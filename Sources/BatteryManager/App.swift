@@ -298,8 +298,7 @@ struct ContentView: View {
 
     private func batteryMode(_ state: BatteryState) -> BatteryMode {
         if state.isCharging { return .charging }
-        if monitor.chargingPaused && state.isPluggedIn { return .onACNotCharging }
-        if state.isPluggedIn { return .onACNotCharging }
+        if state.adapterConnected { return .onACNotCharging }
         return .onBattery
     }
 
@@ -353,7 +352,7 @@ struct ContentView: View {
             return "Auto: charging to \(monitor.chargeUpperBound)%"
         }
         if monitor.chargingPaused { return "Running on AC power - battery will not charge" }
-        if !state.isPluggedIn && !monitor.chargingPaused { return "Connect power adapter to control charging" }
+        if !state.adapterConnected && !monitor.chargingPaused { return "Connect power adapter to control charging" }
         return ""
     }
 
