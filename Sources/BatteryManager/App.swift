@@ -13,13 +13,14 @@ struct BatteryManagerApp: App {
     }
 }
 
-class AppDelegate: NSObject, NSApplicationDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var statusItem: NSStatusItem!
     private var popover: NSPopover!
     private let monitor = BatteryMonitor()
     private var pinnedObserver: Any?
     private var stateObserver: Any?
     private var mouseMonitor: Any?
+    private var globalMouseMonitor: Any?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Activation policy is set in main.swift before SwiftUI launches,
@@ -37,6 +38,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         popover = NSPopover()
         popover.contentSize = NSSize(width: 340, height: 620)
         popover.behavior = .transient
+        popover.delegate = self
         popover.contentViewController = NSHostingController(
             rootView: ContentView(monitor: monitor)
         )
@@ -60,6 +62,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 NSApp.activate(ignoringOtherApps: true)
             }
             return event
+        }
+
+        // Dismiss popover on clicks outside the app — .transient behavior is
+        // unreliable for .accessory apps (clicks on desktop/other apps can be missed).
+        globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+            guard let self, self.popover.isShown, self.popover.behavior == .transient else { return }
+            self.popover.performClose(nil)
         }
     }
 
@@ -91,9 +100,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    func popoverShouldDetach(_ popover: NSPopover) -> Bool {
+        true
+    }
+
     deinit {
         if let mouseMonitor = mouseMonitor {
             NSEvent.removeMonitor(mouseMonitor)
+        }
+        if let globalMouseMonitor = globalMouseMonitor {
+            NSEvent.removeMonitor(globalMouseMonitor)
         }
     }
 
