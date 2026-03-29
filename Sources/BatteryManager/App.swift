@@ -17,7 +17,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var statusItem: NSStatusItem!
     private var popover: NSPopover!
     private let monitor = BatteryMonitor()
-    private var timer: Timer?
     private var pinnedObserver: Any?
     private var stateObserver: Any?
     private var mouseMonitor: Any?
@@ -64,10 +63,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             return event
         }
 
-        // Also update periodically as a fallback
-        timer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
-            self?.updateMenuBarIcon()
-        }
     }
 
     private func updateMenuBarIcon() {
@@ -99,7 +94,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     deinit {
-        timer?.invalidate()
         if let mouseMonitor = mouseMonitor {
             NSEvent.removeMonitor(mouseMonitor)
         }
@@ -148,14 +142,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             let symX = (battW - symSize.width) / 2
             let symY = (totalH - symSize.height) / 2
 
-            // Draw white background behind symbol for contrast
-            let pad: CGFloat = 0
-            let bgRect = NSRect(x: symX - pad, y: symY - pad,
-                                width: symSize.width + pad * 2, height: symSize.height + pad * 2)
             // Erase area behind symbol
             NSGraphicsContext.current?.compositingOperation = .copy
             NSColor.clear.setFill()
-            NSBezierPath(ovalIn: bgRect).fill()
+            NSBezierPath(ovalIn: NSRect(x: symX, y: symY,
+                                         width: symSize.width, height: symSize.height)).fill()
             NSGraphicsContext.current?.compositingOperation = .sourceOver
 
             // Draw the symbol in black
@@ -228,7 +219,7 @@ struct ContentView: View {
             // Status grid
             statusGrid(state)
 
-            if !monitor.autoManageEnabled && (state.isPluggedIn || state.adapterConnected) {
+            if !monitor.autoManageEnabled && state.adapterConnected {
                 Divider().padding(.horizontal)
 
                 // Charge control button
@@ -347,7 +338,7 @@ struct ContentView: View {
             return "Auto: charging to \(monitor.chargeUpperBound)%"
         }
         if monitor.chargingPaused { return "Running on AC power - battery will not charge" }
-        if !state.adapterConnected && !monitor.chargingPaused { return "Connect power adapter to control charging" }
+        if !state.adapterConnected { return "Connect power adapter to control charging" }
         return ""
     }
 
@@ -553,21 +544,21 @@ struct ContentView: View {
 
     /// Button is enabled if adapter is connected OR if charging is paused
     private func buttonEnabled(_ state: BatteryState) -> Bool {
-        return state.isPluggedIn || state.adapterConnected || monitor.chargingPaused
+        return state.adapterConnected || monitor.chargingPaused
     }
 
     private func statusColor(_ state: BatteryState) -> Color {
-        if monitor.chargingPaused && state.isPluggedIn { return .blue }
+        if monitor.chargingPaused && state.adapterConnected { return .blue }
         if state.isCharging { return .green }
-        if state.isPluggedIn { return .blue }
+        if state.adapterConnected { return .blue }
         if state.percentage <= 15 { return .red }
         return .secondary
     }
 
     private func statusText(_ state: BatteryState) -> String {
-        if monitor.chargingPaused && state.isPluggedIn { return "On AC Power (Not Charging)" }
+        if monitor.chargingPaused && state.adapterConnected { return "On AC Power (Not Charging)" }
         if state.isCharging { return "Charging" }
-        if state.isPluggedIn { return "On AC Power" }
+        if state.adapterConnected { return "On AC Power" }
         return "On Battery"
     }
 }

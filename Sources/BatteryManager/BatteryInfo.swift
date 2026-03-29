@@ -6,7 +6,6 @@ struct BatteryState {
     let percentage: Int
     let cycleCount: Int
     let isCharging: Bool
-    let isPluggedIn: Bool
     let adapterConnected: Bool
     let health: String
     let temperature: Double
@@ -116,11 +115,11 @@ final class BatteryMonitor: ObservableObject {
     /// Remove the sudoers rule and helper binary.
     /// If charging is paused, resumes charging via sudo BEFORE removing the rule.
     func removeSudoRule() {
+        let wasPaused = self.chargingPaused
         smcQueue.async { [weak self] in
             guard let self = self else { return }
 
             let cmd = "rm -f '\(Self.sudoersPath)' '\(Self.helperPath)' /etc/sudoers.d/battery-manager"
-            let wasPaused = self.chargingPaused
 
             // Resume charging BEFORE removing the helper (need sudo access)
             if wasPaused { self.runSMCWrite("allow") }
@@ -284,7 +283,7 @@ final class BatteryMonitor: ObservableObject {
                 // Clear stale time-to-full and ensure state reflects paused charging
                 battery = BatteryState(
                     percentage: b.percentage, cycleCount: b.cycleCount,
-                    isCharging: false, isPluggedIn: true,
+                    isCharging: false,
                     adapterConnected: true,
                     health: b.health, temperature: b.temperature,
                     timeRemaining: "",
@@ -401,7 +400,6 @@ final class BatteryMonitor: ObservableObject {
             percentage: percentage,
             cycleCount: cycleCount,
             isCharging: isCharging,
-            isPluggedIn: isPluggedIn,
             adapterConnected: adapterConnected,
             health: health,
             temperature: temperature,
@@ -421,7 +419,7 @@ final class BatteryMonitor: ObservableObject {
     func toggleCharging() {
         let shouldPause = !chargingPaused
         if shouldPause {
-            guard let state = state, (state.isPluggedIn || state.adapterConnected) else {
+            guard let state = state, state.adapterConnected else {
                 lastError = "No power adapter connected"
                 return
             }
