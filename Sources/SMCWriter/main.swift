@@ -178,11 +178,13 @@ let savedSleepPath = AppConstants.savedSleepPath
 @discardableResult
 func setDischargeSleepPrevention(enabled: Bool) -> Bool {
     if enabled {
-        // Save original values before overriding
-        if let original = readPmsetSleep() {
+        // Save original values before overriding, but only if not already saved
+        // (avoids overwriting with already-overridden values on re-entry)
+        let fm = FileManager.default
+        if !fm.fileExists(atPath: savedSleepPath), let original = readPmsetSleep() {
             try? "\(original)".write(toFile: savedSleepPath, atomically: true, encoding: .utf8)
         }
-        if let original = readPmsetValue("displaysleep") {
+        if !fm.fileExists(atPath: savedSleepPath + "-display"), let original = readPmsetValue("displaysleep") {
             try? "\(original)".write(toFile: savedSleepPath + "-display", atomically: true, encoding: .utf8)
         }
     }
