@@ -186,6 +186,7 @@ struct ContentView: View {
     @State private var healthShowPercent = true
     @State private var ageShowYears = true
     @State private var amperageShowMA = true
+    @State private var capacityShowMAh = true
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
 
     var body: some View {
@@ -409,7 +410,15 @@ struct ContentView: View {
 
             // Row 4: Power & capacity
             StatCard(title: "Wattage", value: String(format: "%.1f W", watts), icon: "bolt.horizontal.fill", iconColor: tint)
-            StatCard(title: "Capacity", value: "\(state.currentCapacity)/\(state.maxCapacity) mAh", icon: "battery.100", iconColor: tint)
+            StatCard(title: "Capacity",
+                value: capacityShowMAh
+                    ? "\(state.currentCapacity)/\(state.maxCapacity) mAh"
+                    : (state.maxCapacity > 0
+                        ? String(format: "%.1f%%", Double(state.currentCapacity) / Double(state.maxCapacity) * 100)
+                        : "\(state.percentage)%"),
+                icon: "battery.100", iconColor: tint, onTap: {
+                    capacityShowMAh.toggle()
+                })
         }
         .padding(.horizontal, 16)
     }
