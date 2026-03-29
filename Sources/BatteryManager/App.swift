@@ -104,6 +104,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         true
     }
 
+    func popoverDidDetach(_ popover: NSPopover) {
+        monitor.pinned = true
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        monitor.pinned = false
+    }
+
     deinit {
         if let mouseMonitor = mouseMonitor {
             NSEvent.removeMonitor(mouseMonitor)
