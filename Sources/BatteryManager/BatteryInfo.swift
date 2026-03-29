@@ -67,9 +67,13 @@ final class BatteryMonitor: ObservableObject {
         chargingPaused = false
         if isSudoRuleInstalled {
             smcQueue.async { [weak self] in
-                _ = self?.runSMCWriteViaSudo("nodischarge")
-                _ = self?.runSMCWriteViaSudo("allow")
-                NSLog("BatteryManager: Cleared CHTE/CHIE on launch")
+                let okDischarge = self?.runSMCWriteViaSudo("nodischarge") ?? false
+                let okAllow = self?.runSMCWriteViaSudo("allow") ?? false
+                if okDischarge && okAllow {
+                    NSLog("BatteryManager: Cleared CHTE/CHIE on launch")
+                } else {
+                    NSLog("BatteryManager: Launch cleanup failed (nodischarge=%d, allow=%d)", okDischarge, okAllow)
+                }
             }
         }
 

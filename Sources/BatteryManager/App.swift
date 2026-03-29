@@ -113,6 +113,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     deinit {
+        (pinnedObserver as? AnyCancellable)?.cancel()
+        (stateObserver as? AnyCancellable)?.cancel()
         if let mouseMonitor = mouseMonitor {
             NSEvent.removeMonitor(mouseMonitor)
         }
