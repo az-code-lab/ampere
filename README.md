@@ -3,9 +3,9 @@
 A lightweight macOS menu bar app for monitoring battery status and controlling charging on Apple Silicon Macs.
 
 <p align="center">
-  <img src="screenshot-auto.png" alt="BatteryManager — Auto charge mode" width="280">
+  <img src="screenshot-auto.png" alt="BatteryManager — Auto charge mode" height="560">
   &nbsp;&nbsp;
-  <img src="screenshot-manual.png" alt="BatteryManager — Manual pause charging" width="280">
+  <img src="screenshot-manual.png" alt="BatteryManager — Manual pause charging" height="560">
 </p>
 
 ## Features
