@@ -186,7 +186,7 @@ struct ContentView: View {
     @State private var healthShowPercent = true
     @State private var ageShowYears = true
     @State private var amperageShowMA = true
-    @State private var capacityShowMAh = true
+    @State private var capacityShowMAh = false
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
 
     var body: some View {
@@ -392,12 +392,18 @@ struct ContentView: View {
                     ageShowYears.toggle()
                 })
 
-            // Row 2: Health & environment
+            // Row 2: Capacity & Health
+            StatCard(title: "Capacity",
+                value: capacityShowMAh
+                    ? "\(state.currentCapacity)/\(state.maxCapacity) mAh"
+                    : (state.maxCapacity > 0
+                        ? String(format: "%.1f%%", Double(state.currentCapacity) / Double(state.maxCapacity) * 100)
+                        : "\(state.percentage)%"),
+                icon: "battery.100", iconColor: tint, onTap: {
+                    capacityShowMAh.toggle()
+                })
             StatCard(title: "Health", value: healthValue, icon: "stethoscope", iconColor: tint, onTap: {
                 healthShowPercent.toggle()
-            })
-            StatCard(title: "Temperature", value: tempValue, icon: "thermometer.medium", iconColor: tint, onTap: {
-                useFahrenheit.toggle()
             })
 
             // Row 3: Electrical
@@ -408,17 +414,11 @@ struct ContentView: View {
                     amperageShowMA.toggle()
                 })
 
-            // Row 4: Power & capacity
+            // Row 4: Power & Temperature
             StatCard(title: "Wattage", value: String(format: "%.1f W", watts), icon: "bolt.horizontal.fill", iconColor: tint)
-            StatCard(title: "Capacity",
-                value: capacityShowMAh
-                    ? "\(state.currentCapacity)/\(state.maxCapacity) mAh"
-                    : (state.maxCapacity > 0
-                        ? String(format: "%.1f%%", Double(state.currentCapacity) / Double(state.maxCapacity) * 100)
-                        : "\(state.percentage)%"),
-                icon: "battery.100", iconColor: tint, onTap: {
-                    capacityShowMAh.toggle()
-                })
+            StatCard(title: "Temperature", value: tempValue, icon: "thermometer.medium", iconColor: tint, onTap: {
+                useFahrenheit.toggle()
+            })
         }
         .padding(.horizontal, 16)
     }
@@ -878,6 +878,7 @@ struct StatCard: View {
                 .foregroundColor(.secondary)
         }
         .frame(maxWidth: .infinity)
+        .frame(height: 60)
         .padding(.vertical, 8)
         .padding(.horizontal, 4)
         .background(Color.primary.opacity(0.04))
