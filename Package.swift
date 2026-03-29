@@ -5,8 +5,10 @@ let package = Package(
     name: "BatteryManager",
     platforms: [.macOS(.v14)],
     targets: [
+        .target(name: "Shared"),
         .executableTarget(
             name: "BatteryManager",
+            dependencies: ["Shared"],
             linkerSettings: [
                 .linkedFramework("IOKit"),
                 .linkedFramework("AppKit"),
@@ -14,6 +16,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "SMCWriter",
+            dependencies: ["Shared"],
             linkerSettings: [
                 .linkedFramework("IOKit"),
             ]

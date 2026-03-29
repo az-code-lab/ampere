@@ -244,19 +244,21 @@ struct ContentView: View {
             if !monitor.autoManageEnabled && state.adapterConnected {
                 Divider().padding(.horizontal)
 
-                // Charge control button
+                // Charge control: pause/discharge/resume
                 chargeControlSection()
-
-                // Active discharge (experimental)
-                dischargeControlSection()
             }
 
-            Divider().padding(.horizontal)
+            if monitor.autoManageEnabled {
+                Divider().padding(.horizontal)
 
-            // Auto charge management
-            autoManageSection(state)
+                // Auto charge management content (slider + discharge toggle)
+                autoManageContent(state)
+            }
 
             Divider().padding(.horizontal).padding(.top, 8)
+
+            // Auto charge management toggle
+            autoManageToggle()
 
             // Launch at login
             HStack {
@@ -315,6 +317,7 @@ struct ContentView: View {
 
     private func batteryMode(_ state: BatteryState) -> BatteryMode {
         if state.isCharging { return .charging }
+        if monitor.activeDischarging { return .discharging }
         if state.adapterConnected { return .onACNotCharging }
         return .onBattery
     }
@@ -354,6 +357,9 @@ struct ContentView: View {
 
     private func statusMessage(_ state: BatteryState) -> String {
         if let error = monitor.lastError { return error }
+        if monitor.activeDischarging {
+            return "Discharging to \(monitor.chargeUpperBound)% — sleep is temporarily disabled"
+        }
         if monitor.autoManageEnabled && monitor.chargingPaused {
             if state.percentage > monitor.chargeUpperBound {
                 return "Auto: not charging — drains to \(monitor.chargeUpperBound)% under load"
@@ -363,7 +369,6 @@ struct ContentView: View {
         if monitor.autoManageEnabled && state.isCharging {
             return "Auto: charging to \(monitor.chargeUpperBound)%"
         }
-        if monitor.activeDischarging { return "Force discharging — running on battery while on AC" }
         if monitor.chargingPaused { return "Running on AC power - battery will not charge" }
         if !state.adapterConnected { return "Connect power adapter to control charging" }
         return ""
@@ -371,6 +376,7 @@ struct ContentView: View {
 
     private func statusMessageColor(_ state: BatteryState) -> Color {
         if monitor.lastError != nil { return .red }
+        if monitor.activeDischarging { return .orange }
         if monitor.chargingPaused { return .blue }
         return .secondary
     }
@@ -435,141 +441,91 @@ struct ContentView: View {
         .padding(.horizontal, 16)
     }
 
-    private func autoManageSection(_ state: BatteryState) -> some View {
+    private func autoManageToggle() -> some View {
+        HStack {
+            Image(systemName: "arrow.up.arrow.down.circle.fill")
+                .font(.system(size: 14))
+                .foregroundColor(monitor.autoManageEnabled ? .accentColor : .secondary)
+            Text("Auto Charge Management")
+                .font(.system(size: 13, weight: .semibold))
+            Spacer()
+            Toggle("", isOn: Binding(
+                get: { monitor.autoManageEnabled },
+                set: { newValue in
+                    if newValue {
+                        monitor.ensureSudoInstalled { ok in
+                            if ok {
+                                monitor.autoManageEnabled = true
+                            } else {
+                                monitor.lastError = "Admin access required for auto charge management"
+                            }
+                        }
+                    } else {
+                        monitor.autoManageEnabled = false
+                        if monitor.chargingPaused {
+                            monitor.toggleCharging()
+                        }
+                    }
+                }
+            ))
+            .toggleStyle(.switch)
+            .controlSize(.small)
+        }
+        .padding(.horizontal, 16)
+    }
+
+    private func autoManageContent(_ state: BatteryState) -> some View {
         VStack(spacing: 10) {
+            BatteryRangeSlider(
+                lower: Binding(
+                    get: { Double(monitor.chargeLowerBound) },
+                    set: { monitor.chargeLowerBound = Int($0) }
+                ),
+                upper: Binding(
+                    get: { Double(monitor.chargeUpperBound) },
+                    set: { monitor.chargeUpperBound = Int($0) }
+                ),
+                currentLevel: Double(state.percentage),
+                step: 5,
+                minGap: 5
+            )
+            .frame(height: 68)
+            .padding(.top, 2)
+            .background(WindowDragBlocker())
+
             HStack {
-                Image(systemName: "arrow.up.arrow.down.circle.fill")
+                Image(systemName: "arrow.down.to.line")
                     .font(.system(size: 14))
-                    .foregroundColor(monitor.autoManageEnabled ? .accentColor : .secondary)
-                Text("Auto Charge Management")
+                    .foregroundColor(monitor.autoDischargeEnabled ? .accentColor : .secondary)
+                Text("Discharge to Upper Bound")
                     .font(.system(size: 13, weight: .semibold))
                 Spacer()
                 Toggle("", isOn: Binding(
-                    get: { monitor.autoManageEnabled },
+                    get: { monitor.autoDischargeEnabled },
                     set: { newValue in
-                        if newValue {
-                            // Install sudo helper upfront (password prompt on background queue)
-                            monitor.ensureSudoInstalled { ok in
-                                if ok {
-                                    monitor.autoManageEnabled = true
-                                } else {
-                                    monitor.lastError = "Admin access required for auto charge management"
-                                }
-                            }
-                        } else {
-                            monitor.autoManageEnabled = false
-                            if monitor.chargingPaused {
-                                monitor.toggleCharging()
-                            }
-                        }
+                        monitor.autoDischargeEnabled = newValue
                     }
                 ))
                 .toggleStyle(.switch)
                 .controlSize(.small)
             }
 
-            if monitor.autoManageEnabled {
-                BatteryRangeSlider(
-                    lower: Binding(
-                        get: { Double(monitor.chargeLowerBound) },
-                        set: { monitor.chargeLowerBound = Int($0) }
-                    ),
-                    upper: Binding(
-                        get: { Double(monitor.chargeUpperBound) },
-                        set: { monitor.chargeUpperBound = Int($0) }
-                    ),
-                    currentLevel: Double(state.percentage),
-                    step: 5,
-                    minGap: 5
-                )
-                .frame(height: 68)
-                .padding(.top, 2)
-            }
         }
         .padding(.horizontal, 16)
     }
-
-    @State private var buttonHovered = false
-    @State private var buttonPressed = false
 
     private func chargeControlSection() -> some View {
-        let baseColor: Color = monitor.chargingPaused ? .green : .orange
-
-        return HStack(spacing: 8) {
-            Image(systemName: monitor.chargingPaused ? "play.fill" : "pause.fill")
-                .font(.system(size: 14))
-            Text(monitor.chargingPaused ? "Resume Charging" : "Pause Charging")
-                .font(.system(size: 13, weight: .semibold))
-        }
-        .frame(maxWidth: .infinity)
-        .frame(height: 36)
-        .foregroundColor(.white)
-        .background(
-            RoundedRectangle(cornerRadius: 8)
-                .fill(baseColor)
-                .brightness(buttonPressed ? -0.15 : buttonHovered ? 0.1 : 0)
-                .shadow(color: buttonHovered ? baseColor.opacity(0.4) : .clear,
-                        radius: 6, x: 0, y: 2)
-        )
-        .contentShape(Rectangle())
-        .simultaneousGesture(
-            DragGesture(minimumDistance: 0)
-                .onChanged { _ in buttonPressed = true }
-                .onEnded { _ in
-                    buttonPressed = false
-                    monitor.toggleCharging()
+        VStack(spacing: 4) {
+            if monitor.chargingPaused {
+                Button(action: { monitor.toggleCharging() }) {
+                    Label("Resume Charging", systemImage: "play.fill")
                 }
-        )
-        .onHover { buttonHovered = $0 }
-        .animation(.easeOut(duration: 0.15), value: buttonPressed)
-        .animation(.easeOut(duration: 0.2), value: buttonHovered)
-        .padding(.horizontal, 16)
-    }
-
-    @State private var dischargeHovered = false
-    @State private var dischargePressed = false
-
-    private func dischargeControlSection() -> some View {
-        let baseColor: Color = monitor.activeDischarging ? .green : .red
-
-        return VStack(spacing: 4) {
-            HStack(spacing: 8) {
-                Image(systemName: monitor.activeDischarging ? "stop.fill" : "arrow.down.to.line")
-                    .font(.system(size: 14))
-                Text(monitor.activeDischarging ? "Stop Discharging" : "Force Discharge")
-                    .font(.system(size: 13, weight: .semibold))
-            }
-            .frame(maxWidth: .infinity)
-            .frame(height: 36)
-            .foregroundColor(.white)
-            .background(
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(baseColor)
-                    .brightness(dischargePressed ? -0.15 : dischargeHovered ? 0.1 : 0)
-                    .shadow(color: dischargeHovered ? baseColor.opacity(0.4) : .clear,
-                            radius: 6, x: 0, y: 2)
-            )
-            .contentShape(Rectangle())
-            .simultaneousGesture(
-                DragGesture(minimumDistance: 0)
-                    .onChanged { _ in dischargePressed = true }
-                    .onEnded { _ in
-                        dischargePressed = false
-                        monitor.toggleDischarging()
-                    }
-            )
-            .onHover { dischargeHovered = $0 }
-            .animation(.easeOut(duration: 0.15), value: dischargePressed)
-            .animation(.easeOut(duration: 0.2), value: dischargeHovered)
-
-            if monitor.activeDischarging {
-                Text("System sleep is temporarily disabled while discharging")
-                    .font(.system(size: 10))
-                    .foregroundColor(.orange)
+                .buttonStyle(ChargeButtonStyle(color: .green))
             } else {
-                Text("Experimental — draws from battery while on AC (CHIE)")
-                    .font(.system(size: 10))
-                    .foregroundColor(.secondary)
+                Button(action: { monitor.toggleCharging() }) {
+                    Label("Pause Charging", systemImage: "pause.fill")
+                }
+                .buttonStyle(ChargeButtonStyle(color: .orange))
             }
         }
         .padding(.horizontal, 16)
@@ -612,12 +568,14 @@ struct ContentView: View {
 
     private func statusColor(_ state: BatteryState) -> Color {
         if state.isCharging { return .green }
+        if monitor.activeDischarging { return .orange }
         if state.adapterConnected { return .blue }
         if state.percentage <= 15 { return .red }
         return .secondary
     }
 
     private func statusText(_ state: BatteryState) -> String {
+        if monitor.activeDischarging { return "Discharging" }
         if monitor.chargingPaused && state.adapterConnected { return "On AC Power (Not Charging)" }
         if state.isCharging { return "Charging" }
         if state.adapterConnected { return "On AC Power" }
@@ -629,6 +587,7 @@ struct ContentView: View {
 
 enum BatteryMode {
     case charging
+    case discharging
     case onACNotCharging
     case onBattery
 }
@@ -655,7 +614,7 @@ struct BatteryShape: View {
         let t = pos / Self.sweepDuration
         let eased = t * t * (3 - 2 * t) // smoothstep
         let raw = CGFloat(eased) * 1.6 - 0.3 // range: -0.3 to 1.3
-        return mode == .onBattery ? (1.3 - (raw + 0.3)) : raw
+        return (mode == .onBattery || mode == .discharging) ? (1.3 - (raw + 0.3)) : raw
     }
 
     private func iconPulse(time: Double) -> Double {
@@ -686,7 +645,7 @@ struct BatteryShape: View {
 
                 ZStack(alignment: .leading) {
                     // Glow behind battery
-                    if mode == .charging || mode == .onBattery {
+                    if mode == .charging || mode == .onBattery || mode == .discharging {
                         RoundedRectangle(cornerRadius: 8)
                             .fill(fillColor.opacity(0.3))
                             .frame(width: bodyW + 4, height: h + 4)
@@ -711,7 +670,7 @@ struct BatteryShape: View {
                             .fill(fillColor)
                             .frame(width: fillW, height: h - inset * 2)
 
-                        if (mode == .charging || mode == .onBattery) && fillW > 0 && phase > -0.5 {
+                        if (mode == .charging || mode == .onBattery || mode == .discharging) && fillW > 0 && phase > -0.5 {
                             RoundedRectangle(cornerRadius: 3.5)
                                 .fill(
                                     LinearGradient(
@@ -736,8 +695,8 @@ struct BatteryShape: View {
                             .frame(width: bodyW, height: h)
                     }
 
-                    // Bolt slash when draining
-                    if mode == .onBattery {
+                    // Bolt slash when draining (on battery or actively discharging)
+                    if mode == .onBattery || mode == .discharging {
                         Image(systemName: "bolt.slash")
                             .font(.system(size: 18, weight: .bold))
                             .foregroundColor(.white)
@@ -899,6 +858,43 @@ struct BatteryRangeSlider: View {
                     )
             }
         }
+    }
+}
+
+// MARK: - Window Drag Blocker
+
+/// Overlay that prevents window drag from intercepting SwiftUI gestures.
+/// Used on the range slider so thumbs are draggable in detached popover mode.
+struct WindowDragBlocker: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        let view = NoDragView()
+        view.translatesAutoresizingMaskIntoConstraints = false
+        return view
+    }
+    func updateNSView(_ nsView: NSView, context: Context) {}
+
+    private class NoDragView: NSView {
+        override var mouseDownCanMoveWindow: Bool { false }
+        override func hitTest(_ point: NSPoint) -> NSView? { self }
+    }
+}
+
+// MARK: - Charge Button Style
+
+struct ChargeButtonStyle: ButtonStyle {
+    let color: Color
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 13, weight: .semibold))
+            .frame(maxWidth: .infinity)
+            .frame(height: 36)
+            .foregroundColor(.white)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(color)
+                    .opacity(configuration.isPressed ? 0.8 : 1.0)
+            )
     }
 }
 

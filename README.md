@@ -10,8 +10,8 @@ A lightweight macOS menu bar app for monitoring battery status and controlling c
 
 - **Real-time battery stats** - percentage, cycle count, health, temperature, voltage, amperage, wattage, capacity, and battery age
 - **Charge control** - pause and resume charging via SMC
-- **Force discharge** - actively drain the battery while connected to AC power
 - **Auto charge management** - configurable upper/lower bounds to keep your battery in an optimal charge range
+- **Discharge to upper bound** - optionally drain the battery to the target level while on AC power
 - **Animated menu bar icon** - battery shape with live charge level indicator
 - **Pinnable popover** - pin the panel to keep it open while you work
 - **Launch at login** - start automatically when you log in
@@ -53,11 +53,20 @@ When enabled, the app automatically manages charging between configurable bounds
 - **Between bounds** - holds (charging inhibited)
 - **Above upper bound** - inhibits charging; battery drains passively under system load
 
-### Force Discharge
+### Discharge to Upper Bound
 
-Force discharge causes the Mac to run on battery power while the AC adapter remains connected. This is useful for draining the battery to a target level for calibration or health management.
+An optional toggle within auto charge management. When enabled, the app actively discharges the battery down to the upper bound when the current level exceeds it, rather than waiting for passive drain under load.
 
-**Note:** While force discharge is active, system sleep is temporarily disabled (displayed as a warning in the UI). Sleep is restored immediately when discharge is stopped. If the app is force-killed or crashes, a watchdog daemon automatically cleans up within a few seconds.
+**Note:** While discharge is active, system sleep is temporarily disabled (displayed as a warning in the UI). Sleep is restored immediately when discharge stops (either by reaching the target or toggling off). If the app is force-killed or crashes, a watchdog daemon automatically cleans up within a few seconds.
+
+### Manual Charge Control
+
+When auto charge management is off and a power adapter is connected, a manual **Pause Charging** / **Resume Charging** button is available.
+
+### Settings and Safety
+
+- **Settings persist across restarts** - auto charge management, discharge toggle, and charge bounds are saved and restored when the app relaunches.
+- **Quitting the app restores system defaults** - all SMC overrides (charging inhibit, discharge) and power management changes (sleep settings) are cleared when the app exits. Your Mac returns to its normal charging and sleep behavior. If the app crashes or is force-killed, a watchdog daemon cleans up automatically within a few seconds.
 
 ## Build from Source
 
@@ -111,14 +120,14 @@ The helper binary may be outdated (e.g., after rebuilding the project). Fix by r
 
 ## Technical Details
 
-This section documents the implementation details of SMC-based charge control and force discharge, including the problems encountered and their solutions.
+This section documents the implementation details of SMC-based charge control and discharge, including the problems encountered and their solutions.
 
 ### SMC Keys
 
 | Key | Type | Description |
 |-----|------|-------------|
 | `CHTE` | `ui32` (4 bytes) | Charge terminate / inhibit. `1` = charging paused, `0` = charging allowed. |
-| `CHIE` | `hex_` (1 byte) | Charge inhibit enable / force discharge. `0x08` = discharge active, `0x00` = normal. |
+| `CHIE` | `hex_` (1 byte) | Charge inhibit enable / discharge. `0x08` = discharge active, `0x00` = normal. |
 
 Both keys are written via IOKit's `IOConnectCallStructMethod` (selector 2) to the `AppleSMCKeysEndpoint` service (falling back to `AppleSMC`). Writing requires root privileges. Reading does not require root.
 
@@ -153,7 +162,7 @@ When discharge is stopped, sleep is restored to the user's original setting via 
 
 ### Watchdog Daemon
 
-When force discharge is activated, the SMCWriter spawns a **watchdog daemon** via `posix_spawn`. The daemon:
+When discharge is activated, the SMCWriter spawns a **watchdog daemon** via `posix_spawn`. The daemon:
 
 1. Runs as a detached root process (independent of the app and sudo process chain).
 2. Polls the app's PID every 2 seconds.

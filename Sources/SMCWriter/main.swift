@@ -3,6 +3,7 @@
 
 import Foundation
 import IOKit
+import Shared
 
 // MARK: - SMC Data Types (duplicated to avoid cross-target dependency on AppKit)
 
@@ -111,8 +112,8 @@ func smcWriteKey(_ conn: io_connect_t, _ key: String, _ bytes: [UInt8]) -> Bool 
 
 // MARK: - Sleep control
 
-/// Read the current `sleep` value from pmset.
-func readPmsetSleep() -> Int? {
+/// Read a pmset value by key name (e.g. "sleep", "displaysleep").
+func readPmsetValue(_ key: String) -> Int? {
     let task = Process()
     task.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
     task.arguments = ["-g"]
@@ -126,9 +127,9 @@ func readPmsetSleep() -> Int? {
         guard let output = String(data: data, encoding: .utf8) else { return nil }
         for line in output.components(separatedBy: "\n") {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if trimmed.hasPrefix("sleep") && !trimmed.hasPrefix("sleepimage") && !trimmed.hasPrefix("disksleep") {
+            if trimmed.hasPrefix(key) {
                 let parts = trimmed.split(separator: " ")
-                if parts.count >= 2, let val = Int(parts[1]) {
+                if parts.count >= 2, parts[0] == Substring(key), let val = Int(parts[1]) {
                     return val
                 }
             }
@@ -137,34 +138,49 @@ func readPmsetSleep() -> Int? {
     return nil
 }
 
+/// Convenience: read the current `sleep` value.
+func readPmsetSleep() -> Int? { readPmsetValue("sleep") }
+
 /// Path to store the original sleep value for restoration.
-let savedSleepPath = "/tmp/.battery_manager_saved_sleep"
+let savedSleepPath = AppConstants.savedSleepPath
 
 /// Prevent or restore system/clamshell sleep using pmset. Requires root.
 @discardableResult
 func setDischargeSleepPrevention(enabled: Bool) -> Bool {
     if enabled {
-        // Save original sleep value before overriding
+        // Save original values before overriding
         if let original = readPmsetSleep() {
             try? "\(original)".write(toFile: savedSleepPath, atomically: true, encoding: .utf8)
+        }
+        if let original = readPmsetValue("displaysleep") {
+            try? "\(original)".write(toFile: savedSleepPath + "-display", atomically: true, encoding: .utf8)
         }
     }
 
     let task = Process()
     task.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
     if enabled {
-        task.arguments = ["-a", "sleep", "0", "disablesleep", "1"]
+        // Disable both system sleep and display sleep to prevent clamshell issues
+        task.arguments = ["-a", "sleep", "0", "disablesleep", "1", "displaysleep", "0"]
     } else {
-        // Restore original sleep value
+        // Restore original values
         let originalSleep: String
         if let saved = try? String(contentsOfFile: savedSleepPath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
            !saved.isEmpty {
             originalSleep = saved
             try? FileManager.default.removeItem(atPath: savedSleepPath)
         } else {
-            originalSleep = "1" // safe default
+            originalSleep = "1"
         }
-        task.arguments = ["-a", "sleep", originalSleep, "disablesleep", "0"]
+        let originalDisplaySleep: String
+        if let saved = try? String(contentsOfFile: savedSleepPath + "-display", encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+           !saved.isEmpty {
+            originalDisplaySleep = saved
+            try? FileManager.default.removeItem(atPath: savedSleepPath + "-display")
+        } else {
+            originalDisplaySleep = "10"
+        }
+        task.arguments = ["-a", "sleep", originalSleep, "disablesleep", "0", "displaysleep", originalDisplaySleep]
     }
     task.standardOutput = FileHandle.nullDevice
     task.standardError = FileHandle.nullDevice
@@ -253,6 +269,8 @@ if action.hasPrefix("watchdog:") {
                 _ = smcWriteKey(conn, "CHIE", [0x00])
                 IOServiceClose(conn)
             }
+            // Wait for PD renegotiation to settle before restoring sleep
+            sleep(3)
             _ = setDischargeSleepPrevention(enabled: false)
             _exit(0)
         }
@@ -294,10 +312,12 @@ case "allow":
     }
 
 case "nodischarge":
-    // Clears CHIE and restores sleep. Used for graceful stop (app calls this
-    // before killing the daemon) and launch cleanup.
+    // Clears CHIE, waits for PD renegotiation to settle, then restores sleep.
     let chieValue: [UInt8] = [0x00]
     if smcWriteKey(conn, "CHIE", chieValue) {
+        // Wait for USB-C PD renegotiation to complete before re-enabling
+        // clamshell sleep, otherwise the brief display disruption triggers sleep.
+        sleep(3)
         _ = setDischargeSleepPrevention(enabled: false)
         print("OK: active discharge disabled")
         exit(0)

@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import IOKit.ps
+import Shared
 
 struct BatteryState {
     let percentage: Int
@@ -23,6 +24,9 @@ final class BatteryMonitor: ObservableObject {
     @Published var state: BatteryState?
     @Published var chargingPaused: Bool = false
     @Published var activeDischarging: Bool = false
+    @Published var autoDischargeEnabled: Bool {
+        didSet { UserDefaults.standard.set(autoDischargeEnabled, forKey: "autoDischargeEnabled") }
+    }
     @Published var lastError: String?
     @Published var pinned: Bool = false
     @Published var smcCHTE: String = "?"
@@ -45,38 +49,25 @@ final class BatteryMonitor: ObservableObject {
     private var autoManageInFlight = false
     private let smcQueue = DispatchQueue(label: "com.battery-manager.smc", qos: .utility)
 
-    private static let pausedFlagPath = NSTemporaryDirectory() + ".battery_manager_paused"
-    private static let sudoersPath = "/etc/sudoers.d/az-battery-manager"
-    private static let helperPath = "/usr/local/bin/az-battery-manager-smc"
+    private static let sudoersPath = AppConstants.sudoersPath
+    private static let helperPath = AppConstants.helperPath
 
     init() {
         // Load persisted auto-manage settings
         let defaults = UserDefaults.standard
         self.autoManageEnabled = defaults.bool(forKey: "autoManageEnabled")
+        self.autoDischargeEnabled = defaults.bool(forKey: "autoDischargeEnabled")
         self.chargeLowerBound = defaults.object(forKey: "chargeLowerBound") as? Int ?? 40
         self.chargeUpperBound = defaults.object(forKey: "chargeUpperBound") as? Int ?? 60
 
-        let wasPaused = FileManager.default.fileExists(atPath: Self.pausedFlagPath)
-
-        if wasPaused && autoManageEnabled {
-            // Auto-manage is on — restore paused state so it can resume control
-            chargingPaused = true
-            // Still clear CHIE — discharge should never persist across restarts
-            smcQueue.async { [weak self] in
-                self?.killOrphanedDischargeProcesses()
-                _ = self?.runSMCWriteViaSudo("nodischarge")
-                NSLog("BatteryManager: Restored charge inhibit, cleared CHIE on launch")
-            }
-        } else {
-            // Clear both CHTE and CHIE on launch
-            chargingPaused = false
-            try? FileManager.default.removeItem(atPath: Self.pausedFlagPath)
-            smcQueue.async { [weak self] in
-                self?.killOrphanedDischargeProcesses()
-                _ = self?.runSMCWriteViaSudo("allow")
-                _ = self?.runSMCWriteViaSudo("nodischarge")
-                NSLog("BatteryManager: Cleared CHTE/CHIE on launch")
-            }
+        // Always start fresh — clear CHTE/CHIE and kill orphaned watchdogs.
+        // Auto-manage will re-evaluate and re-inhibit on the first refresh if needed.
+        chargingPaused = false
+        smcQueue.async { [weak self] in
+            self?.killOrphanedDischargeProcesses()
+            _ = self?.runSMCWriteViaSudo("allow")
+            _ = self?.runSMCWriteViaSudo("nodischarge")
+            NSLog("BatteryManager: Cleared CHTE/CHIE on launch")
         }
 
         refresh()
@@ -92,24 +83,17 @@ final class BatteryMonitor: ObservableObject {
 
             let done = DispatchSemaphore(value: 0)
             self.smcQueue.async {
-                // Always clear CHIE / restore sleep settings on quit
+                // Always restore system defaults on quit
                 if self.activeDischarging {
                     self.runSMCWrite("nodischarge")
                 }
-
-                if self.chargingPaused && self.autoManageEnabled {
-                    // Auto-manage — keep CHTE set so charging stays inhibited
-                    // between app quit and restart. The paused flag stays too,
-                    // so init() will restore the state on next launch.
-                } else if self.chargingPaused {
-                    // Manual pause — clear CHTE so we don't leave charging stuck
+                if self.chargingPaused {
                     self.runSMCWrite("allow")
-                    try? FileManager.default.removeItem(atPath: Self.pausedFlagPath)
                 }
 
                 done.signal()
             }
-            _ = done.wait(timeout: .now() + 3.0)
+            _ = done.wait(timeout: .now() + 6.0)
         }
     }
 
@@ -156,9 +140,9 @@ final class BatteryMonitor: ObservableObject {
             DispatchQueue.main.async {
                 if ok && !self.isSudoRuleInstalled {
                     self.autoManageEnabled = false
+                    self.autoDischargeEnabled = false
                     self.chargingPaused = false
                     self.activeDischarging = false
-                    try? FileManager.default.removeItem(atPath: Self.pausedFlagPath)
                 } else {
                     // User cancelled — restore previous state
                     self.smcQueue.async {
@@ -230,12 +214,12 @@ final class BatteryMonitor: ObservableObject {
 
     // MARK: - SMC Write
 
-    /// Kill any orphaned SMCWriter watchdog/discharge processes from a previous crash.
+    /// Kill any orphaned SMCWriter watchdog processes (they run as root).
     private func killOrphanedDischargeProcesses() {
-        // Kill watchdog daemons (the long-lived process)
         let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-        task.arguments = ["-f", "\(Self.helperPath) watchdog:"]
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
+        task.arguments = ["pkill", "-f", "\(Self.helperPath) watchdog:"]
+        task.standardInput = FileHandle.nullDevice
         task.standardOutput = FileHandle.nullDevice
         task.standardError = FileHandle.nullDevice
         try? task.run()
@@ -405,10 +389,62 @@ final class BatteryMonitor: ObservableObject {
     func refresh() {
         var battery = Self.readBattery()
 
-        // Auto charge management:
-        //   1. charge when < lower bound, continue until upper bound
-        //   2. hold when between bounds (inhibit charging)
-        //   3. above upper bound → inhibit charging (battery drains passively under load)
+        // Always update state immediately so the UI has data
+        state = battery
+
+        // Stop discharge if the toggle was turned off or auto-manage was disabled
+        if activeDischarging && (!autoDischargeEnabled || !autoManageEnabled) && !autoManageInFlight {
+            autoManageInFlight = true
+            smcQueue.async { [weak self] in
+                guard let self = self else { return }
+                let ok = self.runSMCWrite("nodischarge")
+                DispatchQueue.main.async {
+                    self.autoManageInFlight = false
+                    if ok {
+                        self.activeDischarging = false
+                        NSLog("BatteryManager: Auto-discharge toggled off")
+                    }
+                    self.refresh()
+                }
+            }
+            return
+        }
+
+        // Auto-discharge: start when above upper bound, stop when reached
+        if autoManageEnabled, autoDischargeEnabled, !autoManageInFlight, let b = battery, b.adapterConnected {
+            if !activeDischarging && b.percentage > chargeUpperBound {
+                autoManageInFlight = true
+                smcQueue.async { [weak self] in
+                    guard let self = self else { return }
+                    let ok = self.runSMCWrite("discharge")
+                    DispatchQueue.main.async {
+                        self.autoManageInFlight = false
+                        if ok {
+                            self.activeDischarging = true
+                            NSLog("BatteryManager: Auto-discharge started at %d%%, target %d%%", b.percentage, self.chargeUpperBound)
+                        }
+                        self.refresh()
+                    }
+                }
+                return
+            } else if activeDischarging && b.percentage <= chargeUpperBound {
+                autoManageInFlight = true
+                smcQueue.async { [weak self] in
+                    guard let self = self else { return }
+                    let ok = self.runSMCWrite("nodischarge")
+                    DispatchQueue.main.async {
+                        self.autoManageInFlight = false
+                        if ok {
+                            self.activeDischarging = false
+                            NSLog("BatteryManager: Auto-discharge reached target %d%%", self.chargeUpperBound)
+                        }
+                        self.refresh()
+                    }
+                }
+                return
+            }
+        }
+
         if autoManageEnabled, !autoManageInFlight, let b = battery, b.adapterConnected {
             if lastError != nil { lastError = nil }
 
@@ -422,7 +458,6 @@ final class BatteryMonitor: ObservableObject {
                         self.autoManageInFlight = false
                         if ok {
                             self.chargingPaused = true
-                            FileManager.default.createFile(atPath: Self.pausedFlagPath, contents: nil)
                             NSLog("BatteryManager: Inhibited charging at %d%%", b.percentage)
                         }
                         self.refresh()
@@ -438,7 +473,6 @@ final class BatteryMonitor: ObservableObject {
                         self.autoManageInFlight = false
                         if ok {
                             self.chargingPaused = false
-                            try? FileManager.default.removeItem(atPath: Self.pausedFlagPath)
                             NSLog("BatteryManager: Charging from %d%% to %d%%", b.percentage, self.chargeUpperBound)
                         }
                         self.refresh()
@@ -465,7 +499,6 @@ final class BatteryMonitor: ObservableObject {
                 // Adapter disconnected — clear inhibit/discharge so charging works when plugged back in
                 chargingPaused = false
                 activeDischarging = false
-                try? FileManager.default.removeItem(atPath: Self.pausedFlagPath)
                 smcQueue.async { [weak self] in
                     self?.runSMCWrite("allow")
                     self?.runSMCWrite("nodischarge")
@@ -589,39 +622,6 @@ final class BatteryMonitor: ObservableObject {
 
     // MARK: - Toggle
 
-    func toggleDischarging() {
-        let shouldDischarge = !activeDischarging
-        if shouldDischarge {
-            guard let state = state, state.adapterConnected else {
-                lastError = "No power adapter connected"
-                return
-            }
-        }
-
-        ensureSudoInstalled { [weak self] ok in
-            guard let self = self, ok else {
-                self?.lastError = "Admin access required to control discharge"
-                return
-            }
-            self.smcQueue.async {
-                let arg = shouldDischarge ? "discharge" : "nodischarge"
-                let ok = self.runSMCWrite(arg)
-                DispatchQueue.main.async {
-                    if ok {
-                        self.activeDischarging = shouldDischarge
-                        self.lastError = nil
-                        NSLog("BatteryManager: Active discharge %@", shouldDischarge ? "enabled" : "disabled")
-                    } else {
-                        self.lastError = "Failed to change discharge state"
-                    }
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
-                        self.refresh()
-                    }
-                }
-            }
-        }
-    }
-
     func toggleCharging() {
         let shouldPause = !chargingPaused
         if shouldPause {
@@ -644,11 +644,6 @@ final class BatteryMonitor: ObservableObject {
                     if ok {
                         self.chargingPaused = shouldPause
                         self.lastError = nil
-                        if shouldPause {
-                            FileManager.default.createFile(atPath: Self.pausedFlagPath, contents: nil)
-                        } else {
-                            try? FileManager.default.removeItem(atPath: Self.pausedFlagPath)
-                        }
                         NSLog("BatteryManager: Charging %@", shouldPause ? "paused" : "resumed")
                     } else {
                         self.lastError = "Failed to change charging state"
