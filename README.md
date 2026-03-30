@@ -18,7 +18,7 @@ A lightweight macOS menu bar app for monitoring battery status and controlling c
 - **Discharge to upper bound** - optionally drain the battery to the target level while on AC power
 - **Health check** - periodically verifies SMC state matches expected values
 - **Update notifications** - checks for new versions via Homebrew cask
-- **Animated menu bar icon** - battery shape with live charge level indicator
+- **Menu bar icon** - battery shape with live charge level indicator
 - **Pinnable popover** - pin the panel to keep it open while you work
 - **Launch at login** - start automatically when you log in
 

@@ -39,6 +39,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         popover.contentSize = NSSize(width: 340, height: 620)
         popover.behavior = .transient
         popover.delegate = self
+        popover.contentViewController = NSHostingController(
+            rootView: ContentView(monitor: monitor)
+        )
 
         // Observe pinned state to change popover behavior
         pinnedObserver = monitor.$pinned.sink { [weak self] pinned in
@@ -96,10 +99,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if popover.isShown {
             popover.performClose(nil)
         } else {
-            // Create hosting controller on demand so SwiftUI doesn't run when hidden
-            popover.contentViewController = NSHostingController(
-                rootView: ContentView(monitor: monitor)
-            )
             monitor.setFastPolling(true)
             updateMenuBarIcon()
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
@@ -116,11 +115,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     func popoverDidClose(_ notification: Notification) {
+        // popoverDidClose also fires during detach (popover → window transition).
+        // Skip cleanup in that case — the user is still viewing the panel.
+        guard !popover.isDetached else { return }
         monitor.pinned = false
         monitor.setFastPolling(false)
-        if !popover.isDetached {
-            popover.contentViewController = nil
-        }
     }
 
     deinit {
@@ -218,7 +217,7 @@ struct ContentView: View {
     private var healthCheckTimeString: String {
         guard let time = monitor.lastHealthCheckTime else { return "n/a" }
         let fmt = DateFormatter()
-        fmt.dateFormat = "h:m:s a M/d/yyyy"
+        fmt.dateFormat = "h:mm:ss a M/d/yyyy"
         return fmt.string(from: time)
     }
 
@@ -447,7 +446,7 @@ struct ContentView: View {
         let healthValue = healthShowPercent ? state.health : "\(state.maxCapacity)/\(state.designCapacity) mAh"
 
         let mode = batteryMode(state)
-        let tint: Color = mode == .charging ? .green : mode == .onBattery ? .orange : .secondary
+        let tint: Color = mode == .charging ? .green : (mode == .onBattery || mode == .discharging) ? .orange : .secondary
 
         return LazyVGrid(columns: [
             GridItem(.flexible()),

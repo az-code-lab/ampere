@@ -53,7 +53,7 @@ final class BatteryMonitor: ObservableObject {
     private var terminationObserver: NSObjectProtocol?
     private var autoManageInFlight = false
     private var refreshCount = 0
-    private(set) var popoverVisible = false
+    private var popoverVisible = false
     private let smcQueue = DispatchQueue(label: "com.ampere.smc", qos: .utility)
 
     private static let sudoersPath = AppConstants.sudoersPath
@@ -617,8 +617,6 @@ final class BatteryMonitor: ObservableObject {
         if refreshCount > 3, refreshCount % 12 == 0, !autoManageInFlight, isSudoRuleInstalled,
            let b = battery, b.adapterConnected {
             performHealthCheck(battery: b)
-        } else if healthWarning != nil {
-            healthWarning = nil
         }
     }
 
