@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ampere — Smart Battery Manager for Mac</title>
+    <meta name="description" content="A lightweight macOS menu bar app for monitoring battery status and controlling charging on Apple Silicon Macs.">
+    <link rel="icon" type="image/png" href="icon.png">
+    <style>
+        :root {
+            --green: #34C759;
+            --green-dark: #28a745;
+            --orange: #FF9500;
+            --bg: #fafafa;
+            --text: #1d1d1f;
+            --text-secondary: #6e6e73;
+            --card-bg: #ffffff;
+            --border: #e5e5ea;
+        }
+
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --bg: #000000;
+                --text: #f5f5f7;
+                --text-secondary: #a1a1a6;
+                --card-bg: #1c1c1e;
+                --border: #38383a;
+            }
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Helvetica Neue", Arial, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.6;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        .container {
+            max-width: 960px;
+            margin: 0 auto;
+            padding: 0 24px;
+        }
+
+        /* Hero */
+        .hero {
+            text-align: center;
+            padding: 80px 0 60px;
+        }
+
+        .hero-icon {
+            width: 128px;
+            height: 128px;
+            margin-bottom: 24px;
+            border-radius: 28px;
+        }
+
+        .hero h1 {
+            font-size: 56px;
+            font-weight: 700;
+            letter-spacing: -0.02em;
+            margin-bottom: 12px;
+        }
+
+        .hero .tagline {
+            font-size: 22px;
+            color: var(--text-secondary);
+            max-width: 540px;
+            margin: 0 auto 40px;
+        }
+
+        .install-code {
+            display: inline-block;
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 16px 28px;
+            font-family: "SF Mono", Menlo, monospace;
+            font-size: 15px;
+            color: var(--text);
+            letter-spacing: -0.01em;
+            user-select: all;
+        }
+
+        .install-label {
+            display: block;
+            font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+            font-size: 13px;
+            color: var(--text-secondary);
+            margin-bottom: 12px;
+        }
+
+        /* Screenshots */
+        .screenshots {
+            text-align: center;
+            padding: 40px 0 80px;
+        }
+
+        .screenshots img {
+            height: 520px;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.12);
+            margin: 0 12px;
+        }
+
+        @media (prefers-color-scheme: dark) {
+            .screenshots img {
+                box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+            }
+        }
+
+        /* Features */
+        .features {
+            padding: 80px 0;
+        }
+
+        .features h2 {
+            font-size: 40px;
+            font-weight: 700;
+            text-align: center;
+            margin-bottom: 48px;
+            letter-spacing: -0.02em;
+        }
+
+        .feature-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 24px;
+        }
+
+        .feature-card {
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 28px;
+        }
+
+        .feature-card .icon {
+            font-size: 28px;
+            margin-bottom: 12px;
+        }
+
+        .feature-card h3 {
+            font-size: 18px;
+            font-weight: 600;
+            margin-bottom: 8px;
+        }
+
+        .feature-card p {
+            font-size: 15px;
+            color: var(--text-secondary);
+            line-height: 1.5;
+        }
+
+        /* How it works */
+        .how-it-works {
+            padding: 80px 0;
+        }
+
+        .how-it-works h2 {
+            font-size: 40px;
+            font-weight: 700;
+            text-align: center;
+            margin-bottom: 48px;
+            letter-spacing: -0.02em;
+        }
+
+        .steps {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 32px;
+            text-align: center;
+        }
+
+        .step-number {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 48px;
+            height: 48px;
+            border-radius: 50%;
+            background: var(--green);
+            color: white;
+            font-size: 20px;
+            font-weight: 700;
+            margin-bottom: 16px;
+        }
+
+        .steps h3 {
+            font-size: 18px;
+            font-weight: 600;
+            margin-bottom: 8px;
+        }
+
+        .steps p {
+            font-size: 15px;
+            color: var(--text-secondary);
+        }
+
+        /* Requirements */
+        .requirements {
+            padding: 60px 0;
+            text-align: center;
+        }
+
+        .requirements h2 {
+            font-size: 40px;
+            font-weight: 700;
+            margin-bottom: 32px;
+            letter-spacing: -0.02em;
+        }
+
+        .req-pills {
+            display: flex;
+            justify-content: center;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+
+        .req-pill {
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 100px;
+            padding: 10px 20px;
+            font-size: 15px;
+            color: var(--text-secondary);
+        }
+
+        /* CTA */
+        .cta {
+            text-align: center;
+            padding: 80px 0 100px;
+        }
+
+        .cta h2 {
+            font-size: 36px;
+            font-weight: 700;
+            margin-bottom: 12px;
+            letter-spacing: -0.02em;
+        }
+
+        .cta p {
+            color: var(--text-secondary);
+            font-size: 18px;
+            margin-bottom: 32px;
+        }
+
+        .cta-buttons {
+            display: flex;
+            justify-content: center;
+            gap: 16px;
+            flex-wrap: wrap;
+        }
+
+        .btn {
+            display: inline-block;
+            padding: 14px 28px;
+            border-radius: 12px;
+            font-size: 16px;
+            font-weight: 600;
+            text-decoration: none;
+            transition: opacity 0.2s;
+        }
+
+        .btn:hover {
+            opacity: 0.85;
+        }
+
+        .btn-primary {
+            background: var(--green);
+            color: white;
+        }
+
+        .btn-secondary {
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            color: var(--text);
+        }
+
+        /* Footer */
+        footer {
+            text-align: center;
+            padding: 40px 0;
+            color: var(--text-secondary);
+            font-size: 14px;
+            border-top: 1px solid var(--border);
+        }
+
+        footer a {
+            color: var(--text-secondary);
+            text-decoration: none;
+        }
+
+        footer a:hover {
+            color: var(--text);
+        }
+
+        /* Responsive */
+        @media (max-width: 640px) {
+            .hero h1 { font-size: 40px; }
+            .hero .tagline { font-size: 18px; }
+            .features h2, .how-it-works h2, .requirements h2, .cta h2 { font-size: 32px; }
+            .screenshots img { height: 400px; margin: 8px; }
+            .install-code { font-size: 13px; padding: 12px 20px; }
+        }
+    </style>
+</head>
+<body>
+
+    <!-- Hero -->
+    <section class="hero">
+        <div class="container">
+            <img src="icon.png" alt="Ampere" class="hero-icon">
+            <h1>Ampere</h1>
+            <p class="tagline">Smart battery management for your Mac. Monitor, control, and extend your battery's lifespan from the menu bar.</p>
+            <div class="install-code">
+                <span class="install-label">Install with Homebrew</span>
+                brew tap elgs/taps && brew install --cask ampere
+            </div>
+        </div>
+    </section>
+
+    <!-- Screenshots -->
+    <section class="screenshots">
+        <div class="container">
+            <img src="../screenshot-auto.png" alt="Ampere auto charge mode">
+            <img src="../screenshot-manual.png" alt="Ampere manual charge mode">
+        </div>
+    </section>
+
+    <!-- Features -->
+    <section class="features">
+        <div class="container">
+            <h2>Features</h2>
+            <div class="feature-grid">
+                <div class="feature-card">
+                    <div class="icon">&#9889;</div>
+                    <h3>Real-Time Battery Stats</h3>
+                    <p>Percentage, cycle count, health, temperature, voltage, amperage, wattage, capacity, and battery age &mdash; all at a glance.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="icon">&#9208;</div>
+                    <h3>Charge Control</h3>
+                    <p>Pause and resume charging with a single click. Manual or automatic &mdash; you choose.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="icon">&#127919;</div>
+                    <h3>Auto Charge Management</h3>
+                    <p>Set upper and lower bounds. Ampere keeps your battery in the sweet spot automatically.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="icon">&#128737;</div>
+                    <h3>Micro-Charge Prevention</h3>
+                    <p>Prevents short charge cycles between bounds. Only charges from below the lower bound or on your explicit request.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="icon">&#128267;</div>
+                    <h3>Active Discharge</h3>
+                    <p>Optionally drain to your target level on AC power instead of waiting for passive drain under load.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="icon">&#128737;</div>
+                    <h3>Health Check</h3>
+                    <p>Periodically verifies SMC state matches expected values. Alerts you if something is off.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="icon">&#128204;</div>
+                    <h3>Pinnable Panel</h3>
+                    <p>Pin the popover open while you work. It stays visible even when you click elsewhere.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="icon">&#128274;</div>
+                    <h3>Safe by Design</h3>
+                    <p>All SMC overrides are cleared on quit. A watchdog daemon cleans up even after a crash or force-kill.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="icon">&#128260;</div>
+                    <h3>Update Notifications</h3>
+                    <p>Checks for new versions automatically and shows an icon when an update is available.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- How It Works -->
+    <section class="how-it-works">
+        <div class="container">
+            <h2>How It Works</h2>
+            <div class="steps">
+                <div>
+                    <div class="step-number">1</div>
+                    <h3>Install</h3>
+                    <p>One command with Homebrew, or download the DMG from GitHub Releases.</p>
+                </div>
+                <div>
+                    <div class="step-number">2</div>
+                    <h3>Set Your Bounds</h3>
+                    <p>Choose your ideal charge range with the slider. Common recommendation: 40% &ndash; 80%.</p>
+                </div>
+                <div>
+                    <div class="step-number">3</div>
+                    <h3>Forget About It</h3>
+                    <p>Ampere manages charging automatically. Launch at login and it works silently in your menu bar.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Requirements -->
+    <section class="requirements">
+        <div class="container">
+            <h2>Requirements</h2>
+            <div class="req-pills">
+                <span class="req-pill">macOS 14 Sonoma or later</span>
+                <span class="req-pill">Apple Silicon Mac</span>
+                <span class="req-pill">Admin privileges for charge control</span>
+            </div>
+        </div>
+    </section>
+
+    <!-- CTA -->
+    <section class="cta">
+        <div class="container">
+            <h2>Take Control of Your Battery</h2>
+            <p>Free, open-source, and lightweight. Your battery will thank you.</p>
+            <div class="cta-buttons">
+                <a href="https://github.com/elgs/ampere/releases/latest" class="btn btn-primary">Download Latest Release</a>
+                <a href="https://github.com/elgs/ampere" class="btn btn-secondary">View on GitHub</a>
+            </div>
+        </div>
+    </section>
+
+    <!-- Footer -->
+    <footer>
+        <div class="container">
+            <p>Ampere is open-source software under the <a href="https://github.com/elgs/ampere/blob/master/LICENSE">MIT License</a>.</p>
+        </div>
+    </footer>
+
+</body>
+</html>
