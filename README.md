@@ -13,7 +13,11 @@ A lightweight macOS menu bar app for monitoring battery status and controlling c
 - **Real-time battery stats** - percentage, cycle count, health, temperature, voltage, amperage, wattage, capacity, and battery age
 - **Charge control** - pause and resume charging via SMC
 - **Auto charge management** - configurable upper/lower bounds to keep your battery in an optimal charge range
+- **Micro-charge prevention** - inhibits charging between bounds after restart; only charges from below the lower bound or on explicit user request
+- **Charge to upper bound** - explicitly allow charging from the current level to the upper bound
 - **Discharge to upper bound** - optionally drain the battery to the target level while on AC power
+- **Health check** - periodically verifies SMC state matches expected values
+- **Update notifications** - checks for new versions via Homebrew cask
 - **Animated menu bar icon** - battery shape with live charge level indicator
 - **Pinnable popover** - pin the panel to keep it open while you work
 - **Launch at login** - start automatically when you log in
@@ -215,7 +219,7 @@ When discharge is activated, the SMCWriter spawns a **watchdog daemon** via `pos
 
 The watchdog must be spawned with `posix_spawn` (not `fork`) because the Swift/ObjC runtime is not fork-safe — forked children crash when using Foundation, IOKit, or Objective-C APIs. Similarly, signal handlers (`SIGTERM`/`SIGHUP`) cannot be used for cleanup because they can only call async-signal-safe C functions, not Swift/Foundation/IOKit APIs.
 
-On app launch, any orphaned watchdog processes from a previous crash are killed via `pkill`, and CHIE/sleep settings are unconditionally cleared as a safety measure.
+On app launch, any orphaned watchdog processes from a previous crash are killed via `pkill`, and CHIE/sleep settings are cleared. If auto charge management is enabled and the battery is at or above the lower bound, CHTE is set to inhibit (micro-charge prevention); otherwise CHTE is cleared.
 
 ### Process Architecture
 
