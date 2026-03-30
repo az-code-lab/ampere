@@ -229,11 +229,48 @@ func setDischargeSleepPrevention(enabled: Bool) -> Bool {
 // MARK: - Main
 
 guard CommandLine.arguments.count == 2 else {
-    fputs("Usage: smc-writer inhibit|allow|discharge:pid|nodischarge\n", stderr)
+    fputs("Usage: smc-writer inhibit|allow|discharge:pid|nodischarge|watchdog:pid\n", stderr)
     exit(1)
 }
 
 let action = CommandLine.arguments[1]
+
+/// Spawn a detached watchdog daemon that monitors the given app PID.
+/// When the app dies, the watchdog clears CHTE, CHIE, and restores sleep.
+func spawnWatchdog(appPID: Int32) -> Bool {
+    let execPath = CommandLine.arguments[0]
+    var spawnPid: pid_t = 0
+    var fileActions: posix_spawn_file_actions_t?
+    posix_spawn_file_actions_init(&fileActions)
+    posix_spawn_file_actions_addopen(&fileActions, STDIN_FILENO, "/dev/null", O_RDONLY, 0)
+    posix_spawn_file_actions_addopen(&fileActions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0)
+    posix_spawn_file_actions_addopen(&fileActions, STDERR_FILENO, "/dev/null", O_WRONLY, 0)
+
+    let arg0 = strdup(execPath)!
+    let arg1 = strdup("watchdog:\(appPID)")!
+    var args: [UnsafeMutablePointer<CChar>?] = [arg0, arg1, nil]
+    let result = posix_spawn(&spawnPid, execPath, &fileActions, nil, &args, nil)
+    posix_spawn_file_actions_destroy(&fileActions)
+    free(arg0)
+    free(arg1)
+
+    if result != 0 {
+        fputs("WARNING: Failed to spawn watchdog (errno \(result))\n", stderr)
+        return false
+    }
+    return true
+}
+
+// "spawn-watchdog:PID" — spawn a watchdog daemon and exit immediately.
+if action.hasPrefix("spawn-watchdog:") {
+    guard let appPID = Int32(action.dropFirst("spawn-watchdog:".count)) else {
+        fputs("ERROR: invalid PID\n", stderr)
+        exit(1)
+    }
+    _ = spawnWatchdog(appPID: appPID)
+    print("OK: watchdog spawned")
+    exit(0)
+}
 
 // "discharge:PID" — set sleep prevention, write CHIE, spawn watchdog daemon, exit.
 if action.hasPrefix("discharge:") {
@@ -258,28 +295,7 @@ if action.hasPrefix("discharge:") {
     }
     IOServiceClose(conn)
 
-    // Spawn a watchdog daemon as a separate process via posix_spawn.
-    // The daemon monitors the app PID and cleans up if it dies.
-    // Using posix_spawn (not fork) because Swift runtime is not fork-safe.
-    let execPath = CommandLine.arguments[0]
-    var spawnPid: pid_t = 0
-    var fileActions: posix_spawn_file_actions_t?
-    posix_spawn_file_actions_init(&fileActions)
-    posix_spawn_file_actions_addopen(&fileActions, STDIN_FILENO, "/dev/null", O_RDONLY, 0)
-    posix_spawn_file_actions_addopen(&fileActions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0)
-    posix_spawn_file_actions_addopen(&fileActions, STDERR_FILENO, "/dev/null", O_WRONLY, 0)
-
-    let arg0 = strdup(execPath)!
-    let arg1 = strdup("watchdog:\(appPID)")!
-    var args: [UnsafeMutablePointer<CChar>?] = [arg0, arg1, nil]
-    let spawnResult = posix_spawn(&spawnPid, execPath, &fileActions, nil, &args, nil)
-    posix_spawn_file_actions_destroy(&fileActions)
-    free(arg0)
-    free(arg1)
-
-    if spawnResult != 0 {
-        fputs("WARNING: Failed to spawn watchdog (errno \(spawnResult))\n", stderr)
-    }
+    _ = spawnWatchdog(appPID: appPID)
 
     print("OK: active discharge enabled")
     exit(0)
@@ -313,7 +329,7 @@ if action.hasPrefix("watchdog:") {
 // One-shot commands
 let validActions: Set<String> = ["inhibit", "allow", "nodischarge"]
 guard validActions.contains(action) else {
-    fputs("Usage: smc-writer inhibit|allow|discharge:pid|nodischarge\n", stderr)
+    fputs("Usage: smc-writer inhibit|allow|discharge:pid|nodischarge|watchdog:pid\n", stderr)
     exit(1)
 }
 

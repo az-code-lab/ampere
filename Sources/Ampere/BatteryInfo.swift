@@ -78,9 +78,12 @@ final class BatteryMonitor: ObservableObject {
             if shouldInhibit {
                 chargingPaused = true
             }
+            let pid = ProcessInfo.processInfo.processIdentifier
             smcQueue.async { [weak self] in
                 let okDischarge = self?.runSMCWriteViaSudo("nodischarge") ?? false
                 let okChte = self?.runSMCWriteViaSudo(shouldInhibit ? "inhibit" : "allow") ?? false
+                // Always spawn a watchdog so CHTE/CHIE are cleared if the app is killed
+                _ = self?.runSMCWriteViaSudo("spawn-watchdog:\(pid)")
                 if okDischarge && okChte {
                     NSLog("Ampere: Launch cleanup done (inhibit=%d)", shouldInhibit)
                 } else {
@@ -314,9 +317,11 @@ final class BatteryMonitor: ObservableObject {
         return ok
     }
 
-    /// Stop discharge: clear CHIE, kill watchdog, and restore sleep via one-shot command.
+    /// Stop discharge: clear CHIE, kill watchdog, restore sleep, then re-spawn
+    /// a watchdog so CHTE is still protected if the app is killed.
     private func stopDischarge() {
         _ = runSMCWriteViaSudo("nodischarge")
+        _ = runSMCWriteViaSudo("spawn-watchdog:\(ProcessInfo.processInfo.processIdentifier)")
         NSLog("Ampere: discharge stopped")
     }
 
