@@ -172,7 +172,7 @@ This section documents the implementation details of SMC-based charge control an
 
 | Key | Type | Description |
 |------|------|-------------|
-| `CHTE` | `ui32` (4 bytes) | Charge terminate / inhibit. `0x01000000` paused, `0x00000000` allowed. |
+| `CHTE` | `ui32` (4 bytes) | Charge terminate / inhibit. `0x01 00 00 00` paused, `0x00 00 00 00` allowed. |
 | `CHIE` | `hex_` (1 byte) | Charge inhibit enable / discharge. `0x08` discharge, `0x00` normal. |
 
 Both keys are written via IOKit's `IOConnectCallStructMethod` (selector 2) to the `AppleSMCKeysEndpoint` service (falling back to `AppleSMC`). Writing requires root privileges. Reading does not require root.
