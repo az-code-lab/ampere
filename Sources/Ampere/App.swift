@@ -72,10 +72,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
     }
 
+    private var lastIconPct: Int = -1
+    private var lastIconCharging: Bool = false
+
     private func updateMenuBarIcon() {
         guard let button = statusItem.button else { return }
         let pct = monitor.state?.percentage ?? 0
         let isCharging = monitor.state?.isCharging ?? false
+
+        // Skip redraw if nothing visible changed
+        guard pct != lastIconPct || isCharging != lastIconCharging else { return }
+        lastIconPct = pct
+        lastIconCharging = isCharging
 
         button.image = buildMenuBarIcon(
             percentage: CGFloat(pct),
