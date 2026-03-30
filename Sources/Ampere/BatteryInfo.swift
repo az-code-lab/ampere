@@ -462,9 +462,6 @@ final class BatteryMonitor: ObservableObject {
         refreshCount += 1
         var battery = Self.readBattery()
 
-        // Always update state immediately so the UI has data
-        state = battery
-
         // Stop discharge if the toggle was turned off or auto-manage was disabled
         if activeDischarging && (!autoDischargeEnabled || !autoManageEnabled) && !autoManageInFlight {
             autoManageInFlight = true
@@ -477,7 +474,6 @@ final class BatteryMonitor: ObservableObject {
                         self.activeDischarging = false
                         NSLog("Ampere: Auto-discharge toggled off")
                     }
-                    self.refresh()
                 }
             }
             return
@@ -496,7 +492,6 @@ final class BatteryMonitor: ObservableObject {
                             self.activeDischarging = true
                             NSLog("Ampere: Auto-discharge started at %d%%, target %d%%", b.percentage, self.chargeUpperBound)
                         }
-                        self.refresh()
                     }
                 }
                 return
@@ -511,7 +506,6 @@ final class BatteryMonitor: ObservableObject {
                             self.activeDischarging = false
                             NSLog("Ampere: Auto-discharge reached target %d%%", self.chargeUpperBound)
                         }
-                        self.refresh()
                     }
                 }
                 return
@@ -534,7 +528,6 @@ final class BatteryMonitor: ObservableObject {
                             self.chargeToUpperBound = false
                             NSLog("Ampere: Inhibited charging at %d%%", b.percentage)
                         }
-                        self.refresh()
                     }
                 }
             } else if chargingPaused && (b.percentage < chargeLowerBound || chargeToUpperBound) {
@@ -549,7 +542,6 @@ final class BatteryMonitor: ObservableObject {
                             self.chargingPaused = false
                             NSLog("Ampere: Charging from %d%% to %d%%", b.percentage, self.chargeUpperBound)
                         }
-                        self.refresh()
                     }
                 }
             }
@@ -584,8 +576,8 @@ final class BatteryMonitor: ObservableObject {
         state = battery
 
         // Health check: verify SMC state matches expected state.
-        // Skip during the first few cycles to allow initial cleanup to settle.
-        if refreshCount > 3, !autoManageInFlight, isSudoRuleInstalled,
+        // Run every ~60s (12 cycles × 5s), skip first few cycles for cleanup to settle.
+        if refreshCount > 3, refreshCount % 12 == 0, !autoManageInFlight, isSudoRuleInstalled,
            let b = battery, b.adapterConnected {
             performHealthCheck(battery: b)
         } else {
