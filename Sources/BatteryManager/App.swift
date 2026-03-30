@@ -396,7 +396,7 @@ struct ContentView: View {
             if state.percentage > monitor.chargeUpperBound {
                 return "Auto: not charging — drains to \(monitor.chargeUpperBound)% under load"
             }
-            return "Auto: holding at \(monitor.chargeUpperBound)% — charges below \(monitor.chargeLowerBound)%"
+            return "Auto: holding — charges below \(monitor.chargeLowerBound)% or on demand"
         }
         if monitor.autoManageEnabled && state.isCharging {
             return "Auto: charging to \(monitor.chargeUpperBound)%"
@@ -526,21 +526,40 @@ struct ContentView: View {
             .padding(.top, 2)
             .background(WindowDragBlocker())
 
-            HStack {
-                Image(systemName: "arrow.down.to.line")
-                    .font(.system(size: 14))
-                    .foregroundColor(monitor.autoDischargeEnabled ? .accentColor : .secondary)
-                Text("Discharge to Upper Bound")
-                    .font(.system(size: 13, weight: .semibold))
-                Spacer()
-                Toggle("", isOn: Binding(
-                    get: { monitor.autoDischargeEnabled },
-                    set: { newValue in
-                        monitor.autoDischargeEnabled = newValue
-                    }
-                ))
-                .toggleStyle(.switch)
-                .controlSize(.small)
+            if state.percentage > monitor.chargeUpperBound {
+                HStack {
+                    Image(systemName: "arrow.down.to.line")
+                        .font(.system(size: 14))
+                        .foregroundColor(monitor.autoDischargeEnabled ? .accentColor : .secondary)
+                    Text("Discharge to Upper Bound")
+                        .font(.system(size: 13, weight: .semibold))
+                    Spacer()
+                    Toggle("", isOn: Binding(
+                        get: { monitor.autoDischargeEnabled },
+                        set: { newValue in
+                            monitor.autoDischargeEnabled = newValue
+                        }
+                    ))
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                }
+            } else {
+                HStack {
+                    Image(systemName: "arrow.up.to.line")
+                        .font(.system(size: 14))
+                        .foregroundColor(monitor.chargeToUpperBound ? .accentColor : .secondary)
+                    Text("Charge to Upper Bound")
+                        .font(.system(size: 13, weight: .semibold))
+                    Spacer()
+                    Toggle("", isOn: Binding(
+                        get: { monitor.chargeToUpperBound },
+                        set: { newValue in
+                            monitor.chargeToUpperBound = newValue
+                        }
+                    ))
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                }
             }
 
         }

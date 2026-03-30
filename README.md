@@ -52,14 +52,27 @@ Pausing/resuming charging requires root access to write to the SMC. BatteryManag
 When enabled, the app automatically manages charging between configurable bounds:
 
 - **Below lower bound** - starts charging, continues until the upper bound is reached
-- **Between bounds** - holds (charging inhibited)
-- **Above upper bound** - inhibits charging; battery drains passively under system load
+- **Between bounds** - holds (charging inhibited); use **Charge to Upper Bound** to explicitly start charging
+- **Above upper bound** - inhibits charging; use **Discharge to Upper Bound** to actively drain to the target
 
-### Discharge to Upper Bound
+#### Micro-Charge Prevention
 
-An optional toggle within auto charge management. When enabled, the app actively discharges the battery down to the upper bound when the current level exceeds it, rather than waiting for passive drain under load.
+To protect battery longevity, the app prevents unnecessary short charge cycles between bounds. When the charge level is between the lower and upper bounds, charging is inhibited by default — including after an app restart or crash. The only ways charging begins are:
+
+1. The battery drops below the **lower bound** (automatic — charges all the way to the upper bound)
+2. The user toggles **Charge to Upper Bound** (explicit — charges to the upper bound, then resets)
+
+This ensures charge cycles are always full (lower → upper) rather than fragmented micro-charges.
+
+#### Discharge to Upper Bound
+
+When the battery is above the upper bound, this toggle appears. When enabled, the app actively discharges the battery down to the upper bound, rather than waiting for passive drain under load.
 
 **Note:** While discharge is active, system sleep is temporarily disabled (displayed as a warning in the UI). Sleep is restored immediately when discharge stops (either by reaching the target or toggling off). If the app is force-killed or crashes, a watchdog daemon automatically cleans up within a few seconds.
+
+#### Charge to Upper Bound
+
+When the battery is at or below the upper bound and charging is inhibited, this toggle appears. When enabled, the app allows charging until the upper bound is reached, then automatically resets the toggle and re-inhibits charging.
 
 ### Manual Charge Control
 

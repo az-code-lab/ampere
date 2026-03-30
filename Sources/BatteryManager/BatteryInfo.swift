@@ -27,6 +27,7 @@ final class BatteryMonitor: ObservableObject {
     @Published var autoDischargeEnabled: Bool {
         didSet { UserDefaults.standard.set(autoDischargeEnabled, forKey: "autoDischargeEnabled") }
     }
+    @Published var chargeToUpperBound: Bool = false
     @Published var lastError: String?
     @Published var pinned: Bool = false
     @Published var healthWarning: String?
@@ -63,19 +64,24 @@ final class BatteryMonitor: ObservableObject {
         self.chargeLowerBound = defaults.object(forKey: "chargeLowerBound") as? Int ?? 40
         self.chargeUpperBound = defaults.object(forKey: "chargeUpperBound") as? Int ?? 60
 
-        // Always start fresh — clear CHTE/CHIE and kill orphaned watchdogs.
-        // Auto-manage will re-evaluate and re-inhibit on the first refresh if needed.
-        // Only run if sudo helper is installed (otherwise there's nothing to clean up,
-        // and sudo would prompt for a password).
+        // Always clear discharge (CHIE) and kill orphaned watchdogs on launch.
+        // For CHTE: if auto-manage is enabled and charge is at or above the lower
+        // bound, inhibit charging to prevent micro-charges between bounds after a
+        // restart. Only allow charging when charge drops below the lower bound.
         chargingPaused = false
         if isSudoRuleInstalled {
+            let shouldInhibit = autoManageEnabled
+                && (Self.readBattery()?.percentage ?? 0) >= chargeLowerBound
+            if shouldInhibit {
+                chargingPaused = true
+            }
             smcQueue.async { [weak self] in
                 let okDischarge = self?.runSMCWriteViaSudo("nodischarge") ?? false
-                let okAllow = self?.runSMCWriteViaSudo("allow") ?? false
-                if okDischarge && okAllow {
-                    NSLog("BatteryManager: Cleared CHTE/CHIE on launch")
+                let okChte = self?.runSMCWriteViaSudo(shouldInhibit ? "inhibit" : "allow") ?? false
+                if okDischarge && okChte {
+                    NSLog("BatteryManager: Launch cleanup done (inhibit=%d)", shouldInhibit)
                 } else {
-                    NSLog("BatteryManager: Launch cleanup failed (nodischarge=%d, allow=%d)", okDischarge, okAllow)
+                    NSLog("BatteryManager: Launch cleanup failed (nodischarge=%d, chte=%d)", okDischarge, okChte)
                 }
             }
         }
@@ -152,6 +158,7 @@ final class BatteryMonitor: ObservableObject {
                 if ok && !self.isSudoRuleInstalled {
                     self.autoManageEnabled = false
                     self.autoDischargeEnabled = false
+                    self.chargeToUpperBound = false
                     self.chargingPaused = false
                     self.activeDischarging = false
                 } else {
@@ -459,7 +466,7 @@ final class BatteryMonitor: ObservableObject {
             if lastError != nil { lastError = nil }
 
             if !chargingPaused && b.percentage >= chargeUpperBound {
-                // At or above upper bound — inhibit charging
+                // At or above upper bound — inhibit charging and reset charge-to-upper toggle
                 autoManageInFlight = true
                 smcQueue.async { [weak self] in
                     guard let self = self else { return }
@@ -468,13 +475,14 @@ final class BatteryMonitor: ObservableObject {
                         self.autoManageInFlight = false
                         if ok {
                             self.chargingPaused = true
+                            self.chargeToUpperBound = false
                             NSLog("BatteryManager: Inhibited charging at %d%%", b.percentage)
                         }
                         self.refresh()
                     }
                 }
-            } else if chargingPaused && b.percentage < chargeLowerBound {
-                // Below lower bound — start charging (will continue to upper bound)
+            } else if chargingPaused && (b.percentage < chargeLowerBound || chargeToUpperBound) {
+                // Below lower bound or user explicitly requested charge to upper bound
                 autoManageInFlight = true
                 smcQueue.async { [weak self] in
                     guard let self = self else { return }
@@ -509,6 +517,7 @@ final class BatteryMonitor: ObservableObject {
                 // Adapter disconnected — clear inhibit/discharge so charging works when plugged back in
                 chargingPaused = false
                 activeDischarging = false
+                chargeToUpperBound = false
                 smcQueue.async { [weak self] in
                     self?.runSMCWrite("allow")
                     self?.runSMCWrite("nodischarge")
