@@ -32,7 +32,8 @@ final class BatteryMonitor: ObservableObject {
     @Published var smcCHTE: String = "?"
     @Published var smcCHIE: String = "?"
     @Published var healthWarning: String?
-    @Published var lastHealthCheckResult: String = "pending"
+    @Published var lastHealthCheckStatus: String = "pending"
+    @Published var lastHealthCheckSMC: String = ""
     @Published var lastHealthCheckTime: Date?
 
     @Published var autoManageEnabled: Bool {
@@ -368,18 +369,6 @@ final class BatteryMonitor: ObservableObject {
         return "0x\(hex)"
     }
 
-    /// Read the raw numeric value of CHTE (0 = charging allowed, 1 = charging paused).
-    private static func smcReadCHTEValue() -> Int? {
-        guard let bytes = smcReadKey("CHTE"), bytes.count == 4 else { return nil }
-        return bytes.withUnsafeBytes { Int($0.load(as: UInt32.self)) }
-    }
-
-    /// Read the raw numeric value of CHIE (0x00 = normal, 0x08 = discharge active).
-    private static func smcReadCHIEValue() -> Int? {
-        guard let bytes = smcReadKey("CHIE"), bytes.count == 1 else { return nil }
-        return Int(bytes[0])
-    }
-
     // MARK: - Health Check
 
     /// Health check for manual mode.
@@ -569,12 +558,20 @@ final class BatteryMonitor: ObservableObject {
         }
     }
 
+    /// Format raw SMC bytes as hex string, e.g. "0x01 00 00 00".
+    private static func formatHex(_ bytes: [UInt8]) -> String {
+        "0x" + bytes.map { String(format: "%02x", $0) }.joined(separator: " ")
+    }
+
     private func performHealthCheck(battery: BatteryState) {
-        guard let chte = Self.smcReadCHTEValue(),
-              let chie = Self.smcReadCHIEValue() else {
+        guard let chteBytes = Self.smcReadKey("CHTE"), chteBytes.count == 4,
+              let chieBytes = Self.smcReadKey("CHIE"), chieBytes.count == 1 else {
             healthWarning = nil
             return
         }
+
+        let chte = chteBytes.withUnsafeBytes { Int($0.load(as: UInt32.self)) }
+        let chie = Int(chieBytes[0])
 
         let healthy: Bool
         if autoManageEnabled {
@@ -592,12 +589,15 @@ final class BatteryMonitor: ObservableObject {
             )
         }
 
+        let chteHex = Self.formatHex(chteBytes)
+        let chieHex = Self.formatHex(chieBytes)
         lastHealthCheckTime = Date()
+        lastHealthCheckSMC = "CHTE=\(chteHex)\nCHIE=\(chieHex)"
         if healthy {
-            lastHealthCheckResult = "pass\nCHTE=\(chte) CHIE=\(chie)"
+            lastHealthCheckStatus = "pass"
             healthWarning = nil
         } else {
-            lastHealthCheckResult = "FAIL\nCHTE=\(chte) CHIE=\(chie)"
+            lastHealthCheckStatus = "FAIL"
             NSLog("BatteryManager: Health check failed — CHTE=%d CHIE=%d charge=%d%% paused=%d auto=%d discharge=%d bounds=[%d,%d]",
                   chte, chie, battery.percentage, chargingPaused, autoManageEnabled, autoDischargeEnabled,
                   chargeLowerBound, chargeUpperBound)

@@ -78,24 +78,24 @@ The app periodically verifies that the actual SMC key values (`CHTE` and `CHIE`)
 
 | Pause button | Expected CHTE | Expected CHIE |
 |---|---|---|
-| Paused | 1 | 0 |
-| Resumed | 0 | 0 |
+| Paused | `0x01 00 00 00` | `0x00` |
+| Resumed | `0x00 00 00 00` | `0x00` |
 
 #### Auto Mode — Discharge to Upper Bound OFF
 
 | Charge level | Expected CHTE | Expected CHIE |
 |---|---|---|
-| >= upper bound | 1 | 0 |
-| >= lower bound and < upper bound | 0 or 1 | 0 |
-| < lower bound | 0 | 0 |
+| >= upper bound | `0x01 00 00 00` | `0x00` |
+| >= lower bound and < upper bound | `0x00 00 00 00` or `0x01 00 00 00` | `0x00` |
+| < lower bound | `0x00 00 00 00` | `0x00` |
 
 #### Auto Mode — Discharge to Upper Bound ON
 
 | Charge level | Expected CHTE | Expected CHIE |
 |---|---|---|
-| > upper bound | 1 | 8 |
-| >= lower bound and <= upper bound | 0 or 1 | 0 |
-| < lower bound | 0 | 0 |
+| > upper bound | `0x01 00 00 00` | `0x08` |
+| >= lower bound and <= upper bound | `0x00 00 00 00` or `0x01 00 00 00` | `0x00` |
+| < lower bound | `0x00 00 00 00` | `0x00` |
 
 ## Build from Source
 

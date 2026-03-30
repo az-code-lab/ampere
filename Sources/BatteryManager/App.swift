@@ -315,10 +315,33 @@ struct ContentView: View {
             }
             .padding(.horizontal, 16)
             .padding(.top, 4)
-            .alert("BatteryManager \(AppVersion.current)", isPresented: $showAbout) {
-                Button("OK") {}
-            } message: {
-                Text("Battery status monitor and charge controller for Apple Silicon Macs.\n\nHealth check: \(monitor.lastHealthCheckResult)\nChecked at: \(healthCheckTimeString)\n\nRequires admin privileges for charge control.")
+            .sheet(isPresented: $showAbout) {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("BatteryManager \(AppVersion.current)")
+                        .font(.headline)
+                    Text("Battery status monitor and charge controller for Apple Silicon Macs.")
+                        .font(.system(size: 12))
+                        .foregroundColor(.secondary)
+                    Divider()
+                    Text("Health check: \(monitor.lastHealthCheckStatus)")
+                        .font(.system(size: 12))
+                    Text(monitor.lastHealthCheckSMC)
+                        .font(.system(size: 12, design: .monospaced))
+                    Text("Checked at: \(healthCheckTimeString)")
+                        .font(.system(size: 12))
+                        .foregroundColor(.secondary)
+                    Divider()
+                    Text("Requires admin privileges for charge control.")
+                        .font(.system(size: 12))
+                        .foregroundColor(.secondary)
+                    HStack {
+                        Spacer()
+                        Button("OK") { showAbout = false }
+                            .keyboardShortcut(.defaultAction)
+                    }
+                }
+                .padding(20)
+                .frame(width: 300)
             }
         }
         .padding(.vertical, 20)
