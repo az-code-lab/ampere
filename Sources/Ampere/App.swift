@@ -39,9 +39,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         popover.contentSize = NSSize(width: 340, height: 620)
         popover.behavior = .transient
         popover.delegate = self
-        popover.contentViewController = NSHostingController(
-            rootView: ContentView(monitor: monitor)
-        )
 
         // Observe pinned state to change popover behavior
         pinnedObserver = monitor.$pinned.sink { [weak self] pinned in
@@ -99,11 +96,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if popover.isShown {
             popover.performClose(nil)
         } else {
-            // Refresh data before showing
-            monitor.refresh()
+            // Create hosting controller on demand so SwiftUI doesn't run when hidden
+            popover.contentViewController = NSHostingController(
+                rootView: ContentView(monitor: monitor)
+            )
+            monitor.setFastPolling(true)
             updateMenuBarIcon()
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-            // Bring popover to front
             NSApp.activate(ignoringOtherApps: true)
         }
     }
@@ -118,6 +117,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     func popoverDidClose(_ notification: Notification) {
         monitor.pinned = false
+        monitor.setFastPolling(false)
+        // Destroy the SwiftUI view to stop display-cycle layout passes
+        popover.contentViewController = nil
     }
 
     deinit {
@@ -367,11 +369,14 @@ struct ContentView: View {
         return .onBattery
     }
 
+    private func batteryIcon(_ state: BatteryState) -> StaticBatteryBody {
+        StaticBatteryBody(percentage: Double(state.percentage), mode: batteryMode(state))
+    }
+
     private func batteryHeader(_ state: BatteryState) -> some View {
         VStack(spacing: 8) {
             VStack(spacing: 12) {
-                BatteryShape(percentage: Double(state.percentage),
-                             mode: batteryMode(state))
+                batteryIcon(state)
                     .frame(width: 100, height: 48)
 
                 Text("\(state.percentage)%")
@@ -500,10 +505,11 @@ struct ContentView: View {
                 get: { monitor.autoManageEnabled },
                 set: { newValue in
                     if newValue {
+                        // Set immediately so the toggle doesn't flicker
+                        monitor.autoManageEnabled = true
                         monitor.ensureSudoInstalled { ok in
-                            if ok {
-                                monitor.autoManageEnabled = true
-                            } else {
+                            if !ok {
+                                monitor.autoManageEnabled = false
                                 monitor.lastError = "Admin access required for auto charge management"
                             }
                         }
@@ -658,9 +664,9 @@ enum BatteryMode {
     case onBattery
 }
 
-struct BatteryShape: View {
+private struct StaticBatteryBody: View {
     let percentage: Double
-    var mode: BatteryMode = .onBattery
+    let mode: BatteryMode
 
     private var fillColor: Color {
         if percentage <= 15 { return .red }
@@ -668,120 +674,36 @@ struct BatteryShape: View {
         return .green
     }
 
-    // Shimmer: 3s sweep + 2s pause
-    private static let sweepDuration: Double = 3.0
-    private static let pauseDuration: Double = 2.0
-    private static var cycleDuration: Double { sweepDuration + pauseDuration }
-
-    private func shimmerPhase(time: Double) -> CGFloat {
-        let pos = time.truncatingRemainder(dividingBy: Self.cycleDuration)
-        guard pos < Self.sweepDuration else { return -1 } // off-screen during pause
-        // Ease in-out for smoother start/stop
-        let t = pos / Self.sweepDuration
-        let eased = t * t * (3 - 2 * t) // smoothstep
-        let raw = CGFloat(eased) * 1.6 - 0.3 // range: -0.3 to 1.3
-        return (mode == .onBattery || mode == .discharging) ? (1.3 - (raw + 0.3)) : raw
-    }
-
-    private func iconPulse(time: Double) -> Double {
-        0.65 + 0.35 * sin(time * 2.0 * Double.pi / 3.0)
-    }
-
-    private func glowPulse(time: Double) -> CGFloat {
-        CGFloat(4.0 + 4.0 * sin(time * 2.0 * Double.pi / 4.0))
-    }
-
-    private func breathePulse(time: Double) -> Double {
-        0.6 + 0.4 * sin(time * 2.0 * Double.pi / 2.5)
+    private var iconName: String {
+        switch mode {
+        case .charging: return "bolt.fill"
+        case .discharging, .onBattery: return "bolt.slash"
+        case .onACNotCharging: return "powerplug.fill"
+        }
     }
 
     var body: some View {
-        TimelineView(.animation) { timeline in
-            let t = timeline.date.timeIntervalSinceReferenceDate
-            let phase = shimmerPhase(time: t)
-            let glow = glowPulse(time: t)
-            let icon = iconPulse(time: t)
-            let breathe = breathePulse(time: t)
+        HStack(spacing: 0) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(Color.primary.opacity(0.4), lineWidth: 2)
 
-            GeometryReader { geo in
-                let bodyW = geo.size.width - 6
-                let h = geo.size.height
-                let inset: CGFloat = 3
-                let fillW = max(0, (bodyW - inset * 2) * percentage / 100)
+                RoundedRectangle(cornerRadius: 3.5)
+                    .fill(fillColor)
+                    .padding(3)
+                    .scaleEffect(x: percentage / 100, y: 1, anchor: .leading)
 
-                ZStack(alignment: .leading) {
-                    // Glow behind battery
-                    if mode == .charging || mode == .onBattery || mode == .discharging {
-                        RoundedRectangle(cornerRadius: 8)
-                            .fill(fillColor.opacity(0.3))
-                            .frame(width: bodyW + 4, height: h + 4)
-                            .blur(radius: glow)
-                            .offset(x: -2)
-                    }
-
-                    // Battery outline
-                    RoundedRectangle(cornerRadius: 6)
-                        .stroke(Color.primary.opacity(0.4), lineWidth: 2)
-                        .frame(width: bodyW, height: h)
-
-                    // Battery cap
-                    RoundedRectangle(cornerRadius: 2)
-                        .fill(Color.primary.opacity(0.4))
-                        .frame(width: 6, height: h * 0.35)
-                        .offset(x: bodyW - 1)
-
-                    // Fill + shimmer
-                    ZStack(alignment: .leading) {
-                        RoundedRectangle(cornerRadius: 3.5)
-                            .fill(fillColor)
-                            .frame(width: fillW, height: h - inset * 2)
-
-                        if (mode == .charging || mode == .onBattery || mode == .discharging) && fillW > 0 && phase > -0.5 {
-                            RoundedRectangle(cornerRadius: 3.5)
-                                .fill(
-                                    LinearGradient(
-                                        colors: [.clear, .white.opacity(0.35), .clear],
-                                        startPoint: UnitPoint(x: phase - 0.3, y: 0),
-                                        endPoint: UnitPoint(x: phase + 0.3, y: 0)
-                                    )
-                                )
-                                .frame(width: fillW, height: h - inset * 2)
-                        }
-                    }
-                    .offset(x: inset)
-                    .clipped()
-
-                    // Bolt when charging
-                    if mode == .charging {
-                        Image(systemName: "bolt.fill")
-                            .font(.system(size: 18, weight: .bold))
-                            .foregroundColor(.white)
-                            .shadow(color: .black.opacity(0.3), radius: 1, x: 0, y: 1)
-                            .opacity(icon)
-                            .frame(width: bodyW, height: h)
-                    }
-
-                    // Bolt slash when draining (on battery or actively discharging)
-                    if mode == .onBattery || mode == .discharging {
-                        Image(systemName: "bolt.slash")
-                            .font(.system(size: 18, weight: .bold))
-                            .foregroundColor(.white)
-                            .shadow(color: .black.opacity(0.3), radius: 1, x: 0, y: 1)
-                            .opacity(icon)
-                            .frame(width: bodyW, height: h)
-                    }
-
-                    // Plug when on AC but paused
-                    if mode == .onACNotCharging {
-                        Image(systemName: "powerplug.fill")
-                            .font(.system(size: 14, weight: .medium))
-                            .foregroundColor(.white.opacity(0.8))
-                            .shadow(color: .black.opacity(0.3), radius: 1, x: 0, y: 1)
-                            .opacity(breathe)
-                            .frame(width: bodyW, height: h)
-                    }
-                }
+                Image(systemName: iconName)
+                    .font(.system(size: mode == .onACNotCharging ? 14 : 18,
+                                  weight: mode == .onACNotCharging ? .medium : .bold))
+                    .foregroundColor(.white)
+                    .opacity(0.8)
             }
+
+            RoundedRectangle(cornerRadius: 2)
+                .fill(Color.primary.opacity(0.4))
+                .frame(width: 5, height: 16)
+                .padding(.leading, -1)
         }
     }
 }

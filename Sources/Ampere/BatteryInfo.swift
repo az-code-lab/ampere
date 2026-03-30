@@ -3,7 +3,7 @@ import AppKit
 import IOKit.ps
 import Shared
 
-struct BatteryState {
+struct BatteryState: Equatable {
     let percentage: Int
     let cycleCount: Int
     let isCharging: Bool
@@ -53,6 +53,7 @@ final class BatteryMonitor: ObservableObject {
     private var terminationObserver: NSObjectProtocol?
     private var autoManageInFlight = false
     private var refreshCount = 0
+    private(set) var popoverVisible = false
     private let smcQueue = DispatchQueue(label: "com.ampere.smc", qos: .utility)
 
     private static let sudoersPath = AppConstants.sudoersPath
@@ -89,7 +90,7 @@ final class BatteryMonitor: ObservableObject {
         }
 
         refresh()
-        timer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: 60.0, repeats: true) { [weak self] _ in
             self?.refresh()
         }
         // Check for updates: 5 minutes after launch, then once daily at a random interval
@@ -126,6 +127,17 @@ final class BatteryMonitor: ObservableObject {
         updateCheckTimer?.invalidate()
         if let observer = terminationObserver {
             NotificationCenter.default.removeObserver(observer)
+        }
+    }
+
+    /// Switch to fast (10s) or slow (60s) polling based on popover visibility.
+    func setFastPolling(_ fast: Bool) {
+        popoverVisible = fast
+        timer?.invalidate()
+        let interval: TimeInterval = fast ? 10.0 : 60.0
+        if fast { refresh() }
+        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+            self?.refresh()
         }
     }
 
@@ -462,6 +474,17 @@ final class BatteryMonitor: ObservableObject {
         refreshCount += 1
         var battery = Self.readBattery()
 
+        // Only publish to SwiftUI when popover is visible to avoid expensive layout passes
+        if popoverVisible {
+            state = battery
+        } else if state == nil {
+            // First refresh on launch — always publish so menu bar icon has data
+            state = battery
+        } else if let old = state, old.percentage != battery?.percentage || old.isCharging != battery?.isCharging {
+            // Menu bar icon needs updating
+            state = battery
+        }
+
         // Stop discharge if the toggle was turned off or auto-manage was disabled
         if activeDischarging && (!autoDischargeEnabled || !autoManageEnabled) && !autoManageInFlight {
             autoManageInFlight = true
@@ -550,17 +573,19 @@ final class BatteryMonitor: ObservableObject {
         if chargingPaused, let b = battery {
             if b.adapterConnected {
                 // Clear stale time-to-full and ensure state reflects paused charging
-                battery = BatteryState(
-                    percentage: b.percentage, cycleCount: b.cycleCount,
-                    isCharging: false,
-                    adapterConnected: true,
-                    health: b.health, temperature: b.temperature,
-                    timeRemaining: "",
-                    designCapacity: b.designCapacity, maxCapacity: b.maxCapacity,
-                    currentCapacity: b.currentCapacity, amperage: b.amperage,
-                    voltage: b.voltage,
-                    batteryAgeYears: b.batteryAgeYears, batteryAgeDays: b.batteryAgeDays
-                )
+                if b.isCharging || !b.timeRemaining.isEmpty {
+                    battery = BatteryState(
+                        percentage: b.percentage, cycleCount: b.cycleCount,
+                        isCharging: false,
+                        adapterConnected: true,
+                        health: b.health, temperature: b.temperature,
+                        timeRemaining: "",
+                        designCapacity: b.designCapacity, maxCapacity: b.maxCapacity,
+                        currentCapacity: b.currentCapacity, amperage: b.amperage,
+                        voltage: b.voltage,
+                        batteryAgeYears: b.batteryAgeYears, batteryAgeDays: b.batteryAgeDays
+                    )
+                }
             } else {
                 // Adapter disconnected — clear inhibit/discharge so charging works when plugged back in
                 chargingPaused = false
@@ -573,14 +598,17 @@ final class BatteryMonitor: ObservableObject {
             }
         }
 
-        state = battery
+        // Update state again if it was modified (e.g. cleared timeRemaining when paused)
+        if popoverVisible, state != battery {
+            state = battery
+        }
 
         // Health check: verify SMC state matches expected state.
-        // Run every ~60s (12 cycles × 5s), skip first few cycles for cleanup to settle.
+        // Run every 12 refresh cycles, skip first few cycles for cleanup to settle.
         if refreshCount > 3, refreshCount % 12 == 0, !autoManageInFlight, isSudoRuleInstalled,
            let b = battery, b.adapterConnected {
             performHealthCheck(battery: b)
-        } else {
+        } else if healthWarning != nil {
             healthWarning = nil
         }
     }
