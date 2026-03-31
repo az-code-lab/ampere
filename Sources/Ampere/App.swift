@@ -118,11 +118,26 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     func popoverDidDetach(_ popover: NSPopover) {
         monitor.pinned = true
+        // Observe the detached window closing — popoverDidClose only fires
+        // during the detach transition, NOT when the detached window is closed.
+        if let window = popover.contentViewController?.view.window {
+            NotificationCenter.default.addObserver(
+                self, selector: #selector(detachedWindowDidClose),
+                name: NSWindow.willCloseNotification, object: window
+            )
+        }
+    }
+
+    @objc private func detachedWindowDidClose(_ notification: Notification) {
+        NotificationCenter.default.removeObserver(self, name: NSWindow.willCloseNotification, object: notification.object)
+        monitor.pinned = false
+        monitor.setFastPolling(false)
     }
 
     func popoverDidClose(_ notification: Notification) {
-        // popoverDidClose also fires during detach (popover → window transition).
-        // Skip cleanup in that case — the user is still viewing the panel.
+        // popoverDidClose fires during detach (popover → window transition)
+        // but NOT when the detached window is closed. The detached window
+        // close is handled by detachedWindowDidClose above.
         guard !popover.isDetached else { return }
         monitor.pinned = false
         monitor.setFastPolling(false)
