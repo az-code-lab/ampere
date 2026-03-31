@@ -39,6 +39,7 @@ final class BatteryMonitor: ObservableObject {
     @Published var lastHealthCheckCHIEMatch: Bool = true
     @Published var lastHealthCheckTime: Date?
     @Published var updateAvailable: String?  // nil = no update, otherwise the new version string
+    @Published var isPopoverVisible: Bool = false
 
     @Published var autoManageEnabled: Bool {
         didSet {
@@ -145,6 +146,7 @@ final class BatteryMonitor: ObservableObject {
     /// Switch to fast (10s) or slow (60s) polling based on popover visibility.
     func setFastPolling(_ fast: Bool) {
         popoverVisible = fast
+        isPopoverVisible = fast
         timer?.invalidate()
         let interval: TimeInterval = fast ? 10.0 : 60.0
         if fast { refresh() }

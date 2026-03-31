@@ -413,7 +413,11 @@ struct ContentView: View {
     }
 
     private func batteryIcon(_ state: BatteryState) -> StaticBatteryBody {
-        StaticBatteryBody(percentage: Double(state.percentage), mode: batteryMode(state))
+        StaticBatteryBody(
+            percentage: Double(state.percentage),
+            mode: batteryMode(state),
+            animate: monitor.isPopoverVisible
+        )
     }
 
     private func batteryHeader(_ state: BatteryState) -> some View {
@@ -729,6 +733,9 @@ enum BatteryMode {
 private struct StaticBatteryBody: View {
     let percentage: Double
     let mode: BatteryMode
+    var animate: Bool = false
+
+    @State private var shimmerPhase: CGFloat = 0
 
     private var fillColor: Color {
         if percentage <= 15 { return .red }
@@ -744,16 +751,53 @@ private struct StaticBatteryBody: View {
         }
     }
 
+    private var shouldAnimate: Bool {
+        animate && (mode == .charging || mode == .discharging)
+    }
+
     var body: some View {
         HStack(spacing: 0) {
             ZStack {
                 RoundedRectangle(cornerRadius: 6)
                     .stroke(Color.primary.opacity(0.4), lineWidth: 2)
 
-                RoundedRectangle(cornerRadius: 3.5)
-                    .fill(fillColor)
-                    .padding(3)
-                    .scaleEffect(x: percentage / 100, y: 1, anchor: .leading)
+                // Battery fill
+                GeometryReader { geo in
+                    let inset: CGFloat = 3
+                    let totalWidth = geo.size.width - inset * 2
+                    let fillWidth = totalWidth * percentage / 100
+                    let fillHeight = geo.size.height - inset * 2
+
+                    ZStack {
+                        // Base color
+                        RoundedRectangle(cornerRadius: 3.5)
+                            .fill(fillColor)
+                            .frame(width: fillWidth, height: fillHeight)
+
+                        // Animated shimmer overlay
+                        if shouldAnimate {
+                            // A wide gradient strip that slides across
+                            let shimmerWidth = fillWidth * 2
+                            LinearGradient(
+                                colors: [
+                                    .clear,
+                                    .white.opacity(0.3),
+                                    .white.opacity(0.5),
+                                    .white.opacity(0.3),
+                                    .clear
+                                ],
+                                startPoint: .leading,
+                                endPoint: .trailing
+                            )
+                            .frame(width: shimmerWidth * 0.5, height: fillHeight)
+                            .offset(x: shimmerPhase * fillWidth)
+                            .frame(width: fillWidth, height: fillHeight)
+                            .clipShape(RoundedRectangle(cornerRadius: 3.5))
+                        }
+                    }
+                    .offset(x: inset, y: inset)
+                    .frame(width: fillWidth, height: fillHeight, alignment: .leading)
+                }
 
                 Image(systemName: iconName)
                     .font(.system(size: mode == .onACNotCharging ? 14 : 18,
@@ -766,6 +810,32 @@ private struct StaticBatteryBody: View {
                 .fill(Color.primary.opacity(0.4))
                 .frame(width: 5, height: 16)
                 .padding(.leading, -1)
+        }
+        .onChange(of: shouldAnimate) {
+            if shouldAnimate {
+                startAnimation()
+            } else {
+                withAnimation(.default) { shimmerPhase = 0 }
+            }
+        }
+        .onAppear {
+            if shouldAnimate {
+                startAnimation()
+            }
+        }
+    }
+
+    private func startAnimation() {
+        // Charging: shimmer flows left → right
+        // Discharging: shimmer flows right → left
+        let from: CGFloat = mode == .charging ? -1.0 : 1.0
+        let to: CGFloat = mode == .charging ? 1.0 : -1.0
+        shimmerPhase = from
+        withAnimation(
+            .linear(duration: 5.0)
+            .repeatForever(autoreverses: false)
+        ) {
+            shimmerPhase = to
         }
     }
 }
@@ -923,13 +993,11 @@ struct WindowDragBlocker: NSViewRepresentable {
     }
     func updateNSView(_ nsView: NSView, context: Context) {}
 
+    /// Prevents window drag only within this view's bounds.
+    /// Does NOT set window-level isMovableByWindowBackground, which would
+    /// disable drag for the entire window and cause intermittent unresponsiveness.
     private class NoDragView: NSView {
         override var mouseDownCanMoveWindow: Bool { false }
-
-        override func viewDidMoveToWindow() {
-            super.viewDidMoveToWindow()
-            window?.isMovableByWindowBackground = false
-        }
     }
 }
 
