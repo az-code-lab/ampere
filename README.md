@@ -106,29 +106,6 @@ The app polls battery state on a timer. Health checks run every poll cycle after
 
 Health checks also run immediately after revoking or re-granting admin access, so the warning clears (or appears) without waiting for the next scheduled check.
 
-#### Manual Mode
-
-| Pause button | Expected CHTE | Expected CHIE |
-|---|---|---|
-| Paused | `0x01 00 00 00` | `0x00` |
-| Resumed | `0x00 00 00 00` | `0x00` |
-
-#### Auto Mode — Discharge to Upper Bound OFF
-
-| Charge level | Expected CHTE | Expected CHIE |
-|---|---|---|
-| >= upper bound | `0x01 00 00 00` | `0x00` |
-| >= lower bound and < upper bound | `0x00 00 00 00` or `0x01 00 00 00` | `0x00` |
-| < lower bound | `0x00 00 00 00` | `0x00` |
-
-#### Auto Mode — Discharge to Upper Bound ON
-
-| Charge level | Expected CHTE | Expected CHIE |
-|---|---|---|
-| > upper bound | `0x01 00 00 00` | `0x08` |
-| >= lower bound and <= upper bound | `0x00 00 00 00` or `0x01 00 00 00` | `0x00` |
-| < lower bound | `0x00 00 00 00` | `0x00` |
-
 ## Build from Source
 
 ```bash
@@ -189,6 +166,29 @@ This section documents the implementation details of SMC-based charge control an
 |------|------|-------------|
 | `CHTE` | `ui32` (4 bytes) | Charge terminate / inhibit. `0x01 00 00 00` paused, `0x00 00 00 00` allowed. |
 | `CHIE` | `hex_` (1 byte) | Charge inhibit enable / discharge. `0x08` discharge, `0x00` normal. |
+
+#### Manual Mode
+
+| Pause button | Expected CHTE | Expected CHIE |
+|---|---|---|
+| Paused | `0x01 00 00 00` | `0x00` |
+| Resumed | `0x00 00 00 00` | `0x00` |
+
+#### Auto Mode — Discharge to Upper Bound OFF
+
+| Charge level | Expected CHTE | Expected CHIE |
+|---|---|---|
+| >= upper bound | `0x01 00 00 00` | `0x00` |
+| >= lower bound and < upper bound | `0x00 00 00 00` or `0x01 00 00 00` | `0x00` |
+| < lower bound | `0x00 00 00 00` | `0x00` |
+
+#### Auto Mode — Discharge to Upper Bound ON
+
+| Charge level | Expected CHTE | Expected CHIE |
+|---|---|---|
+| > upper bound | `0x01 00 00 00` | `0x08` |
+| >= lower bound and <= upper bound | `0x00 00 00 00` or `0x01 00 00 00` | `0x00` |
+| < lower bound | `0x00 00 00 00` | `0x00` |
 
 Both keys are written via IOKit's `IOConnectCallStructMethod` (selector 2) to the `AppleSMCKeysEndpoint` service (falling back to `AppleSMC`). Writing requires root privileges. Reading does not require root.
 
