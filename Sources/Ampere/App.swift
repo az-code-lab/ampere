@@ -624,6 +624,9 @@ struct ContentView: View {
                         get: { monitor.chargeToUpperBound },
                         set: { newValue in
                             monitor.chargeToUpperBound = newValue
+                            if !newValue {
+                                monitor.inhibitCharging()
+                            }
                         }
                     ))
                     .toggleStyle(.switch)

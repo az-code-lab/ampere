@@ -56,6 +56,7 @@ final class BatteryMonitor: ObservableObject {
     private var timer: Timer?
     private var updateCheckTimer: Timer?
     private var terminationObserver: NSObjectProtocol?
+    private var wakeObserver: NSObjectProtocol?
     private var autoManageInFlight = false
     private var refreshCount = 0
     private var popoverVisible = false
@@ -135,6 +136,27 @@ final class BatteryMonitor: ObservableObject {
             }
             _ = done.wait(timeout: .now() + 6.0)
         }
+
+        // Re-assert SMC state on wake — firmware or PD renegotiation can reset
+        // CHTE during sleep, allowing charging to bypass micro-charge prevention.
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self = self, self.isSudoRuleInstalled else { return }
+            NSLog("Ampere: System wake — re-asserting SMC state")
+            self.smcQueue.async {
+                if self.activeDischarging {
+                    _ = self.startDischarge()
+                } else if self.chargingPaused {
+                    _ = self.runSMCWriteViaSudo("inhibit")
+                    _ = self.runSMCWriteViaSudo("spawn-watchdog:\(ProcessInfo.processInfo.processIdentifier)")
+                }
+                DispatchQueue.main.async {
+                    self.refresh()
+                }
+            }
+        }
     }
 
     deinit {
@@ -142,6 +164,9 @@ final class BatteryMonitor: ObservableObject {
         updateCheckTimer?.invalidate()
         if let observer = terminationObserver {
             NotificationCenter.default.removeObserver(observer)
+        }
+        if let observer = wakeObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
         }
     }
 
@@ -861,6 +886,22 @@ final class BatteryMonitor: ObservableObject {
     }
 
     // MARK: - Toggle
+
+    /// Re-inhibit charging (e.g. when user toggles off "Charge to Upper Bound" mid-charge).
+    func inhibitCharging() {
+        guard !chargingPaused else { return }
+        smcQueue.async { [weak self] in
+            guard let self = self else { return }
+            let ok = self.runSMCWriteViaSudo("inhibit")
+            DispatchQueue.main.async {
+                if ok {
+                    self.chargingPaused = true
+                    NSLog("Ampere: Re-inhibited charging")
+                }
+                self.refresh()
+            }
+        }
+    }
 
     func toggleCharging() {
         let shouldPause = !chargingPaused
