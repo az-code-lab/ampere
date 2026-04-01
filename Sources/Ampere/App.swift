@@ -93,16 +93,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             animationTimer?.invalidate()
             animationTimer = nil
             if needsAnimation {
-                animationPct = isCharging ? 0 : pct
+                animationPct = pct
                 animationTimer = Timer.scheduledTimer(withTimeInterval: 0.6, repeats: true) { [weak self] _ in
                     guard let self, let button = self.statusItem.button else { return }
                     let curPct = self.monitor.state?.percentage ?? 0
+                    let target: Int
                     if self.monitor.state?.isCharging ?? false {
-                        self.animationPct += 10
-                        if self.animationPct > curPct { self.animationPct = 0 }
+                        target = self.monitor.autoManageEnabled ? self.monitor.chargeUpperBound : 100
+                        self.animationPct += 5
+                        if self.animationPct > target { self.animationPct = curPct }
                     } else {
-                        self.animationPct -= 10
-                        if self.animationPct < 0 { self.animationPct = curPct }
+                        target = self.monitor.chargeUpperBound
+                        self.animationPct -= 5
+                        if self.animationPct < target { self.animationPct = curPct }
                     }
                     let warn = self.monitor.healthWarning != nil
                     button.image = self.buildMenuBarIcon(
