@@ -95,10 +95,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         )
         let titleAttrs: [NSAttributedString.Key: Any] = hasWarning
             ? [.font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular),
-               .foregroundColor: NSColor.systemOrange,
-               .baselineOffset: -2]
-            : [.font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular),
-               .baselineOffset: -2]
+               .foregroundColor: NSColor.systemOrange]
+            : [.font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)]
         button.attributedTitle = NSAttributedString(string: " \(pct)%", attributes: titleAttrs)
     }
 
@@ -161,13 +159,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let battH: CGFloat = 11
         let capW: CGFloat = 2.8
         let totalW = battW + capW + 1
-        let totalH: CGFloat = 17
+        let totalH: CGFloat = 18
 
         let image = NSImage(size: NSSize(width: totalW, height: totalH))
         image.lockFocus()
 
         let color: NSColor = hasWarning ? .systemOrange : .black
-        let battY = (totalH - battH) / 2 - 1.5
+        let battY = (totalH - battH) / 2
 
         // Battery outline
         let bodyRect = NSRect(x: 0.5, y: battY + 0.5, width: battW - 1, height: battH - 1)
@@ -197,7 +195,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             let configured = symbol.withSymbolConfiguration(config) ?? symbol
             let symSize = configured.size
             let symX = (battW - symSize.width) / 2
-            let symY = battY + (battH - symSize.height) / 2
+            let symY = (totalH - symSize.height) / 2
 
             // Erase area behind symbol
             NSGraphicsContext.current?.compositingOperation = .copy
