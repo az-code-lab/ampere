@@ -754,7 +754,7 @@ private struct StaticBatteryBody: View {
     let mode: BatteryMode
     var animate: Bool = false
 
-    @State private var shimmerPhase: CGFloat = 0
+    private static let shimmerDuration: TimeInterval = 5.0
 
     private var fillColor: Color {
         if percentage <= 15 { return .red }
@@ -793,25 +793,30 @@ private struct StaticBatteryBody: View {
                             .fill(fillColor)
                             .frame(width: fillWidth, height: fillHeight)
 
-                        // Animated shimmer overlay
+                        // Animated shimmer overlay — uses TimelineView for
+                        // reliable animation that survives mode changes.
                         if shouldAnimate {
-                            // A wide gradient strip that slides across
-                            let shimmerWidth = fillWidth * 2
-                            LinearGradient(
-                                colors: [
-                                    .clear,
-                                    .white.opacity(0.3),
-                                    .white.opacity(0.5),
-                                    .white.opacity(0.3),
-                                    .clear
-                                ],
-                                startPoint: .leading,
-                                endPoint: .trailing
-                            )
-                            .frame(width: shimmerWidth * 0.5, height: fillHeight)
-                            .offset(x: shimmerPhase * fillWidth)
-                            .frame(width: fillWidth, height: fillHeight)
-                            .clipShape(RoundedRectangle(cornerRadius: 3.5))
+                            TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: false)) { timeline in
+                                let phase = timeline.date.timeIntervalSinceReferenceDate
+                                    .truncatingRemainder(dividingBy: Self.shimmerDuration) / Self.shimmerDuration
+                                let offset = (mode == .discharging ? (1.0 - phase * 2.0) : (phase * 2.0 - 1.0)) * fillWidth
+                                let shimmerWidth = fillWidth * 2
+                                LinearGradient(
+                                    colors: [
+                                        .clear,
+                                        .white.opacity(0.3),
+                                        .white.opacity(0.5),
+                                        .white.opacity(0.3),
+                                        .clear
+                                    ],
+                                    startPoint: .leading,
+                                    endPoint: .trailing
+                                )
+                                .frame(width: shimmerWidth * 0.5, height: fillHeight)
+                                .offset(x: offset)
+                                .frame(width: fillWidth, height: fillHeight)
+                                .clipShape(RoundedRectangle(cornerRadius: 3.5))
+                            }
                         }
                     }
                     .offset(x: inset, y: inset)
@@ -829,32 +834,6 @@ private struct StaticBatteryBody: View {
                 .fill(Color.primary.opacity(0.4))
                 .frame(width: 5, height: 16)
                 .padding(.leading, -1)
-        }
-        .onChange(of: shouldAnimate) {
-            if shouldAnimate {
-                startAnimation()
-            } else {
-                withAnimation(.default) { shimmerPhase = 0 }
-            }
-        }
-        .onAppear {
-            if shouldAnimate {
-                startAnimation()
-            }
-        }
-    }
-
-    private func startAnimation() {
-        // Charging: shimmer flows left → right
-        // Discharging: shimmer flows right → left
-        let from: CGFloat = mode == .charging ? -1.0 : 1.0
-        let to: CGFloat = mode == .charging ? 1.0 : -1.0
-        shimmerPhase = from
-        withAnimation(
-            .linear(duration: 5.0)
-            .repeatForever(autoreverses: false)
-        ) {
-            shimmerPhase = to
         }
     }
 }
