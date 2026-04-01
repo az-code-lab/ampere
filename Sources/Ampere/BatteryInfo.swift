@@ -96,6 +96,21 @@ final class BatteryMonitor: ObservableObject {
             autoDischargeEnabled = false
             chargeToUpperBound = false
         }
+        if isSudoRuleInstalled && isHelperStale {
+            NSLog("Ampere: Helper is stale, re-installing…")
+            if !installSudo() {
+                NSLog("Ampere: Helper re-install failed or cancelled, quitting")
+                DispatchQueue.main.async {
+                    let alert = NSAlert()
+                    alert.messageText = "Admin Access Required"
+                    alert.informativeText = "Ampere needs to update its helper tool after an upgrade. Please relaunch and enter your admin password."
+                    alert.alertStyle = .critical
+                    alert.runModal()
+                    NSApp.terminate(nil)
+                }
+                return
+            }
+        }
         if isSudoRuleInstalled {
             let shouldInhibit = autoManageEnabled
                 && (Self.readBattery()?.percentage ?? 0) >= chargeLowerBound
