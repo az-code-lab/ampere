@@ -26,7 +26,6 @@ public enum SMC {
     // MARK: - Display strings (for health check UI)
     public static let chteInhibitHex  = "0x01 00 00 00"
     public static let chteAllowHex    = "0x00 00 00 00"
-    public static let chteEitherHex   = "0x00 or 0x01"
     public static let chieDischargeHex = "0x08"
     public static let chieNormalHex    = "0x00"
 }

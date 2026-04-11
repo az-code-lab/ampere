@@ -28,7 +28,9 @@ final class BatteryMonitor: ObservableObject {
     @Published var autoDischargeEnabled: Bool {
         didSet { UserDefaults.standard.set(autoDischargeEnabled, forKey: "autoDischargeEnabled") }
     }
-    @Published var chargeToUpperBound: Bool = false
+    @Published var chargeToUpperBound: Bool {
+        didSet { UserDefaults.standard.set(chargeToUpperBound, forKey: "chargeToUpperBound") }
+    }
     @Published var lastError: String?
     @Published var pinned: Bool = false
     @Published var healthWarning: String?
@@ -70,13 +72,18 @@ final class BatteryMonitor: ObservableObject {
     private var lastAdapterConnected: Bool?
     private let smcQueue = DispatchQueue(label: "com.ampere.smc", qos: .utility)
 
+    /// Skip health checks on the first N refresh cycles so launch-time SMC
+    /// writes have a chance to settle before we assert on their results.
+    private static let healthCheckSettleRefreshes = 3
+
     private static let sudoersPath = AppConstants.sudoersPath
     private static let helperPath = AppConstants.helperPath
 
     init() {
         // Load persisted auto-manage settings
         let defaults = UserDefaults.standard
-        self.autoManageEnabled = defaults.bool(forKey: "autoManageEnabled")
+        let autoManage = defaults.bool(forKey: "autoManageEnabled")
+        self.autoManageEnabled = autoManage
         self.autoDischargeEnabled = defaults.bool(forKey: "autoDischargeEnabled")
         var lower = defaults.object(forKey: "chargeLowerBound") as? Int ?? 40
         var upper = defaults.object(forKey: "chargeUpperBound") as? Int ?? 60
@@ -85,6 +92,10 @@ final class BatteryMonitor: ObservableObject {
         if lower >= upper { lower = 40; upper = 60 }
         self.chargeLowerBound = lower
         self.chargeUpperBound = upper
+        // Charge-to-upper intent persists across restart so a crash mid-recovery
+        // resumes the in-progress charge rather than parking at the current level.
+        // Clear it if auto-manage is disabled (it has no effect outside auto mode).
+        self.chargeToUpperBound = autoManage && defaults.bool(forKey: "chargeToUpperBound")
 
         // Always clear discharge (CHIE) and kill orphaned watchdogs on launch.
         // For CHTE: if auto-manage is enabled and charge is at or above the lower
@@ -109,7 +120,11 @@ final class BatteryMonitor: ObservableObject {
         }
         if isSudoRuleInstalled {
             let launchPercentage = Self.readBattery()?.percentage ?? 0
-            let shouldInhibit = autoManageEnabled && launchPercentage >= chargeLowerBound
+            // Respect persisted charge-to-upper intent: if true, skip the inhibit
+            // so an in-progress charge-to-upper survives a restart.
+            let shouldInhibit = autoManageEnabled
+                && launchPercentage >= chargeLowerBound
+                && !chargeToUpperBound
             if shouldInhibit {
                 chargingPaused = true
             } else if autoManageEnabled && launchPercentage < chargeLowerBound {
@@ -165,38 +180,74 @@ final class BatteryMonitor: ObservableObject {
 
         // Re-assert SMC state on wake — firmware or PD renegotiation can reset
         // CHTE during sleep, allowing charging to bypass micro-charge prevention.
-        // Check charge level vs bounds to avoid a race with refresh() that can
-        // deadlock CHTE=inhibit when charging should be allowed.
+        // Delegate to evaluateAutoManageStep so rule 1/2/3 transitions are
+        // handled consistently with refresh() and don't race against it.
         wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didWakeNotification,
             object: nil, queue: .main
         ) { [weak self] _ in
             guard let self = self, self.isSudoRuleInstalled else { return }
             NSLog("Ampere: System wake — re-asserting SMC state")
+
+            // Capture all state on main queue to avoid cross-queue reads.
+            let activeDischarging = self.activeDischarging
+            let chargingPausedSnapshot = self.chargingPaused
+            let priorState = AutoManageState(
+                chargingPaused: chargingPausedSnapshot,
+                chargeToUpperBound: self.chargeToUpperBound,
+                lastAdapterConnected: self.lastAdapterConnected
+            )
+            let autoManageEnabledSnapshot = self.autoManageEnabled
+            let lower = self.chargeLowerBound
+            let upper = self.chargeUpperBound
+
             self.smcQueue.async {
-                if self.activeDischarging {
+                if activeDischarging {
                     _ = self.startDischarge()
-                } else if self.chargingPaused {
-                    // If auto-manage is on and charge fell below the lower
-                    // bound during sleep, allow charging instead of blindly
-                    // re-asserting inhibit (which would race with refresh()
-                    // and potentially deadlock CHTE=0x01 while chargingPaused
-                    // gets cleared).
-                    if self.autoManageEnabled,
-                       let pct = Self.readBattery()?.percentage,
-                       pct < self.chargeLowerBound {
-                        _ = self.runSMCWriteViaSudo("allow")
-                        DispatchQueue.main.async {
-                            self.chargingPaused = false
-                            self.chargeToUpperBound = true
-                            NSLog("Ampere: Wake — charge %d%% < lower bound %d%%, allowing", pct, self.chargeLowerBound)
-                        }
-                    } else {
-                        _ = self.runSMCWriteViaSudo("inhibit")
-                    }
+                    DispatchQueue.main.async { self.refresh() }
+                    return
                 }
-                DispatchQueue.main.async {
-                    self.refresh()
+
+                guard let battery = Self.readBattery() else {
+                    DispatchQueue.main.async { self.refresh() }
+                    return
+                }
+
+                let inputs = AutoManageInputs(
+                    autoManageEnabled: autoManageEnabledSnapshot,
+                    adapterConnected: battery.adapterConnected,
+                    percentage: battery.percentage,
+                    lowerBound: lower,
+                    upperBound: upper
+                )
+                let decision = BatteryMonitor.evaluateAutoManageStep(
+                    state: priorState, inputs: inputs
+                )
+
+                // Determine the SMC op to write. An explicit transition from the
+                // pure function wins. Otherwise re-assert inhibit if we were
+                // already paused, so a firmware-induced CHTE reset during sleep
+                // gets corrected before the next refresh cycle.
+                let op: SMCWriteOp?
+                switch decision.action {
+                case .allow:   op = .allow
+                case .inhibit: op = .inhibit
+                case .none:    op = chargingPausedSnapshot ? .inhibit : nil
+                }
+
+                if let op = op {
+                    _ = self.runSMCWrite(op)
+                    DispatchQueue.main.async {
+                        if decision.action != .none {
+                            self.chargingPaused = decision.newState.chargingPaused
+                            self.chargeToUpperBound = decision.newState.chargeToUpperBound
+                            NSLog("Ampere: Wake — auto-manage %@ at %d%%",
+                                  op == .allow ? "allow" : "inhibit", battery.percentage)
+                        }
+                        self.refresh()
+                    }
+                } else {
+                    DispatchQueue.main.async { self.refresh() }
                 }
             }
         }
@@ -296,7 +347,7 @@ final class BatteryMonitor: ObservableObject {
         smcQueue.async { [weak self] in
             guard let self = self else { return }
 
-            let cmd = "rm -f '\(Self.sudoersPath)' '\(Self.helperPath)'"
+            let cmd = "rm -f \(Self.shQuote(Self.sudoersPath)) \(Self.shQuote(Self.helperPath))"
 
             // Always clear all SMC state BEFORE removing the helper (need sudo access).
             // Use unconditional writes since in-memory state may not reflect actual SMC state.
@@ -314,13 +365,12 @@ final class BatteryMonitor: ObservableObject {
                     self.activeDischarging = false
                     self.recheckHealth()
                 } else {
-                    // User cancelled — restore previous state
+                    // Removal failed or was cancelled — restore previous SMC state
                     self.smcQueue.async {
-                        if wasPaused { self.runSMCWrite("inhibit") }
+                        if wasPaused { self.runSMCWrite(.inhibit) }
                         if wasDischarging { _ = self.startDischarge() }
                     }
                 }
-                self.objectWillChange.send()
             }
         }
     }
@@ -351,19 +401,27 @@ final class BatteryMonitor: ObservableObject {
         return (mainBinary as NSString).deletingLastPathComponent + "/SMCWriter"
     }
 
+    /// Single-quote a string for safe use in a shell command, escaping any
+    /// embedded single quotes via the `'\''` idiom.
+    private static func shQuote(_ s: String) -> String {
+        "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
     /// Install the SMCWriter binary at a root-owned fixed path, plus a sudoers rule.
     /// Shows the native macOS password dialog (one-time).
     private func installSudo() -> Bool {
-        let user = NSUserName()
-        let smcWriter = smcWriterPath
+        let writer = Self.shQuote(smcWriterPath)
+        let helper = Self.shQuote(Self.helperPath)
+        let sudoers = Self.shQuote(Self.sudoersPath)
+        let rule = Self.shQuote("\(NSUserName()) ALL=(root) NOPASSWD: \(Self.helperPath)\n")
         let cmd = [
             "mkdir -p /usr/local/bin",
-            "cp '\(smcWriter)' \(Self.helperPath)",
-            "xattr -cr \(Self.helperPath)",
-            "chmod 0755 \(Self.helperPath)",
-            "chown root:wheel \(Self.helperPath)",
-            "printf '%s' '\(user) ALL=(root) NOPASSWD: \(Self.helperPath)\n' > \(Self.sudoersPath)",
-            "chmod 0440 \(Self.sudoersPath)",
+            "cp \(writer) \(helper)",
+            "xattr -cr \(helper)",
+            "chmod 0755 \(helper)",
+            "chown root:wheel \(helper)",
+            "printf '%s' \(rule) > \(sudoers)",
+            "chmod 0440 \(sudoers)",
         ].joined(separator: " && ")
 
         return runAsAdmin(cmd)
@@ -390,6 +448,15 @@ final class BatteryMonitor: ObservableObject {
 
     // MARK: - SMC Write
 
+    /// High-level SMC operations exposed to the auto-manage state machine and
+    /// the UI. Each case maps to one or more `runSMCWriteViaSudo` calls.
+    enum SMCWriteOp {
+        case allow        // CHTE=0x00 — charging enabled
+        case inhibit      // CHTE=0x01 — charging blocked
+        case discharge    // CHIE=0x08 + sleep prevention + watchdog
+        case nodischarge  // clear CHIE + restore sleep + re-spawn watchdog
+    }
+
     /// Start the discharge daemon. It writes CHIE, sets sleep prevention,
     /// then spawns a watchdog daemon via posix_spawn that monitors the app
     /// PID and cleans up if the app dies.
@@ -405,29 +472,34 @@ final class BatteryMonitor: ObservableObject {
     }
 
     /// Stop discharge: clear CHIE, kill watchdog, restore sleep, then re-spawn
-    /// a watchdog so CHTE is still protected if the app is killed.
-    private func stopDischarge() {
-        _ = runSMCWriteViaSudo("nodischarge")
-        _ = runSMCWriteViaSudo("spawn-watchdog:\(ProcessInfo.processInfo.processIdentifier)")
-        NSLog("Ampere: discharge stopped")
+    /// a watchdog so CHTE is still protected if the app is killed. Returns
+    /// the success of the primary `nodischarge` write; logs but does not fail
+    /// the overall call if only the watchdog respawn failed.
+    private func stopDischarge() -> Bool {
+        let ok = runSMCWriteViaSudo("nodischarge")
+        let watchdogOk = runSMCWriteViaSudo("spawn-watchdog:\(ProcessInfo.processInfo.processIdentifier)")
+        if !watchdogOk {
+            NSLog("Ampere: nodischarge succeeded but watchdog respawn failed — CHTE protection on crash may be lost")
+        }
+        if ok {
+            NSLog("Ampere: discharge stopped")
+        }
+        return ok
     }
 
-    /// Run the SMCWriter helper via sudo (no password prompt).
-    /// Requires the sudoers helper to be installed first via ensureSudoInstalled().
+    /// Run a high-level SMC operation via the sudoers helper (no password
+    /// prompt). Requires the sudoers helper to be installed.
     @discardableResult
-    private func runSMCWrite(_ arg: String) -> Bool {
+    private func runSMCWrite(_ op: SMCWriteOp) -> Bool {
         guard isSudoRuleInstalled else {
             NSLog("Ampere: sudo helper not installed, cannot write SMC")
             return false
         }
-        switch arg {
-        case "discharge":
-            return startDischarge()
-        case "nodischarge":
-            stopDischarge()
-            return true
-        default:
-            return runSMCWriteViaSudo(arg)
+        switch op {
+        case .allow:       return runSMCWriteViaSudo("allow")
+        case .inhibit:     return runSMCWriteViaSudo("inhibit")
+        case .discharge:   return startDischarge()
+        case .nodischarge: return stopDischarge()
         }
     }
 
@@ -699,23 +771,12 @@ final class BatteryMonitor: ObservableObject {
         refreshCount += 1
         var battery = Self.readBattery()
 
-        // Only publish to SwiftUI when popover is visible to avoid expensive layout passes
-        if isPopoverVisible {
-            state = battery
-        } else if state == nil {
-            // First refresh on launch — always publish so menu bar icon has data
-            state = battery
-        } else if let old = state, old.percentage != battery?.percentage || old.isCharging != battery?.isCharging {
-            // Menu bar icon needs updating
-            state = battery
-        }
-
         // Stop discharge if the toggle was turned off or auto-manage was disabled
         if activeDischarging && (!autoDischargeEnabled || !autoManageEnabled) && !autoManageInFlight {
             autoManageInFlight = true
             smcQueue.async { [weak self] in
                 guard let self = self else { return }
-                let ok = self.runSMCWrite("nodischarge")
+                let ok = self.runSMCWrite(.nodischarge)
                 DispatchQueue.main.async {
                     self.autoManageInFlight = false
                     if ok {
@@ -734,7 +795,7 @@ final class BatteryMonitor: ObservableObject {
                 autoManageInFlight = true
                 smcQueue.async { [weak self] in
                     guard let self = self else { return }
-                    let ok = self.runSMCWrite("discharge")
+                    let ok = self.runSMCWrite(.discharge)
                     DispatchQueue.main.async {
                         self.autoManageInFlight = false
                         if ok {
@@ -749,7 +810,7 @@ final class BatteryMonitor: ObservableObject {
                 autoManageInFlight = true
                 smcQueue.async { [weak self] in
                     guard let self = self else { return }
-                    let ok = self.runSMCWrite("nodischarge")
+                    let ok = self.runSMCWrite(.nodischarge)
                     DispatchQueue.main.async {
                         self.autoManageInFlight = false
                         if ok {
@@ -798,11 +859,11 @@ final class BatteryMonitor: ObservableObject {
                 autoManageInFlight = true
                 let pct = b.percentage
                 let upper = chargeUpperBound
-                let cmd: String = decision.action == .allow ? "allow" : "inhibit"
+                let op: SMCWriteOp = decision.action == .allow ? .allow : .inhibit
                 let next = decision.newState
                 smcQueue.async { [weak self] in
                     guard let self = self else { return }
-                    let ok = self.runSMCWrite(cmd)
+                    let ok = self.runSMCWrite(op)
                     DispatchQueue.main.async {
                         self.autoManageInFlight = false
                         if ok {
@@ -856,20 +917,28 @@ final class BatteryMonitor: ObservableObject {
                 activeDischarging = false
                 chargeToUpperBound = false
                 smcQueue.async { [weak self] in
-                    self?.runSMCWrite("allow")
-                    self?.runSMCWrite("nodischarge")
+                    self?.runSMCWrite(.allow)
+                    self?.runSMCWrite(.nodischarge)
                 }
             }
         }
 
-        // Update state again if it was modified (e.g. cleared timeRemaining when paused)
-        if isPopoverVisible, state != battery {
-            state = battery
+        // Publish state: always on first refresh (menu bar icon needs data) or
+        // when popover is visible, otherwise only when menu-bar-relevant fields
+        // (percentage, isCharging) actually changed — skipping noisy SwiftUI
+        // layout passes while the popover is hidden.
+        if state != battery {
+            let menuBarChanged = state == nil
+                || state?.percentage != battery?.percentage
+                || state?.isCharging != battery?.isCharging
+            if isPopoverVisible || menuBarChanged {
+                state = battery
+            }
         }
 
         // Health check: verify SMC state matches expected state.
-        // Skip first few cycles for cleanup to settle.
-        if refreshCount > 3, !autoManageInFlight, isSudoRuleInstalled,
+        if refreshCount > Self.healthCheckSettleRefreshes,
+           !autoManageInFlight, isSudoRuleInstalled,
            let b = battery, b.adapterConnected {
             performHealthCheck(battery: b)
         }
@@ -931,7 +1000,7 @@ final class BatteryMonitor: ObservableObject {
                 chargeToUpperBound: chargeToUpperBound
             )
             lastHealthCheckExpected = "\(SMC.keyChargeTerminate)=\(expected.chte)\n\(SMC.keyChargeInhibit)=\(expected.chie)"
-            lastHealthCheckCHTEMatch = chteHex == expected.chte || expected.chte == SMC.chteEitherHex
+            lastHealthCheckCHTEMatch = chteHex == expected.chte
             lastHealthCheckCHIEMatch = chieHex == expected.chie
             NSLog("Ampere: Health check failed — CHTE=%d CHIE=%d charge=%d%% paused=%d auto=%d discharge=%d bounds=[%d,%d]",
                   chte, chie, battery.percentage, chargingPaused, autoManageEnabled, autoDischargeEnabled,
@@ -1091,8 +1160,8 @@ final class BatteryMonitor: ObservableObject {
                 return
             }
             self.smcQueue.async {
-                let arg = shouldPause ? "inhibit" : "allow"
-                let ok = self.runSMCWrite(arg)
+                let op: SMCWriteOp = shouldPause ? .inhibit : .allow
+                let ok = self.runSMCWrite(op)
                 DispatchQueue.main.async {
                     if ok {
                         self.chargingPaused = shouldPause
