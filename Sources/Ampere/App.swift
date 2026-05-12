@@ -235,7 +235,7 @@ struct ContentView: View {
     @State private var showAbout = false
     @State private var healthShowPercent = true
     @State private var ageShowYears = true
-    @State private var amperageShowMA = true
+    @State private var amperageShowMA = false
     @State private var capacityShowMAh = false
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
 
