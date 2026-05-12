@@ -19,6 +19,7 @@ struct BatteryState: Equatable {
     let voltage: Double
     let adapterWatts: Double?
     let adapterAmperage: Double?
+    let adapterVoltage: Double?
     let systemWatts: Double?
     let systemAmperage: Double?
     let batteryWatts: Double?
@@ -904,6 +905,7 @@ final class BatteryMonitor: ObservableObject {
                         voltage: b.voltage,
                         adapterWatts: b.adapterWatts,
                         adapterAmperage: b.adapterAmperage,
+                        adapterVoltage: b.adapterVoltage,
                         systemWatts: b.systemWatts,
                         systemAmperage: b.systemAmperage,
                         batteryWatts: b.batteryWatts,
@@ -1060,6 +1062,7 @@ final class BatteryMonitor: ObservableObject {
         var temperature = 0.0
         var adapterWatts: Double?
         var adapterAmperage: Double?
+        var adapterVoltage: Double?
         var totalLoadWatts: Double?
         var systemWatts: Double?
         var systemAmperage: Double?
@@ -1090,6 +1093,7 @@ final class BatteryMonitor: ObservableObject {
             if let telemetry = IORegistryEntryCreateCFProperty(service, "PowerTelemetryData" as CFString, nil, 0)?.takeRetainedValue() as? [String: Any] {
                 adapterWatts = Self.milliwattsToWatts(telemetry["SystemPowerIn"])
                 adapterAmperage = Self.milliamps(telemetry["SystemCurrentIn"])
+                adapterVoltage = Self.millivoltsToVolts(telemetry["SystemVoltageIn"])
                 totalLoadWatts = Self.milliwattsToWatts(telemetry["SystemLoad"])
                 // NOTE: PowerTelemetryData.SystemLoad is the *total* load on the
                 // adapter rail — it includes battery charging power. We compute
@@ -1178,6 +1182,7 @@ final class BatteryMonitor: ObservableObject {
             voltage: voltage,
             adapterWatts: adapterWatts,
             adapterAmperage: adapterAmperage,
+            adapterVoltage: adapterVoltage,
             systemWatts: systemWatts,
             systemAmperage: systemAmperage,
             batteryWatts: batteryWatts,
@@ -1212,6 +1217,11 @@ final class BatteryMonitor: ObservableObject {
 
     private static func milliamps(_ value: Any?) -> Double? {
         numericValue(value)
+    }
+
+    private static func millivoltsToVolts(_ value: Any?) -> Double? {
+        guard let millivolts = numericValue(value) else { return nil }
+        return millivolts / 1000.0
     }
 
     // MARK: - Toggle

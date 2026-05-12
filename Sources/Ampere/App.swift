@@ -551,7 +551,6 @@ struct ContentView: View {
                     healthShowPercent.toggle()
                 })
 
-                StatCard(title: "Voltage", value: String(format: "%.2f V", state.voltage), icon: "bolt.fill", iconColor: tint)
                 StatCard(title: "Temperature", value: tempValue, icon: "thermometer.medium", iconColor: tint, onTap: {
                     useFahrenheit.toggle()
                 })
@@ -570,6 +569,8 @@ struct ContentView: View {
                 StatCard(title: "Battery A", value: amperageValue(Double(state.amperage)), icon: "alternatingcurrent", iconColor: tint, onTap: {
                     amperageShowMA.toggle()
                 })
+                StatCard(title: "Adapter V", value: voltageValue(state.adapterVoltage), icon: "bolt.fill", iconColor: adapterTint)
+                StatCard(title: "Battery V", value: voltageValue(state.voltage), icon: "bolt.fill", iconColor: tint)
             }
         }
         .padding(.horizontal, 16)
@@ -586,6 +587,11 @@ struct ContentView: View {
             return String(format: "%.0f mA", milliamps)
         }
         return String(format: "%.2f A", milliamps / 1000.0)
+    }
+
+    private func voltageValue(_ volts: Double?) -> String {
+        guard let volts else { return "—" }
+        return String(format: "%.2f V", volts)
     }
 
     private func autoManageToggle() -> some View {
