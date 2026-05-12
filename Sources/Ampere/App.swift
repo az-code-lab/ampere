@@ -36,7 +36,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         // Create popover with the battery panel
         popover = NSPopover()
-        popover.contentSize = NSSize(width: 340, height: 620)
+        popover.contentSize = NSSize(width: 340, height: 760)
         popover.behavior = .transient
         popover.delegate = self
         popover.contentViewController = NSHostingController(
@@ -549,7 +549,7 @@ struct ContentView: View {
                 StatCard(title: "Temperature", value: tempValue, icon: "thermometer.medium", iconColor: tint, onTap: {
                     useFahrenheit.toggle()
                 })
-                StatCard(title: "System Load", value: wattsValue(state.loadWatts), icon: "desktopcomputer", iconColor: tint)
+                StatCard(title: "System Load", value: wattsValue(state.electronicsWatts), icon: "desktopcomputer", iconColor: tint)
             }
 
             LazyVGrid(columns: twoColumns, spacing: 8) {

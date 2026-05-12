@@ -20,7 +20,7 @@ struct BatteryState: Equatable {
     let adapterWatts: Double?
     let adapterAmperage: Double?
     let adapterVoltage: Double?
-    let loadWatts: Double?
+    let electronicsWatts: Double?
     let batteryWatts: Double?
     let batteryAgeYears: String   // e.g. "4y 6m"
     let batteryAgeDays: String    // e.g. "1643d"
@@ -905,7 +905,7 @@ final class BatteryMonitor: ObservableObject {
                         adapterWatts: b.adapterWatts,
                         adapterAmperage: b.adapterAmperage,
                         adapterVoltage: b.adapterVoltage,
-                        loadWatts: b.loadWatts,
+                        electronicsWatts: b.electronicsWatts,
                         batteryWatts: b.batteryWatts,
                         batteryAgeYears: b.batteryAgeYears, batteryAgeDays: b.batteryAgeDays
                     )
@@ -1062,7 +1062,7 @@ final class BatteryMonitor: ObservableObject {
         var adapterAmperage: Double?
         var adapterVoltage: Double?
         var totalLoadWatts: Double?
-        var loadWatts: Double?
+        var electronicsWatts: Double?
         var batteryWatts: Double?
 
         if service != MACH_PORT_NULL {
@@ -1104,27 +1104,33 @@ final class BatteryMonitor: ObservableObject {
             // UI shows "—".
         }
 
+        // batteryWatts is only meaningful when we actually read voltage from
+        // the battery service. Keep nil when service was unavailable so the
+        // UI shows "—" instead of a misleading "0.0 W".
         let batW = voltage * Double(amperage) / 1000.0
-        batteryWatts = batW
+        batteryWatts = voltage > 0 ? batW : nil
 
-        // Load power = input/load − battery charging power.
-        // Prefer adapter input when available. If that key is missing but
-        // SystemLoad exists, it is still useful as the total load fallback.
-        // On battery, batW is negative (discharging), so −batW is the absolute
-        // electronics consumption. Keep nil when there is no trustworthy source.
-        // Clamp subtraction to ≥ 0 because adapter/load and battery values come
-        // from independent IOKit reads and can briefly disagree.
+        // Electronics-only consumption = input/load − battery charging power.
+        // Order matters: prefer the adapter reading; once the adapter is gone,
+        // the discharge sign of `batW` is a more trustworthy source of the
+        // electronics figure than `SystemLoad` (which is by definition an
+        // adapter-rail quantity and shouldn't be relied on without an adapter
+        // — using it then would double-count `|batW|`). `SystemLoad` is the
+        // belt-and-suspenders fallback for the rare case where the adapter is
+        // present but `SystemPowerIn` is unavailable.
+        // Clamp subtraction to ≥ 0 because adapter/load and battery values
+        // come from independent IOKit reads and can briefly disagree.
         let electronicsW: Double?
         if let adapter = adapterWatts {
             electronicsW = max(0, adapter - batW)
-        } else if let totalLoad = totalLoadWatts {
-            electronicsW = max(0, totalLoad - batW)
         } else if batW < 0 {
             electronicsW = -batW
+        } else if let totalLoad = totalLoadWatts {
+            electronicsW = max(0, totalLoad - batW)
         } else {
             electronicsW = nil
         }
-        loadWatts = electronicsW
+        electronicsWatts = electronicsW
 
         var adapterConnected = isPluggedIn
         if !adapterConnected, service != MACH_PORT_NULL {
@@ -1177,7 +1183,7 @@ final class BatteryMonitor: ObservableObject {
             adapterWatts: adapterWatts,
             adapterAmperage: adapterAmperage,
             adapterVoltage: adapterVoltage,
-            loadWatts: loadWatts,
+            electronicsWatts: electronicsWatts,
             batteryWatts: batteryWatts,
             batteryAgeYears: batteryAgeYears,
             batteryAgeDays: batteryAgeDays
