@@ -1089,13 +1089,10 @@ final class BatteryMonitor: ObservableObject {
             if let telemetry = IORegistryEntryCreateCFProperty(service, "PowerTelemetryData" as CFString, nil, 0)?.takeRetainedValue() as? [String: Any] {
                 adapterWatts = Self.milliwattsToWatts(telemetry["SystemPowerIn"])
                 adapterAmperage = Self.milliamps(telemetry["SystemCurrentIn"])
-                systemWatts = Self.milliwattsToWatts(telemetry["SystemLoad"])
-
-                if let systemMilliwatts = Self.numericValue(telemetry["SystemLoad"]),
-                   let systemMillivolts = Self.numericValue(telemetry["SystemVoltageIn"]),
-                   systemMillivolts > 0 {
-                    systemAmperage = systemMilliwatts / systemMillivolts * 1000.0
-                }
+                // NOTE: PowerTelemetryData.SystemLoad is the *total* load on the
+                // adapter rail — it includes battery charging power. We compute
+                // electronics-only "System W" below from `adapter − battery` so
+                // the relationship Adapter ≈ System + Battery holds.
             }
             if let details = IORegistryEntryCreateCFProperty(service, "AdapterDetails" as CFString, nil, 0)?.takeRetainedValue() as? [String: Any] {
                 if adapterWatts == nil, let watts = Self.numericValue(details["Watts"]), watts > 0 {
@@ -1107,7 +1104,25 @@ final class BatteryMonitor: ObservableObject {
             }
         }
 
-        batteryWatts = voltage * Double(amperage) / 1000.0
+        let batW = voltage * Double(amperage) / 1000.0
+        batteryWatts = batW
+
+        // System electronics power = adapter input − battery charging power.
+        // On AC charging: subtract positive battery power → only the electronics
+        // portion remains. On battery: adapterWatts is nil and batW is negative
+        // (discharging), so −batW is the absolute electronics consumption.
+        if let adapter = adapterWatts {
+            let electronics = adapter - batW
+            systemWatts = electronics
+            if voltage > 0 {
+                systemAmperage = electronics / voltage * 1000.0
+            }
+        } else {
+            systemWatts = -batW
+            if voltage > 0 {
+                systemAmperage = -batW / voltage * 1000.0
+            }
+        }
 
         var adapterConnected = isPluggedIn
         if !adapterConnected, service != MACH_PORT_NULL {
