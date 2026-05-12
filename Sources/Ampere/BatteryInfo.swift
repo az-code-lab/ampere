@@ -1060,6 +1060,7 @@ final class BatteryMonitor: ObservableObject {
         var temperature = 0.0
         var adapterWatts: Double?
         var adapterAmperage: Double?
+        var totalLoadWatts: Double?
         var systemWatts: Double?
         var systemAmperage: Double?
         var batteryWatts: Double?
@@ -1089,6 +1090,7 @@ final class BatteryMonitor: ObservableObject {
             if let telemetry = IORegistryEntryCreateCFProperty(service, "PowerTelemetryData" as CFString, nil, 0)?.takeRetainedValue() as? [String: Any] {
                 adapterWatts = Self.milliwattsToWatts(telemetry["SystemPowerIn"])
                 adapterAmperage = Self.milliamps(telemetry["SystemCurrentIn"])
+                totalLoadWatts = Self.milliwattsToWatts(telemetry["SystemLoad"])
                 // NOTE: PowerTelemetryData.SystemLoad is the *total* load on the
                 // adapter rail — it includes battery charging power. We compute
                 // electronics-only "System W" below from `adapter − battery` so
@@ -1104,21 +1106,25 @@ final class BatteryMonitor: ObservableObject {
         let batW = voltage * Double(amperage) / 1000.0
         batteryWatts = batW
 
-        // System electronics power = adapter input − battery charging power.
-        // On AC charging: subtract positive battery power → only the electronics
-        // portion remains. On battery: adapterWatts is nil and batW is negative
-        // (discharging), so −batW is the absolute electronics consumption.
-        // Clamped to ≥ 0: adapter and battery come from independent IOKit reads
-        // at slightly different sample times, so the subtraction can be briefly
-        // negative even though electronics consumption is always non-negative.
-        let electronicsW: Double
+        // System electronics power = input/load − battery charging power.
+        // Prefer adapter input when available. If that key is missing but
+        // SystemLoad exists, it is still useful as the total load fallback.
+        // On battery, batW is negative (discharging), so −batW is the absolute
+        // electronics consumption. Keep nil when there is no trustworthy source.
+        // Clamp subtraction to ≥ 0 because adapter/load and battery values come
+        // from independent IOKit reads and can briefly disagree.
+        let electronicsW: Double?
         if let adapter = adapterWatts {
             electronicsW = max(0, adapter - batW)
+        } else if let totalLoad = totalLoadWatts {
+            electronicsW = max(0, totalLoad - batW)
+        } else if batW < 0 {
+            electronicsW = -batW
         } else {
-            electronicsW = max(0, -batW)
+            electronicsW = nil
         }
         systemWatts = electronicsW
-        if voltage > 0 {
+        if let electronicsW, voltage > 0 {
             systemAmperage = electronicsW / voltage * 1000.0
         }
 
