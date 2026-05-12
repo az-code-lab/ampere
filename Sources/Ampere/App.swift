@@ -555,10 +555,10 @@ struct ContentView: View {
             LazyVGrid(columns: twoColumns, spacing: 8) {
                 StatCard(title: "Adapter Power", value: wattsValue(state.adapterWatts), icon: "bolt.horizontal.fill", iconColor: adapterTint)
                 StatCard(title: "Battery Power", value: wattsValue(state.batteryWatts), icon: "bolt.horizontal.fill", iconColor: tint)
-                StatCard(title: "Adapter Current", value: amperageValue(state.adapterAmperage), icon: "alternatingcurrent", iconColor: adapterTint, onTap: {
+                StatCard(title: "Adapter Current", value: amperageValue(state.adapterAmperage), icon: "directcurrent", iconColor: adapterTint, onTap: {
                     amperageShowMA.toggle()
                 })
-                StatCard(title: "Battery Current", value: amperageValue(state.amperage.map(Double.init)), icon: "alternatingcurrent", iconColor: tint, onTap: {
+                StatCard(title: "Battery Current", value: amperageValue(state.amperage.map(Double.init)), icon: "directcurrent", iconColor: tint, onTap: {
                     amperageShowMA.toggle()
                 })
                 StatCard(title: "Adapter Voltage", value: voltageValue(state.adapterVoltage), icon: "bolt.fill", iconColor: adapterTint)
