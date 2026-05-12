@@ -15,8 +15,8 @@ struct BatteryState: Equatable {
     let designCapacity: Int
     let maxCapacity: Int
     let currentCapacity: Int
-    let amperage: Int
-    let voltage: Double
+    let amperage: Int?
+    let voltage: Double?
     let adapterWatts: Double?
     let adapterAmperage: Double?
     let adapterVoltage: Double?
@@ -1055,8 +1055,8 @@ final class BatteryMonitor: ObservableObject {
         var designCap = 0
         var maxCap = 0
         var currentCap = 0
-        var amperage = 0
-        var voltage = 0.0
+        var amperage: Int?
+        var voltage: Double?
         var temperature = 0.0
         var adapterWatts: Double?
         var adapterAmperage: Double?
@@ -1089,7 +1089,7 @@ final class BatteryMonitor: ObservableObject {
             }
             if let telemetry = IORegistryEntryCreateCFProperty(service, "PowerTelemetryData" as CFString, nil, 0)?.takeRetainedValue() as? [String: Any] {
                 adapterWatts = Self.milliwattsToWatts(telemetry["SystemPowerIn"])
-                adapterAmperage = Self.milliamps(telemetry["SystemCurrentIn"])
+                adapterAmperage = Self.numericValue(telemetry["SystemCurrentIn"])
                 adapterVoltage = Self.millivoltsToVolts(telemetry["SystemVoltageIn"])
                 totalLoadWatts = Self.milliwattsToWatts(telemetry["SystemLoad"])
                 // NOTE: PowerTelemetryData.SystemLoad is the *total* load on the
@@ -1104,29 +1104,34 @@ final class BatteryMonitor: ObservableObject {
             // UI shows "—".
         }
 
-        // batteryWatts is only meaningful when we actually read voltage from
-        // the battery service. Keep nil when service was unavailable so the
+        // batteryWatts is only meaningful when we actually read both voltage
+        // and amperage from the battery service. Keep nil otherwise so the
         // UI shows "—" instead of a misleading "0.0 W".
-        let batW = voltage * Double(amperage) / 1000.0
-        batteryWatts = voltage > 0 ? batW : nil
+        let batW: Double? = {
+            guard let voltage, let amperage, voltage > 0 else { return nil }
+            return voltage * Double(amperage) / 1000.0
+        }()
+        batteryWatts = batW
 
         // Electronics-only consumption = input/load − battery charging power.
         // Order matters: prefer the adapter reading; once the adapter is gone,
         // the discharge sign of `batW` is a more trustworthy source of the
-        // electronics figure than `SystemLoad` (which is by definition an
+        // System Load figure than `SystemLoad` (which is by definition an
         // adapter-rail quantity and shouldn't be relied on without an adapter
         // — using it then would double-count `|batW|`). `SystemLoad` is the
         // belt-and-suspenders fallback for the rare case where the adapter is
         // present but `SystemPowerIn` is unavailable.
         // Clamp subtraction to ≥ 0 because adapter/load and battery values
         // come from independent IOKit reads and can briefly disagree.
+        // `batW ?? 0` is safe in branches 1 and 3: if the battery is
+        // unreadable, the entire input goes to System Load.
         let electronicsW: Double?
         if let adapter = adapterWatts {
-            electronicsW = max(0, adapter - batW)
-        } else if batW < 0 {
+            electronicsW = max(0, adapter - (batW ?? 0))
+        } else if let batW, batW < 0 {
             electronicsW = -batW
         } else if let totalLoad = totalLoadWatts {
-            electronicsW = max(0, totalLoad - batW)
+            electronicsW = max(0, totalLoad - (batW ?? 0))
         } else {
             electronicsW = nil
         }
@@ -1190,37 +1195,20 @@ final class BatteryMonitor: ObservableObject {
         )
     }
 
+    /// Coerce any numeric value pulled out of an IOKit dict into a Double.
+    /// CF numeric types (CFNumber regardless of underlying width) bridge to
+    /// NSNumber, so this single case covers Int / Int64 / UInt64 / Double /
+    /// Float / Bool and anything else that's actually a number.
     private static func numericValue(_ value: Any?) -> Double? {
-        if let number = value as? NSNumber {
-            return number.doubleValue
-        }
-        if let value = value as? Double {
-            return value
-        }
-        if let value = value as? Int {
-            return Double(value)
-        }
-        if let value = value as? Int64 {
-            return Double(value)
-        }
-        if let value = value as? UInt64 {
-            return Double(value)
-        }
-        return nil
+        (value as? NSNumber)?.doubleValue
     }
 
     private static func milliwattsToWatts(_ value: Any?) -> Double? {
-        guard let milliwatts = numericValue(value) else { return nil }
-        return milliwatts / 1000.0
-    }
-
-    private static func milliamps(_ value: Any?) -> Double? {
-        numericValue(value)
+        numericValue(value).map { $0 / 1000.0 }
     }
 
     private static func millivoltsToVolts(_ value: Any?) -> Double? {
-        guard let millivolts = numericValue(value) else { return nil }
-        return millivolts / 1000.0
+        numericValue(value).map { $0 / 1000.0 }
     }
 
     // MARK: - Toggle

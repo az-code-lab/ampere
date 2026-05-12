@@ -558,7 +558,7 @@ struct ContentView: View {
                 StatCard(title: "Adapter Current", value: amperageValue(state.adapterAmperage), icon: "alternatingcurrent", iconColor: adapterTint, onTap: {
                     amperageShowMA.toggle()
                 })
-                StatCard(title: "Battery Current", value: amperageValue(Double(state.amperage)), icon: "alternatingcurrent", iconColor: tint, onTap: {
+                StatCard(title: "Battery Current", value: amperageValue(state.amperage.map(Double.init)), icon: "alternatingcurrent", iconColor: tint, onTap: {
                     amperageShowMA.toggle()
                 })
                 StatCard(title: "Adapter Voltage", value: voltageValue(state.adapterVoltage), icon: "bolt.fill", iconColor: adapterTint)
