@@ -17,6 +17,11 @@ struct BatteryState: Equatable {
     let currentCapacity: Int
     let amperage: Int
     let voltage: Double
+    let adapterWatts: Double?
+    let adapterAmperage: Double?
+    let systemWatts: Double?
+    let systemAmperage: Double?
+    let batteryWatts: Double?
     let batteryAgeYears: String   // e.g. "4y 6m"
     let batteryAgeDays: String    // e.g. "1643d"
 }
@@ -897,6 +902,11 @@ final class BatteryMonitor: ObservableObject {
                         designCapacity: b.designCapacity, maxCapacity: b.maxCapacity,
                         currentCapacity: b.currentCapacity, amperage: b.amperage,
                         voltage: b.voltage,
+                        adapterWatts: b.adapterWatts,
+                        adapterAmperage: b.adapterAmperage,
+                        systemWatts: b.systemWatts,
+                        systemAmperage: b.systemAmperage,
+                        batteryWatts: b.batteryWatts,
                         batteryAgeYears: b.batteryAgeYears, batteryAgeDays: b.batteryAgeDays
                     )
                 }
@@ -1048,6 +1058,11 @@ final class BatteryMonitor: ObservableObject {
         var amperage = 0
         var voltage = 0.0
         var temperature = 0.0
+        var adapterWatts: Double?
+        var adapterAmperage: Double?
+        var systemWatts: Double?
+        var systemAmperage: Double?
+        var batteryWatts: Double?
 
         if service != MACH_PORT_NULL {
             if let val = IORegistryEntryCreateCFProperty(service, "CycleCount" as CFString, nil, 0)?.takeRetainedValue() as? Int {
@@ -1071,7 +1086,28 @@ final class BatteryMonitor: ObservableObject {
             if let val = IORegistryEntryCreateCFProperty(service, "Temperature" as CFString, nil, 0)?.takeRetainedValue() as? Int {
                 temperature = Double(val) / 100.0
             }
+            if let telemetry = IORegistryEntryCreateCFProperty(service, "PowerTelemetryData" as CFString, nil, 0)?.takeRetainedValue() as? [String: Any] {
+                adapterWatts = Self.milliwattsToWatts(telemetry["SystemPowerIn"])
+                adapterAmperage = Self.milliamps(telemetry["SystemCurrentIn"])
+                systemWatts = Self.milliwattsToWatts(telemetry["SystemLoad"])
+
+                if let systemMilliwatts = Self.numericValue(telemetry["SystemLoad"]),
+                   let systemMillivolts = Self.numericValue(telemetry["SystemVoltageIn"]),
+                   systemMillivolts > 0 {
+                    systemAmperage = systemMilliwatts / systemMillivolts * 1000.0
+                }
+            }
+            if let details = IORegistryEntryCreateCFProperty(service, "AdapterDetails" as CFString, nil, 0)?.takeRetainedValue() as? [String: Any] {
+                if adapterWatts == nil, let watts = Self.numericValue(details["Watts"]), watts > 0 {
+                    adapterWatts = watts
+                }
+                if adapterAmperage == nil, let milliamps = Self.numericValue(details["Current"]), milliamps > 0 {
+                    adapterAmperage = milliamps
+                }
+            }
         }
+
+        batteryWatts = voltage * Double(amperage) / 1000.0
 
         var adapterConnected = isPluggedIn
         if !adapterConnected, service != MACH_PORT_NULL {
@@ -1121,9 +1157,42 @@ final class BatteryMonitor: ObservableObject {
             currentCapacity: currentCap,
             amperage: amperage,
             voltage: voltage,
+            adapterWatts: adapterWatts,
+            adapterAmperage: adapterAmperage,
+            systemWatts: systemWatts,
+            systemAmperage: systemAmperage,
+            batteryWatts: batteryWatts,
             batteryAgeYears: batteryAgeYears,
             batteryAgeDays: batteryAgeDays
         )
+    }
+
+    private static func numericValue(_ value: Any?) -> Double? {
+        if let number = value as? NSNumber {
+            return number.doubleValue
+        }
+        if let value = value as? Double {
+            return value
+        }
+        if let value = value as? Int {
+            return Double(value)
+        }
+        if let value = value as? Int64 {
+            return Double(value)
+        }
+        if let value = value as? UInt64 {
+            return Double(value)
+        }
+        return nil
+    }
+
+    private static func milliwattsToWatts(_ value: Any?) -> Double? {
+        guard let milliwatts = numericValue(value) else { return nil }
+        return milliwatts / 1000.0
+    }
+
+    private static func milliamps(_ value: Any?) -> Double? {
+        numericValue(value)
     }
 
     // MARK: - Toggle

@@ -509,55 +509,81 @@ struct ContentView: View {
             tempValue = String(format: "%.1f\u{00B0}C", state.temperature)
         }
 
-        let watts = state.voltage * Double(state.amperage) / 1000.0
         let healthValue = healthShowPercent ? state.health : "\(state.maxCapacity)/\(state.designCapacity) mAh"
 
         let mode = batteryMode(state)
         let tint: Color = mode == .charging ? .green : (mode == .onBattery || mode == .discharging) ? .orange : .secondary
-
-        return LazyVGrid(columns: [
+        let twoColumns = [
             GridItem(.flexible()),
             GridItem(.flexible()),
-        ], spacing: 12) {
-            // Row 1: Lifetime
-            StatCard(title: "Cycle Count", value: "\(state.cycleCount)", icon: "arrow.triangle.2.circlepath", iconColor: tint)
-            StatCard(title: "Battery Served",
-                value: ageShowYears
-                    ? (state.batteryAgeYears.isEmpty ? "—" : state.batteryAgeYears)
-                    : (state.batteryAgeDays.isEmpty ? "—" : state.batteryAgeDays),
-                icon: "calendar.badge.clock", iconColor: tint, onTap: {
-                    ageShowYears.toggle()
-                })
+        ]
+        let threeColumns = [
+            GridItem(.flexible()),
+            GridItem(.flexible()),
+            GridItem(.flexible()),
+        ]
 
-            // Row 2: Capacity & Health
-            StatCard(title: "Capacity",
-                value: capacityShowMAh
-                    ? "\(state.currentCapacity)/\(state.maxCapacity) mAh"
-                    : (state.maxCapacity > 0
-                        ? String(format: "%.1f%%", Double(state.currentCapacity) / Double(state.maxCapacity) * 100)
-                        : "\(state.percentage)%"),
-                icon: "battery.100", iconColor: tint, onTap: {
-                    capacityShowMAh.toggle()
-                })
-            StatCard(title: "Health", value: healthValue, icon: "stethoscope", iconColor: tint, onTap: {
-                healthShowPercent.toggle()
-            })
+        return VStack(spacing: 12) {
+            LazyVGrid(columns: twoColumns, spacing: 12) {
+                StatCard(title: "Cycle Count", value: "\(state.cycleCount)", icon: "arrow.triangle.2.circlepath", iconColor: tint)
+                StatCard(title: "Battery Served",
+                    value: ageShowYears
+                        ? (state.batteryAgeYears.isEmpty ? "—" : state.batteryAgeYears)
+                        : (state.batteryAgeDays.isEmpty ? "—" : state.batteryAgeDays),
+                    icon: "calendar.badge.clock", iconColor: tint, onTap: {
+                        ageShowYears.toggle()
+                    })
 
-            // Row 3: Electrical
-            StatCard(title: "Voltage", value: String(format: "%.2f V", state.voltage), icon: "bolt.fill", iconColor: tint)
-            StatCard(title: "Amperage",
-                value: amperageShowMA ? "\(state.amperage) mA" : String(format: "%.2f A", Double(state.amperage) / 1000.0),
-                icon: "alternatingcurrent", iconColor: tint, onTap: {
+                StatCard(title: "Capacity",
+                    value: capacityShowMAh
+                        ? "\(state.currentCapacity)/\(state.maxCapacity) mAh"
+                        : (state.maxCapacity > 0
+                            ? String(format: "%.1f%%", Double(state.currentCapacity) / Double(state.maxCapacity) * 100)
+                            : "\(state.percentage)%"),
+                    icon: "battery.100", iconColor: tint, onTap: {
+                        capacityShowMAh.toggle()
+                    })
+                StatCard(title: "Health", value: healthValue, icon: "stethoscope", iconColor: tint, onTap: {
+                    healthShowPercent.toggle()
+                })
+            }
+
+            LazyVGrid(columns: threeColumns, spacing: 8) {
+                StatCard(title: "Adapter W", value: wattsValue(state.adapterWatts), icon: "powerplug.fill", iconColor: tint)
+                StatCard(title: "System W", value: wattsValue(state.systemWatts), icon: "desktopcomputer", iconColor: tint)
+                StatCard(title: "Battery W", value: wattsValue(state.batteryWatts), icon: "bolt.horizontal.fill", iconColor: tint)
+                StatCard(title: "Adapter A", value: amperageValue(state.adapterAmperage), icon: "powerplug", iconColor: tint, onTap: {
                     amperageShowMA.toggle()
                 })
+                StatCard(title: "System A", value: amperageValue(state.systemAmperage), icon: "cpu", iconColor: tint, onTap: {
+                    amperageShowMA.toggle()
+                })
+                StatCard(title: "Battery A", value: amperageValue(Double(state.amperage)), icon: "alternatingcurrent", iconColor: tint, onTap: {
+                    amperageShowMA.toggle()
+                })
+            }
 
-            // Row 4: Power & Temperature
-            StatCard(title: "Wattage", value: String(format: "%.1f W", watts), icon: "bolt.horizontal.fill", iconColor: tint)
-            StatCard(title: "Temperature", value: tempValue, icon: "thermometer.medium", iconColor: tint, onTap: {
-                useFahrenheit.toggle()
-            })
+            LazyVGrid(columns: twoColumns, spacing: 12) {
+                StatCard(title: "Voltage", value: String(format: "%.2f V", state.voltage), icon: "bolt.fill", iconColor: tint)
+                StatCard(title: "Temperature", value: tempValue, icon: "thermometer.medium", iconColor: tint, onTap: {
+                    useFahrenheit.toggle()
+                })
+            }
         }
         .padding(.horizontal, 16)
+    }
+
+    private func wattsValue(_ watts: Double?) -> String {
+        guard let watts else { return "—" }
+        return String(format: "%.1f W", watts)
+    }
+
+    private func amperageValue(_ milliamps: Double?) -> String {
+        guard let milliamps else { return "—" }
+        if amperageShowMA {
+            return String(format: "%.0f mA", milliamps)
+        }
+        return String(format: "%.2f A", milliamps / 1000.0)
     }
 
     private func autoManageToggle() -> some View {
@@ -1058,4 +1084,3 @@ struct StatCard: View {
         }
     }
 }
-
