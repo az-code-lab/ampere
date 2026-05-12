@@ -517,11 +517,6 @@ struct ContentView: View {
             GridItem(.flexible()),
             GridItem(.flexible()),
         ]
-        let threeColumns = [
-            GridItem(.flexible()),
-            GridItem(.flexible()),
-            GridItem(.flexible()),
-        ]
 
         // Adapter cards dim to .secondary when nothing is plugged in so the
         // "—" or 0 readings are visually distinguished from live values.
@@ -554,23 +549,20 @@ struct ContentView: View {
                 StatCard(title: "Temperature", value: tempValue, icon: "thermometer.medium", iconColor: tint, onTap: {
                     useFahrenheit.toggle()
                 })
+                StatCard(title: "System Load", value: wattsValue(state.loadWatts), icon: "desktopcomputer", iconColor: tint)
             }
 
-            LazyVGrid(columns: threeColumns, spacing: 8) {
-                StatCard(title: "Adapter W", value: wattsValue(state.adapterWatts), icon: "powerplug.fill", iconColor: adapterTint)
-                StatCard(title: "System W", value: wattsValue(state.systemWatts), icon: "desktopcomputer", iconColor: tint)
-                StatCard(title: "Battery W", value: wattsValue(state.batteryWatts), icon: "bolt.horizontal.fill", iconColor: tint)
-                StatCard(title: "Adapter A", value: amperageValue(state.adapterAmperage), icon: "powerplug", iconColor: adapterTint, onTap: {
+            LazyVGrid(columns: twoColumns, spacing: 8) {
+                StatCard(title: "Adapter Power", value: wattsValue(state.adapterWatts), icon: "bolt.horizontal.fill", iconColor: adapterTint)
+                StatCard(title: "Battery Power", value: wattsValue(state.batteryWatts), icon: "bolt.horizontal.fill", iconColor: tint)
+                StatCard(title: "Adapter Current", value: amperageValue(state.adapterAmperage), icon: "alternatingcurrent", iconColor: adapterTint, onTap: {
                     amperageShowMA.toggle()
                 })
-                StatCard(title: "System A", value: amperageValue(state.systemAmperage), icon: "cpu", iconColor: tint, onTap: {
+                StatCard(title: "Battery Current", value: amperageValue(Double(state.amperage)), icon: "alternatingcurrent", iconColor: tint, onTap: {
                     amperageShowMA.toggle()
                 })
-                StatCard(title: "Battery A", value: amperageValue(Double(state.amperage)), icon: "alternatingcurrent", iconColor: tint, onTap: {
-                    amperageShowMA.toggle()
-                })
-                StatCard(title: "Adapter V", value: voltageValue(state.adapterVoltage), icon: "bolt.fill", iconColor: adapterTint)
-                StatCard(title: "Battery V", value: voltageValue(state.voltage), icon: "bolt.fill", iconColor: tint)
+                StatCard(title: "Adapter Voltage", value: voltageValue(state.adapterVoltage), icon: "bolt.fill", iconColor: adapterTint)
+                StatCard(title: "Battery Voltage", value: voltageValue(state.voltage), icon: "bolt.fill", iconColor: tint)
             }
         }
         .padding(.horizontal, 16)
@@ -1079,6 +1071,8 @@ struct StatCard: View {
             Text(title)
                 .font(.system(size: 12))
                 .foregroundColor(.secondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
         }
         .frame(maxWidth: .infinity)
         .frame(height: 60)

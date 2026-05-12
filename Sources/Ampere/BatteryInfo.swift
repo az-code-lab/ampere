@@ -20,8 +20,7 @@ struct BatteryState: Equatable {
     let adapterWatts: Double?
     let adapterAmperage: Double?
     let adapterVoltage: Double?
-    let systemWatts: Double?
-    let systemAmperage: Double?
+    let loadWatts: Double?
     let batteryWatts: Double?
     let batteryAgeYears: String   // e.g. "4y 6m"
     let batteryAgeDays: String    // e.g. "1643d"
@@ -906,8 +905,7 @@ final class BatteryMonitor: ObservableObject {
                         adapterWatts: b.adapterWatts,
                         adapterAmperage: b.adapterAmperage,
                         adapterVoltage: b.adapterVoltage,
-                        systemWatts: b.systemWatts,
-                        systemAmperage: b.systemAmperage,
+                        loadWatts: b.loadWatts,
                         batteryWatts: b.batteryWatts,
                         batteryAgeYears: b.batteryAgeYears, batteryAgeDays: b.batteryAgeDays
                     )
@@ -1064,8 +1062,7 @@ final class BatteryMonitor: ObservableObject {
         var adapterAmperage: Double?
         var adapterVoltage: Double?
         var totalLoadWatts: Double?
-        var systemWatts: Double?
-        var systemAmperage: Double?
+        var loadWatts: Double?
         var batteryWatts: Double?
 
         if service != MACH_PORT_NULL {
@@ -1097,8 +1094,8 @@ final class BatteryMonitor: ObservableObject {
                 totalLoadWatts = Self.milliwattsToWatts(telemetry["SystemLoad"])
                 // NOTE: PowerTelemetryData.SystemLoad is the *total* load on the
                 // adapter rail — it includes battery charging power. We compute
-                // electronics-only "System W" below from `adapter − battery` so
-                // the relationship Adapter ≈ System + Battery holds.
+                // electronics-only "Load" below from `adapter − battery` so
+                // the relationship Adapter ≈ Load + Battery holds.
             }
             // Intentionally no AdapterDetails fallback: details["Watts"] /
             // details["Current"] are the adapter's *rated* capacity, not its
@@ -1110,7 +1107,7 @@ final class BatteryMonitor: ObservableObject {
         let batW = voltage * Double(amperage) / 1000.0
         batteryWatts = batW
 
-        // System electronics power = input/load − battery charging power.
+        // Load power = input/load − battery charging power.
         // Prefer adapter input when available. If that key is missing but
         // SystemLoad exists, it is still useful as the total load fallback.
         // On battery, batW is negative (discharging), so −batW is the absolute
@@ -1127,10 +1124,7 @@ final class BatteryMonitor: ObservableObject {
         } else {
             electronicsW = nil
         }
-        systemWatts = electronicsW
-        if let electronicsW, voltage > 0 {
-            systemAmperage = electronicsW / voltage * 1000.0
-        }
+        loadWatts = electronicsW
 
         var adapterConnected = isPluggedIn
         if !adapterConnected, service != MACH_PORT_NULL {
@@ -1183,8 +1177,7 @@ final class BatteryMonitor: ObservableObject {
             adapterWatts: adapterWatts,
             adapterAmperage: adapterAmperage,
             adapterVoltage: adapterVoltage,
-            systemWatts: systemWatts,
-            systemAmperage: systemAmperage,
+            loadWatts: loadWatts,
             batteryWatts: batteryWatts,
             batteryAgeYears: batteryAgeYears,
             batteryAgeDays: batteryAgeDays
