@@ -1094,14 +1094,11 @@ final class BatteryMonitor: ObservableObject {
                 // electronics-only "System W" below from `adapter − battery` so
                 // the relationship Adapter ≈ System + Battery holds.
             }
-            if let details = IORegistryEntryCreateCFProperty(service, "AdapterDetails" as CFString, nil, 0)?.takeRetainedValue() as? [String: Any] {
-                if adapterWatts == nil, let watts = Self.numericValue(details["Watts"]), watts > 0 {
-                    adapterWatts = watts
-                }
-                if adapterAmperage == nil, let milliamps = Self.numericValue(details["Current"]), milliamps > 0 {
-                    adapterAmperage = milliamps
-                }
-            }
+            // Intentionally no AdapterDetails fallback: details["Watts"] /
+            // details["Current"] are the adapter's *rated* capacity, not its
+            // live draw, so falling back would surface a constant lie. If
+            // PowerTelemetryData is absent (very old Macs), leave nil and the
+            // UI shows "—".
         }
 
         let batW = voltage * Double(amperage) / 1000.0
@@ -1111,17 +1108,18 @@ final class BatteryMonitor: ObservableObject {
         // On AC charging: subtract positive battery power → only the electronics
         // portion remains. On battery: adapterWatts is nil and batW is negative
         // (discharging), so −batW is the absolute electronics consumption.
+        // Clamped to ≥ 0: adapter and battery come from independent IOKit reads
+        // at slightly different sample times, so the subtraction can be briefly
+        // negative even though electronics consumption is always non-negative.
+        let electronicsW: Double
         if let adapter = adapterWatts {
-            let electronics = adapter - batW
-            systemWatts = electronics
-            if voltage > 0 {
-                systemAmperage = electronics / voltage * 1000.0
-            }
+            electronicsW = max(0, adapter - batW)
         } else {
-            systemWatts = -batW
-            if voltage > 0 {
-                systemAmperage = -batW / voltage * 1000.0
-            }
+            electronicsW = max(0, -batW)
+        }
+        systemWatts = electronicsW
+        if voltage > 0 {
+            systemAmperage = electronicsW / voltage * 1000.0
         }
 
         var adapterConnected = isPluggedIn

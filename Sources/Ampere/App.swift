@@ -523,6 +523,10 @@ struct ContentView: View {
             GridItem(.flexible()),
         ]
 
+        // Adapter cards dim to .secondary when nothing is plugged in so the
+        // "—" or 0 readings are visually distinguished from live values.
+        let adapterTint: Color = state.adapterConnected ? tint : .secondary
+
         return VStack(spacing: 12) {
             LazyVGrid(columns: twoColumns, spacing: 12) {
                 StatCard(title: "Cycle Count", value: "\(state.cycleCount)", icon: "arrow.triangle.2.circlepath", iconColor: tint)
@@ -546,13 +550,18 @@ struct ContentView: View {
                 StatCard(title: "Health", value: healthValue, icon: "stethoscope", iconColor: tint, onTap: {
                     healthShowPercent.toggle()
                 })
+
+                StatCard(title: "Voltage", value: String(format: "%.2f V", state.voltage), icon: "bolt.fill", iconColor: tint)
+                StatCard(title: "Temperature", value: tempValue, icon: "thermometer.medium", iconColor: tint, onTap: {
+                    useFahrenheit.toggle()
+                })
             }
 
             LazyVGrid(columns: threeColumns, spacing: 8) {
-                StatCard(title: "Adapter W", value: wattsValue(state.adapterWatts), icon: "powerplug.fill", iconColor: tint)
+                StatCard(title: "Adapter W", value: wattsValue(state.adapterWatts), icon: "powerplug.fill", iconColor: adapterTint)
                 StatCard(title: "System W", value: wattsValue(state.systemWatts), icon: "desktopcomputer", iconColor: tint)
                 StatCard(title: "Battery W", value: wattsValue(state.batteryWatts), icon: "bolt.horizontal.fill", iconColor: tint)
-                StatCard(title: "Adapter A", value: amperageValue(state.adapterAmperage), icon: "powerplug", iconColor: tint, onTap: {
+                StatCard(title: "Adapter A", value: amperageValue(state.adapterAmperage), icon: "powerplug", iconColor: adapterTint, onTap: {
                     amperageShowMA.toggle()
                 })
                 StatCard(title: "System A", value: amperageValue(state.systemAmperage), icon: "cpu", iconColor: tint, onTap: {
@@ -560,13 +569,6 @@ struct ContentView: View {
                 })
                 StatCard(title: "Battery A", value: amperageValue(Double(state.amperage)), icon: "alternatingcurrent", iconColor: tint, onTap: {
                     amperageShowMA.toggle()
-                })
-            }
-
-            LazyVGrid(columns: twoColumns, spacing: 12) {
-                StatCard(title: "Voltage", value: String(format: "%.2f V", state.voltage), icon: "bolt.fill", iconColor: tint)
-                StatCard(title: "Temperature", value: tempValue, icon: "thermometer.medium", iconColor: tint, onTap: {
-                    useFahrenheit.toggle()
                 })
             }
         }
