@@ -152,12 +152,14 @@ final class BatteryMonitor: ObservableObject {
         // restart that crossed an adapter transition.
         self.lastAdapterConnected = defaults.object(forKey: "lastAdapterConnected") as? Bool
 
-        // Always clear discharge (CHIE) and kill orphaned watchdogs on launch.
-        // For CHTE: if auto-manage is enabled and charge is at or above the lower
-        // bound, inhibit charging to prevent micro-charges between bounds after a
-        // restart. Only allow charging when charge drops below the lower bound.
-        // If the helper was removed (e.g. brew uninstall), disable features that need it
+        // chargingPaused starts false; the launch-cleanup block below may
+        // set it to true if shouldInhibit applies. Not persisted — always
+        // derived fresh from the rule conditions at launch.
         chargingPaused = false
+        // If the helper is missing or out-of-date, install (or update) it.
+        // brew uninstall would have removed the helper; a fresh app build
+        // would have a different helper binary. The install prompts for
+        // admin via osascript; cancellation terminates the app.
         if !isSudoRuleInstalled || isHelperStale {
             NSLog("Ampere: Helper %@, installing…", !isSudoRuleInstalled ? "missing" : "stale")
             if !installSudo() {
@@ -1150,7 +1152,10 @@ final class BatteryMonitor: ObservableObject {
             return
         }
 
-        let chte = chteBytes.withUnsafeBytes { Int($0.load(as: UInt32.self)) }
+        // loadUnaligned because Swift's [UInt8] buffer isn't guaranteed to be
+        // UInt32-aligned. macOS arm64 permits unaligned loads, but `.load`'s
+        // API contract requires alignment — undefined behavior otherwise.
+        let chte = chteBytes.withUnsafeBytes { Int($0.loadUnaligned(as: UInt32.self)) }
         let chie = Int(chieBytes[0])
 
         let healthy: Bool

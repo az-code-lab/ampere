@@ -41,6 +41,9 @@ func smcWriteKey(_ conn: io_connect_t, _ key: String, _ bytes: [UInt8]) -> Bool 
 
     let dataType = outputStruct.keyInfo.dataType
     let dataSize = outputStruct.keyInfo.dataSize
+    // Symmetric bounds check with smcReadKey — a malformed dataSize > 32
+    // would overrun the bytes tuple in the write loop below.
+    guard dataSize > 0, dataSize <= SMCKeyData.bytesCapacity else { return false }
 
     inputStruct = SMCKeyData()
     outputStruct = SMCKeyData()
