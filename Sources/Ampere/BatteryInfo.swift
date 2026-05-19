@@ -537,10 +537,12 @@ final class BatteryMonitor: ObservableObject {
             task.waitUntilExit()
             if task.terminationStatus == 0 { return true }
             let errMsg = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            NSLog("Ampere: sudo failed: %@", errMsg)
+            // Include the helper arg and exit status — the previous log
+            // ("sudo failed: %@") swallowed both when stderr was empty.
+            NSLog("Ampere: sudo failed (arg=%@ status=%d): %@", arg, task.terminationStatus, errMsg)
             return false
         } catch {
-            NSLog("Ampere: failed to run sudo: %@", error.localizedDescription)
+            NSLog("Ampere: failed to run sudo (arg=%@): %@", arg, error.localizedDescription)
             return false
         }
     }
@@ -803,8 +805,11 @@ final class BatteryMonitor: ObservableObject {
                     if ok {
                         self.activeDischarging = false
                         NSLog("Ampere: Auto-discharge toggled off")
+                        self.refresh()
                     }
-                    self.refresh()
+                    // On failure: don't re-refresh immediately. The condition is
+                    // still true, so refresh() would loop. Wait for the next
+                    // timer tick instead.
                 }
             }
             return
@@ -822,8 +827,8 @@ final class BatteryMonitor: ObservableObject {
                         if ok {
                             self.activeDischarging = true
                             NSLog("Ampere: Auto-discharge started at %d%%, target %d%%", b.percentage, self.chargeUpperBound)
+                            self.refresh()
                         }
-                        self.refresh()
                     }
                 }
                 return
@@ -837,8 +842,8 @@ final class BatteryMonitor: ObservableObject {
                         if ok {
                             self.activeDischarging = false
                             NSLog("Ampere: Auto-discharge reached target %d%%", self.chargeUpperBound)
+                            self.refresh()
                         }
-                        self.refresh()
                     }
                 }
                 return
@@ -898,8 +903,11 @@ final class BatteryMonitor: ObservableObject {
                             case .none:
                                 break
                             }
+                            self.refresh()
                         }
-                        self.refresh()
+                        // On failure: don't re-refresh. The decision inputs
+                        // are unchanged, so refresh would re-issue the same
+                        // action and tight-loop. Wait for the next timer tick.
                     }
                 }
             }
