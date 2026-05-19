@@ -182,6 +182,17 @@ final class BatteryMonitor: ObservableObject {
             // chargeToUpperBound value next time around.
             let launchBattery = Self.readBattery()
             let launchPercentage = launchBattery?.percentage ?? 0
+            // Crash-recovery sanity: chargeToUpperBound=true is only valid below
+            // the upper bound. A crash between the state machine's CHTE=inhibit
+            // write and its in-memory ctu=false update can leave ctu=true
+            // persisted with pct already at/above upper. Without this correction,
+            // shouldInhibit below would compute false and the launch cleanup
+            // would briefly write CHTE=allow, violating the invariant until the
+            // first refresh self-corrects.
+            if chargeToUpperBound, launchBattery != nil, launchPercentage >= chargeUpperBound {
+                chargeToUpperBound = false
+                defaults.set(false, forKey: "chargeToUpperBound")
+            }
             // Respect persisted charge-to-upper intent: if true, skip the inhibit
             // so an in-progress charge-to-upper survives a restart.
             let shouldInhibit = autoManageEnabled

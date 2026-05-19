@@ -491,7 +491,11 @@ struct ContentView: View {
             return "Discharging to \(monitor.chargeUpperBound)% — sleep is temporarily disabled"
         }
         if monitor.autoManageEnabled && monitor.chargingPaused {
-            if state.percentage > monitor.chargeUpperBound {
+            // "drains to X% under load" implies passive drain via the adapter
+            // rail — only accurate on AC. On battery, the battery drains
+            // directly regardless of CHTE, so fall through to the generic
+            // "holding" message which is still accurate.
+            if state.adapterConnected && state.percentage > monitor.chargeUpperBound {
                 return "Auto: not charging — drains to \(monitor.chargeUpperBound)% under load"
             }
             return "Auto: holding — charges below \(monitor.chargeLowerBound)% or on demand"
@@ -499,7 +503,10 @@ struct ContentView: View {
         if monitor.autoManageEnabled && state.isCharging {
             return "Auto: charging to \(monitor.chargeUpperBound)%"
         }
-        if monitor.chargingPaused { return "Running on AC power - battery will not charge" }
+        // chargingPaused can briefly persist after a manual-mode unplug
+        // (until the next refresh tick clears it), so require adapterConnected
+        // here to avoid "Running on AC power" while actually on battery.
+        if monitor.chargingPaused && state.adapterConnected { return "Running on AC power — battery will not charge" }
         if !state.adapterConnected { return "Connect power adapter to control charging" }
         return ""
     }
@@ -508,7 +515,11 @@ struct ContentView: View {
         if monitor.lastError != nil { return .red }
         if monitor.healthWarning != nil { return .red }
         if monitor.activeDischarging { return .orange }
-        if monitor.chargingPaused { return .blue }
+        // Match statusMessage's branching: blue for auto-hold (regardless of AC)
+        // or manual pause while on AC. A manual-mode chargingPaused with no
+        // adapter falls through to the "Connect power adapter" prompt, which
+        // should be secondary, not blue.
+        if monitor.chargingPaused && (monitor.autoManageEnabled || state.adapterConnected) { return .blue }
         return .secondary
     }
 
