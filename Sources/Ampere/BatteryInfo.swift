@@ -120,8 +120,10 @@ final class BatteryMonitor: ObservableObject {
         let autoManage = defaults.bool(forKey: "autoManageEnabled")
         self.autoManageEnabled = autoManage
         self.autoDischargeEnabled = defaults.bool(forKey: "autoDischargeEnabled")
-        var lower = defaults.object(forKey: "chargeLowerBound") as? Int ?? 40
-        var upper = defaults.object(forKey: "chargeUpperBound") as? Int ?? 60
+        let originalLower = defaults.object(forKey: "chargeLowerBound") as? Int
+        let originalUpper = defaults.object(forKey: "chargeUpperBound") as? Int
+        var lower = originalLower ?? 40
+        var upper = originalUpper ?? 60
         if lower < 0 { lower = 0 }
         if upper > 100 { upper = 100 }
         // Reset to defaults if the saved gap violates the minGap invariant
@@ -130,10 +132,21 @@ final class BatteryMonitor: ObservableObject {
         if upper - lower < Self.chargeBoundMinGap { lower = 40; upper = 60 }
         self.chargeLowerBound = lower
         self.chargeUpperBound = upper
+        // Persist the repair if it differs from what was on disk —
+        // otherwise the corrupted values would resurface on every launch.
+        if originalLower != lower { defaults.set(lower, forKey: "chargeLowerBound") }
+        if originalUpper != upper { defaults.set(upper, forKey: "chargeUpperBound") }
         // Charge-to-upper intent persists across restart so a crash mid-recovery
         // resumes the in-progress charge rather than parking at the current level.
         // Clear it if auto-manage is disabled (it has no effect outside auto mode).
-        self.chargeToUpperBound = autoManage && defaults.bool(forKey: "chargeToUpperBound")
+        let persistedCtu = defaults.bool(forKey: "chargeToUpperBound")
+        self.chargeToUpperBound = autoManage && persistedCtu
+        // Persist the negation (autoManage=false but persisted ctu=true would
+        // otherwise stay diverged from in-memory state forever, since didSet
+        // doesn't fire during init).
+        if !self.chargeToUpperBound && persistedCtu {
+            defaults.set(false, forKey: "chargeToUpperBound")
+        }
         // Restore the last-known adapter state so rule 2 (connected→disconnected
         // → clear chargeToUpperBound) can fire on the first refresh after a
         // restart that crossed an adapter transition.
@@ -487,6 +500,10 @@ final class BatteryMonitor: ObservableObject {
         task.arguments = ["-e", script]
         // Discard child stdout/stderr — we don't read them, and unread
         // Pipes can block the child if its output ever fills the buffer.
+        // Also pin stdin to /dev/null so osascript (which doesn't read it
+        // for our -e usage) can't accidentally block waiting on inherited
+        // input from a TTY.
+        task.standardInput = FileHandle.nullDevice
         task.standardOutput = FileHandle.nullDevice
         task.standardError = FileHandle.nullDevice
         do {
@@ -1394,6 +1411,11 @@ final class BatteryMonitor: ObservableObject {
                     self.chargingPaused = true
                     NSLog("Ampere: Re-inhibited charging")
                     self.refresh()
+                } else {
+                    // Surface the failure so the user notices instead of
+                    // silently observing charging continuing after they
+                    // toggled charge-to-upper off.
+                    self.lastError = "Failed to inhibit charging — revoke and re-grant admin access"
                 }
                 // On failure: don't refresh. The state-machine would just
                 // re-dispatch the same inhibit and tight-loop. Next timer

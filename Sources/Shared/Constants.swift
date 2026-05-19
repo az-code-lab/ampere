@@ -1,5 +1,7 @@
 public enum AppConstants {
-    public static let appPrefix = "az-ampere"
+    // Only the derived paths below are part of the public API — keep the
+    // raw prefix private since nothing outside this file references it.
+    private static let appPrefix = "az-ampere"
     public static let helperPath = "/usr/local/bin/\(appPrefix)-smc"
     public static let sudoersPath = "/etc/sudoers.d/\(appPrefix)"
     public static let savedSleepPath = "/tmp/.\(appPrefix)-saved-sleep"

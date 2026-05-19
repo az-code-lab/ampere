@@ -612,6 +612,16 @@ struct ContentView: View {
                     if newValue {
                         // Set immediately so the toggle doesn't flicker
                         monitor.autoManageEnabled = true
+                        // Rule-1 entry condition: if currently below the lower
+                        // bound on AC, the documented behavior is to charge to
+                        // upper. The state machine's branch 3 requires
+                        // chargingPaused=true which a manual→auto transition
+                        // doesn't have, so set chargeToUpperBound here.
+                        if let state = monitor.state,
+                           state.adapterConnected,
+                           state.percentage < monitor.chargeLowerBound {
+                            monitor.chargeToUpperBound = true
+                        }
                         monitor.ensureSudoInstalled { ok in
                             if !ok {
                                 monitor.autoManageEnabled = false

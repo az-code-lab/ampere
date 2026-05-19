@@ -16,6 +16,7 @@ enum AppVersion {
         task.executableURL = URL(fileURLWithPath: "/usr/bin/git")
         task.arguments = ["describe", "--tags", "--always"]
         let pipe = Pipe()
+        task.standardInput = FileHandle.nullDevice
         task.standardOutput = pipe
         task.standardError = FileHandle.nullDevice
         do {

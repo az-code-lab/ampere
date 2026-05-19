@@ -144,6 +144,32 @@ final class AutoManageTransitionTests: XCTestCase {
                        "Rule 2 analogue: reaching upper bound clears chargeToUpperBound")
     }
 
+    func testRule1_FreshEnableFromManualMode_ChargesToUpper() {
+        // Scenario from fix AY: user enables auto-manage from manual mode
+        // while battery is below the lower bound on AC. The UI handler sets
+        // chargeToUpperBound=true so the eventual charge-to-upper happens
+        // (state machine's branch 3 needs chargingPaused which a fresh
+        // enable doesn't have). Verify the state machine then doesn't
+        // inhibit while charging through the lower bound and inhibits only
+        // at upper.
+        let sim = Simulator(
+            chargingPaused: false,
+            chargeToUpperBound: true,  // UI handler set this on fresh enable
+            lastAdapterConnected: true
+        )
+        // Below lower — no inhibit fires (CHTE stays allow from manual mode)
+        XCTAssertEqual(sim.step(percentage: 35, adapterConnected: true), .none)
+        // Charge through the band — still no inhibit because ctu=true
+        sim.chargeFrom(36, to: 59)
+        XCTAssertEqual(sim.issued.filter { $0 == .inhibit }.count, 0,
+                       "No inhibit fires while charging with chargeToUpperBound set")
+        XCTAssertTrue(sim.state.chargeToUpperBound)
+        // At upper, branch 1 fires
+        XCTAssertEqual(sim.step(percentage: 60, adapterConnected: true), .inhibit)
+        XCTAssertFalse(sim.state.chargeToUpperBound)
+        XCTAssertTrue(sim.state.chargingPaused)
+    }
+
     func testRule1_AlreadyBelowLowerWhenFirstConnected() {
         // Scenario: app starts or first sees state with battery already below
         // lower bound and AC plugged in (e.g., launched in that condition).

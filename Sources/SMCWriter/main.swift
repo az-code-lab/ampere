@@ -153,12 +153,16 @@ func setDischargeSleepPrevention(enabled: Bool) -> Bool {
         // values close to the macOS factory defaults (sleep=10min, displaysleep=10min)
         // rather than 1min, so a wiped save file doesn't strand the user with
         // a Mac that sleeps after 60 seconds.
-        // Also: validate the saved value is numeric — pmset rejects the
-        // *entire* command atomically if any arg is invalid, which would
-        // leave disablesleep=1 stuck on after a corrupted save.
+        // Validate: pmset rejects the *entire* command atomically if any arg
+        // is invalid, which would leave disablesleep=1 stuck. Accept only
+        // 0–1440 (= up to 24h, well past any sensible user setting).
+        func validPmsetMinutes(_ s: String) -> Bool {
+            guard let n = Int(s) else { return false }
+            return n >= 0 && n <= 1440
+        }
         let originalSleep: String
         if let saved = try? String(contentsOfFile: savedSleepPath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
-           !saved.isEmpty, Int(saved) != nil {
+           !saved.isEmpty, validPmsetMinutes(saved) {
             originalSleep = saved
             try? FileManager.default.removeItem(atPath: savedSleepPath)
         } else {
@@ -166,7 +170,7 @@ func setDischargeSleepPrevention(enabled: Bool) -> Bool {
         }
         let originalDisplaySleep: String
         if let saved = try? String(contentsOfFile: savedDisplaySleepPath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
-           !saved.isEmpty, Int(saved) != nil {
+           !saved.isEmpty, validPmsetMinutes(saved) {
             originalDisplaySleep = saved
             try? FileManager.default.removeItem(atPath: savedDisplaySleepPath)
         } else {
@@ -174,12 +178,17 @@ func setDischargeSleepPrevention(enabled: Bool) -> Bool {
         }
         task.arguments = ["-a", "sleep", originalSleep, "disablesleep", "0", "displaysleep", originalDisplaySleep]
     }
+    task.standardInput = FileHandle.nullDevice
     task.standardOutput = FileHandle.nullDevice
     task.standardError = FileHandle.nullDevice
     do {
         try task.run()
         task.waitUntilExit()
-        return task.terminationStatus == 0
+        if task.terminationStatus != 0 {
+            fputs("WARNING: pmset exited with status \(task.terminationStatus)\n", stderr)
+            return false
+        }
+        return true
     } catch {
         fputs("WARNING: Failed to run pmset: \(error.localizedDescription)\n", stderr)
         return false
