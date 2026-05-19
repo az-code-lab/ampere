@@ -196,13 +196,17 @@ func setDischargeSleepPrevention(enabled: Bool) -> Bool {
         task.arguments = ["-a", "sleep", "0", "disablesleep", "1", "displaysleep", "0"]
     } else {
         // Restore original values
+        // Fallbacks if the saved-original files are missing/unreadable: pick
+        // values close to the macOS factory defaults (sleep=10min, displaysleep=10min)
+        // rather than 1min, so a wiped save file doesn't strand the user with
+        // a Mac that sleeps after 60 seconds.
         let originalSleep: String
         if let saved = try? String(contentsOfFile: savedSleepPath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
            !saved.isEmpty {
             originalSleep = saved
             try? FileManager.default.removeItem(atPath: savedSleepPath)
         } else {
-            originalSleep = "1"
+            originalSleep = "10"
         }
         let originalDisplaySleep: String
         if let saved = try? String(contentsOfFile: savedSleepPath + "-display", encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
@@ -267,7 +271,10 @@ if action.hasPrefix("spawn-watchdog:") {
         fputs("ERROR: invalid PID\n", stderr)
         exit(1)
     }
-    _ = spawnWatchdog(appPID: appPID)
+    if !spawnWatchdog(appPID: appPID) {
+        // Stderr already logged inside spawnWatchdog.
+        exit(2)
+    }
     print("OK: watchdog spawned")
     exit(0)
 }
@@ -294,7 +301,18 @@ if action.hasPrefix("discharge:") {
     }
     IOServiceClose(conn)
 
-    _ = spawnWatchdog(appPID: appPID)
+    // Spawn the watchdog AFTER the SMC write, but roll the discharge back if
+    // it fails — running discharge without a crash safety net would leave
+    // sleep disabled and CHIE=0x08 stuck on if the app dies.
+    if !spawnWatchdog(appPID: appPID) {
+        if let conn = smcOpen() {
+            _ = smcWriteKey(conn, SMC.keyChargeInhibit, SMC.chieNormal)
+            IOServiceClose(conn)
+        }
+        _ = setDischargeSleepPrevention(enabled: false)
+        fputs("ERROR: watchdog spawn failed — rolled back discharge\n", stderr)
+        exit(3)
+    }
 
     print("OK: active discharge enabled")
     exit(0)

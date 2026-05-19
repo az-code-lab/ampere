@@ -634,7 +634,7 @@ struct ContentView: View {
                 ),
                 currentLevel: Double(state.percentage),
                 step: 5,
-                minGap: 5
+                minGap: Double(BatteryMonitor.chargeBoundMinGap)
             )
             .frame(height: 68)
             .padding(.top, 2)
