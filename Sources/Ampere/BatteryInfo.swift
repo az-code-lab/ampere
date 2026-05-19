@@ -15,12 +15,19 @@ struct BatteryState: Equatable {
     let designCapacity: Int
     let maxCapacity: Int
     let currentCapacity: Int
+    /// Battery current in mA. Sign convention: positive = into battery
+    /// (charging), negative = out of battery (discharging). Several
+    /// downstream consumers (`PowerFlowRouter`, `BatteryModeRouter`,
+    /// `BatteryETACalculator`, `effectivelyCharging`) treat this sign as
+    /// the source of truth for direction, ahead of `isCharging`.
     let amperage: Double?
     let voltage: Double?
     let adapterWatts: Double?
     let adapterAmperage: Double?
     let adapterVoltage: Double?
     let electronicsWatts: Double?
+    /// Battery power in W (= `voltage * amperage / 1000`). Same sign
+    /// convention as `amperage`: positive = charging, negative = draining.
     let batteryWatts: Double?
     let batteryAgeYears: String   // e.g. "4y 6m"
     let batteryAgeDays: String    // e.g. "1643d"
@@ -917,10 +924,28 @@ final class BatteryMonitor: ObservableObject {
             let menuBarChanged = state == nil
                 || state?.percentage != battery?.percentage
                 || state?.isCharging != battery?.isCharging
+                // Menu bar animation direction is now driven by amperage's
+                // sign too (via `effectivelyCharging`), so a sign flip with
+                // unchanged `isCharging` (the discharge-startup transient)
+                // must also re-render or the icon would lag the actual
+                // current direction.
+                || Self.amperageDirection(state?.amperage)
+                    != Self.amperageDirection(battery?.amperage)
             if isPopoverVisible || menuBarChanged {
                 state = battery
             }
         }
+    }
+
+    /// `-1` discharging, `+1` charging, `0` idle/unknown. Mirrors the
+    /// branching in `BatteryModeRouter` and `effectivelyCharging` so
+    /// `publishStateIfNeeded` re-renders the menu bar on the same events
+    /// those consumers actually depend on.
+    static func amperageDirection(_ amperage: Double?) -> Int {
+        guard let amperage = amperage else { return 0 }
+        if amperage > 0 { return 1 }
+        if amperage < 0 { return -1 }
+        return 0
     }
 
     func refresh() {

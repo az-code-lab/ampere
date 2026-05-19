@@ -253,10 +253,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         color.withAlphaComponent(0.7).setFill()
         NSBezierPath(roundedRect: capRect, xRadius: 0.8, yRadius: 0.8).fill()
 
-        // Fill level
+        // Fill level. Clamp to [0, fillMaxW] because the animation timer
+        // can briefly overshoot 100% (it bumps by +5 before the > target
+        // reset fires), and without an upper clamp the fill would render
+        // past the outlined boundary.
         let inset: CGFloat = 2
         let fillMaxW = battW - 1 - inset * 2
-        let fillW = max(0, fillMaxW * percentage / 100)
+        let fillW = min(fillMaxW, max(0, fillMaxW * percentage / 100))
         let fillRect = NSRect(x: 0.5 + inset, y: battY + 0.5 + inset,
                               width: fillW, height: battH - 1 - inset * 2)
         color.setFill()
@@ -531,41 +534,15 @@ struct ContentView: View {
     /// the computation can't run — that path still serves the on-battery
     /// "Xh Ym remaining" case via IOKit's smart `TimeToEmpty` estimator.
     private func displayedTimeRemaining(_ state: BatteryState) -> String {
-        // Drive branching from the live current's sign rather than from
-        // `state.isCharging`. IOKit's `isCharging` can lag the actual current
-        // direction during auto-manage transitions or when an underpowered
-        // adapter forces the battery to supplement — leaning on amperage
-        // keeps the ETA correct in those moments.
-        if let amperage = state.amperage {
-            if amperage > 0 {
-                let target = monitor.autoManageEnabled ? monitor.chargeUpperBound : 100
-                let eta = chargingETA(state, target: target)
-                if !eta.isEmpty { return eta }
-            } else if amperage < 0 {
-                let target = monitor.activeDischarging ? monitor.chargeUpperBound : 0
-                let eta = dischargeETA(state, target: target)
-                if !eta.isEmpty { return eta }
-            }
-        }
-        return state.timeRemaining
-    }
-
-    private func chargingETA(_ state: BatteryState, target: Int) -> String {
-        BatteryETACalculator.chargingETA(
+        let eta = TimeRemainingRouter.label(
             percentage: state.percentage,
             maxCapacity: state.maxCapacity,
             amperage: state.amperage,
-            target: target
+            autoManageEnabled: monitor.autoManageEnabled,
+            activeDischarging: monitor.activeDischarging,
+            upperBound: monitor.chargeUpperBound
         )
-    }
-
-    private func dischargeETA(_ state: BatteryState, target: Int) -> String {
-        BatteryETACalculator.dischargeETA(
-            percentage: state.percentage,
-            maxCapacity: state.maxCapacity,
-            amperage: state.amperage,
-            target: target
-        )
+        return eta.isEmpty ? state.timeRemaining : eta
     }
 
     private func statusMessage(_ state: BatteryState) -> String {
@@ -644,9 +621,9 @@ struct ContentView: View {
         return LazyVGrid(columns: fourColumns, spacing: 8) {
             // Row 0
             StatCard(title: "Cycle Count", value: "\(state.cycleCount)", icon: "arrow.triangle.2.circlepath", iconColor: tint)
-            StatCard(title: "System Load", value: wattsValue(state.electronicsWatts), icon: "desktopcomputer", iconColor: tint)
-            StatCard(title: "Adapter Load", value: wattsValue(state.adapterWatts), icon: "bolt.horizontal.fill", iconColor: adapterTint)
-            StatCard(title: "Battery Load", value: wattsValue(state.batteryWatts), icon: "bolt.horizontal.fill", iconColor: tint)
+            StatCard(title: "System Load", value: formatWatts(state.electronicsWatts), icon: "desktopcomputer", iconColor: tint)
+            StatCard(title: "Adapter Load", value: formatWatts(state.adapterWatts), icon: "bolt.horizontal.fill", iconColor: adapterTint)
+            StatCard(title: "Battery Load", value: formatWatts(state.batteryWatts), icon: "bolt.horizontal.fill", iconColor: tint)
 
             // Row 1
             StatCard(title: "Battery Served",
@@ -683,11 +660,6 @@ struct ContentView: View {
             })
         }
         .padding(.horizontal, 16)
-    }
-
-    private func wattsValue(_ watts: Double?) -> String {
-        guard let watts else { return "—" }
-        return String(format: "%.1f W", watts)
     }
 
     private func amperageValue(_ milliamps: Double?) -> String {
@@ -916,6 +888,52 @@ enum BatteryMode: Equatable {
     case discharging
     case onACNotCharging
     case onBattery
+}
+
+/// Single source of truth for the "%.1f W" / "—" wattage label format.
+/// Used by both the stat cards (`ContentView.statusGrid`) and the Sankey
+/// diagram nodes (`PowerFlowDiagram.node` / `batteryNode`) — keeping the
+/// formatter shared so the two displays can never disagree on rounding
+/// or the "unknown" sentinel.
+func formatWatts(_ watts: Double?) -> String {
+    guard let watts else { return "—" }
+    return String(format: "%.1f W", watts)
+}
+
+/// Decides which target the ETA label should aim at, then delegates the
+/// formatting to `BatteryETACalculator`. Returns "" when amperage is 0/nil
+/// (no flow) so the caller can fall back to IOKit's `timeRemaining`.
+///
+/// Targets:
+/// - charging on auto-manage → upper bound
+/// - charging manually → 100 % ("to full")
+/// - discharging via "Discharge to Upper Bound" → upper bound
+/// - discharging otherwise → 0 % ("remaining")
+enum TimeRemainingRouter {
+    static func label(
+        percentage: Int,
+        maxCapacity: Int,
+        amperage: Double?,
+        autoManageEnabled: Bool,
+        activeDischarging: Bool,
+        upperBound: Int
+    ) -> String {
+        guard let amperage = amperage else { return "" }
+        if amperage > 0 {
+            let target = autoManageEnabled ? upperBound : 100
+            return BatteryETACalculator.chargingETA(
+                percentage: percentage, maxCapacity: maxCapacity,
+                amperage: amperage, target: target
+            )
+        } else if amperage < 0 {
+            let target = activeDischarging ? upperBound : 0
+            return BatteryETACalculator.dischargeETA(
+                percentage: percentage, maxCapacity: maxCapacity,
+                amperage: amperage, target: target
+            )
+        }
+        return ""
+    }
 }
 
 /// Computes the "Xh Ym to NN%" / "Xh Ym remaining" labels shown next to
@@ -1230,7 +1248,7 @@ private struct PowerFlowDiagram: View {
                 .font(.system(size: 28, weight: .semibold))
                 .foregroundColor(tint)
                 .frame(height: Self.glyphAreaH)
-            Text(wattsLabel(watts))
+            Text(formatWatts(watts))
                 .font(.system(size: 12, weight: .medium, design: .rounded))
                 .foregroundColor(.secondary)
                 .lineLimit(1)
@@ -1246,21 +1264,13 @@ private struct PowerFlowDiagram: View {
         VStack(spacing: 1) {
             BatteryGlyph(percentage: percentage, tint: tint)
                 .frame(width: 40, height: Self.glyphAreaH)
-            Text(wattsLabel(watts))
+            Text(formatWatts(watts))
                 .font(.system(size: 12, weight: .medium, design: .rounded))
                 .foregroundColor(.secondary)
                 .lineLimit(1)
         }
         .frame(width: Self.nodeAreaWidth)
         .position(p)
-    }
-
-    // Matches the stat cards' `wattsValue` formatter exactly. Signed values
-    // are preserved so the Battery node's label reads e.g. "-7.0 W" when
-    // discharging, mirroring the Battery Load card.
-    private func wattsLabel(_ w: Double?) -> String {
-        guard let w else { return "—" }
-        return String(format: "%.1f W", w)
     }
 }
 
