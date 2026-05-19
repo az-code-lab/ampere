@@ -578,7 +578,7 @@ struct ContentView: View {
                     : (state.maxCapacity > 0
                         ? String(format: "%.1f%%", Double(state.currentCapacity) / Double(state.maxCapacity) * 100)
                         : "\(state.percentage)%"),
-                icon: "battery.100", iconColor: tint, onTap: {
+                icon: "percent", iconColor: tint, onTap: {
                     rawChargeShowMAh.toggle()
                 })
             StatCard(title: "Adapter Current", value: amperageValue(state.adapterAmperage), icon: "directcurrent", iconColor: adapterTint, onTap: {
