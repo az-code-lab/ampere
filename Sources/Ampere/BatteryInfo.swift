@@ -15,7 +15,7 @@ struct BatteryState: Equatable {
     let designCapacity: Int
     let maxCapacity: Int
     let currentCapacity: Int
-    let amperage: Int?
+    let amperage: Double?
     let voltage: Double?
     let adapterWatts: Double?
     let adapterAmperage: Double?
@@ -53,17 +53,24 @@ final class BatteryMonitor: ObservableObject {
             UserDefaults.standard.set(autoManageEnabled, forKey: "autoManageEnabled")
         }
     }
+    /// Minimum gap between charge bounds, matches the slider's `minGap`.
+    static let chargeBoundMinGap = 5
+
     @Published var chargeLowerBound: Int {
         didSet {
             if chargeLowerBound < 0 { chargeLowerBound = 0 }
-            else if chargeLowerBound >= chargeUpperBound { chargeLowerBound = chargeUpperBound - 5 }
+            else if chargeLowerBound > chargeUpperBound - Self.chargeBoundMinGap {
+                chargeLowerBound = chargeUpperBound - Self.chargeBoundMinGap
+            }
             UserDefaults.standard.set(chargeLowerBound, forKey: "chargeLowerBound")
         }
     }
     @Published var chargeUpperBound: Int {
         didSet {
             if chargeUpperBound > 100 { chargeUpperBound = 100 }
-            else if chargeUpperBound <= chargeLowerBound { chargeUpperBound = chargeLowerBound + 5 }
+            else if chargeUpperBound < chargeLowerBound + Self.chargeBoundMinGap {
+                chargeUpperBound = chargeLowerBound + Self.chargeBoundMinGap
+            }
             UserDefaults.standard.set(chargeUpperBound, forKey: "chargeUpperBound")
         }
     }
@@ -94,7 +101,10 @@ final class BatteryMonitor: ObservableObject {
         var upper = defaults.object(forKey: "chargeUpperBound") as? Int ?? 60
         if lower < 0 { lower = 0 }
         if upper > 100 { upper = 100 }
-        if lower >= upper { lower = 40; upper = 60 }
+        // Reset to defaults if the saved gap violates the minGap invariant
+        // (corrupted UserDefaults or values written by an older build).
+        // didSet doesn't fire on init, so this is the only chance to repair.
+        if upper - lower < Self.chargeBoundMinGap { lower = 40; upper = 60 }
         self.chargeLowerBound = lower
         self.chargeUpperBound = upper
         // Charge-to-upper intent persists across restart so a crash mid-recovery
@@ -141,11 +151,14 @@ final class BatteryMonitor: ObservableObject {
             let okDischarge = runSMCWriteViaSudo("nodischarge")
             let okChte = runSMCWriteViaSudo(shouldInhibit ? "inhibit" : "allow")
             let pid = ProcessInfo.processInfo.processIdentifier
-            _ = runSMCWriteViaSudo("spawn-watchdog:\(pid)")
+            let okWatchdog = runSMCWriteViaSudo("spawn-watchdog:\(pid)")
             if okDischarge && okChte {
                 NSLog("Ampere: Launch cleanup done (inhibit=%d)", shouldInhibit)
             } else {
                 NSLog("Ampere: Launch cleanup failed (nodischarge=%d, chte=%d)", okDischarge, okChte)
+            }
+            if !okWatchdog {
+                NSLog("Ampere: Watchdog spawn failed at launch — crash safety net not installed")
             }
         }
 
@@ -285,8 +298,11 @@ final class BatteryMonitor: ObservableObject {
     private static let caskURL = URL(string: "https://raw.githubusercontent.com/az-code-lab/homebrew-taps/main/Casks/ampere.rb")!
 
     private func scheduleNextUpdateCheck() {
+        // ~Once per day, with ±2h jitter so multiple clients don't all hit the
+        // cask repo at the same instant after a coordinated event (e.g. mass
+        // reboot, brew upgrade wave).
         updateCheckTimer = Timer.scheduledTimer(
-            withTimeInterval: Double.random(in: 0 ..< 86400),
+            withTimeInterval: Double.random(in: 79200 ..< 93600),
             repeats: false
         ) { [weak self] _ in
             self?.checkForUpdate()
@@ -1055,7 +1071,7 @@ final class BatteryMonitor: ObservableObject {
         var designCap = 0
         var maxCap = 0
         var currentCap = 0
-        var amperage: Int?
+        var amperage: Double?
         var voltage: Double?
         var temperature = 0.0
         var adapterWatts: Double?
@@ -1078,7 +1094,7 @@ final class BatteryMonitor: ObservableObject {
             if let val = IORegistryEntryCreateCFProperty(service, "AppleRawCurrentCapacity" as CFString, nil, 0)?.takeRetainedValue() as? Int {
                 currentCap = val
             }
-            if let val = IORegistryEntryCreateCFProperty(service, "Amperage" as CFString, nil, 0)?.takeRetainedValue() as? Int {
+            if let val = Self.numericValue(IORegistryEntryCreateCFProperty(service, "Amperage" as CFString, nil, 0)?.takeRetainedValue()) {
                 amperage = val
             }
             if let val = IORegistryEntryCreateCFProperty(service, "Voltage" as CFString, nil, 0)?.takeRetainedValue() as? Int {
@@ -1109,7 +1125,7 @@ final class BatteryMonitor: ObservableObject {
         // UI shows "—" instead of a misleading "0.0 W".
         let batW: Double? = {
             guard let voltage, let amperage, voltage > 0 else { return nil }
-            return voltage * Double(amperage) / 1000.0
+            return voltage * amperage / 1000.0
         }()
         batteryWatts = batW
 
