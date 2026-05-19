@@ -231,12 +231,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
 struct ContentView: View {
     @ObservedObject var monitor: BatteryMonitor
-    @State private var useFahrenheit = true
+    // Display preferences persist across restarts per CLAUDE.md requirement 3.
+    // showAbout / launchAtLogin remain @State: the former is sheet visibility,
+    // the latter is derived from SMAppService and isn't a user preference.
+    @AppStorage("ui.useFahrenheit") private var useFahrenheit = true
+    @AppStorage("ui.healthShowPercent") private var healthShowPercent = true
+    @AppStorage("ui.ageShowYears") private var ageShowYears = true
+    @AppStorage("ui.amperageShowMA") private var amperageShowMA = false
+    @AppStorage("ui.rawChargeShowMAh") private var rawChargeShowMAh = false
     @State private var showAbout = false
-    @State private var healthShowPercent = true
-    @State private var ageShowYears = true
-    @State private var amperageShowMA = false
-    @State private var rawChargeShowMAh = false
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
 
     private var healthCheckTimeString: String {

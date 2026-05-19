@@ -309,6 +309,10 @@ if action.hasPrefix("discharge:") {
             _ = smcWriteKey(conn, SMC.keyChargeInhibit, SMC.chieNormal)
             IOServiceClose(conn)
         }
+        // Wait for USB-C PD renegotiation to complete before re-enabling
+        // clamshell sleep — same reason as the nodischarge path. Without
+        // this, the rollback can itself black out external displays.
+        sleep(3)
         _ = setDischargeSleepPrevention(enabled: false)
         fputs("ERROR: watchdog spawn failed — rolled back discharge\n", stderr)
         exit(3)
@@ -335,9 +339,15 @@ if action.hasPrefix("watchdog:") {
                 _ = smcWriteKey(conn, SMC.keyChargeTerminate, SMC.chteAllow)
                 IOServiceClose(conn)
             }
-            // Wait for PD renegotiation to settle before restoring sleep
-            sleep(3)
-            _ = setDischargeSleepPrevention(enabled: false)
+            // Only restore pmset if the save file shows we previously
+            // overrode it (i.e. discharge was active). If the app died
+            // without ever enabling discharge, blindly running pmset would
+            // overwrite the user's actual sleep setting with our fallback.
+            if FileManager.default.fileExists(atPath: savedSleepPath) {
+                // Wait for PD renegotiation to settle before restoring sleep
+                sleep(3)
+                _ = setDischargeSleepPrevention(enabled: false)
+            }
             _exit(0)
         }
     }
