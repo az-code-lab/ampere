@@ -916,7 +916,6 @@ struct BatteryRangeSlider: View {
     var minGap: Double = 5
 
     private let batteryHeight: CGFloat = 28
-    private let capWidth: CGFloat = 5
     private let cornerRadius: CGFloat = 6
     private let inset: CGFloat = 3
     private let markerWidth: CGFloat = 20
@@ -931,7 +930,7 @@ struct BatteryRangeSlider: View {
 
     var body: some View {
         GeometryReader { geo in
-            let bodyW = geo.size.width - capWidth - 2
+            let bodyW = geo.size.width
             let innerW = bodyW - inset * 2
             let fillW = max(0, innerW * fraction(currentLevel))
             let lowerX = innerW * fraction(lower)
@@ -944,12 +943,6 @@ struct BatteryRangeSlider: View {
                     .stroke(Color.primary.opacity(0.35), lineWidth: 1.5)
                     .frame(width: bodyW, height: batteryHeight)
                     .position(x: bodyW / 2, y: midY)
-
-                // Battery cap
-                RoundedRectangle(cornerRadius: 2)
-                    .fill(Color.primary.opacity(0.35))
-                    .frame(width: capWidth, height: batteryHeight * 0.4)
-                    .position(x: bodyW + capWidth / 2 + 1, y: midY)
 
                 // Charge fill
                 let fillColor: Color = currentLevel <= 15 ? .red : currentLevel <= 30 ? .orange : .green
