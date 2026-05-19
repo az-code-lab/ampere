@@ -97,10 +97,23 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var animationTimer: Timer?
     private var animationPct: Int = 0
 
+    /// True iff the battery is actually receiving current right now. Shares
+    /// the source-of-truth logic with `BatteryModeRouter` so the menu bar
+    /// animation direction stays in lockstep with the stat-card tint and
+    /// the Sankey diagram during transients.
+    private func effectivelyCharging() -> Bool {
+        BatteryModeRouter.compute(
+            amperage: monitor.state?.amperage,
+            isCharging: monitor.state?.isCharging ?? false,
+            activeDischarging: monitor.activeDischarging,
+            adapterConnected: monitor.state?.adapterConnected ?? false
+        ) == .charging
+    }
+
     private func updateMenuBarIcon() {
         guard let button = statusItem.button else { return }
         let pct = monitor.state?.percentage ?? 0
-        let isCharging = monitor.state?.isCharging ?? false
+        let isCharging = effectivelyCharging()
         let hasWarning = monitor.healthWarning != nil
 
         let isAnimatingDown = monitor.activeDischarging
@@ -117,7 +130,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     guard let self, let button = self.statusItem.button else { return }
                     let curPct = self.monitor.state?.percentage ?? 0
                     let target: Int
-                    if self.monitor.state?.isCharging ?? false {
+                    if self.effectivelyCharging() {
                         target = self.monitor.autoManageEnabled ? self.monitor.chargeUpperBound : 100
                         self.animationPct += 5
                         if self.animationPct > target { self.animationPct = curPct }
@@ -456,10 +469,12 @@ struct ContentView: View {
     }
 
     private func batteryMode(_ state: BatteryState) -> BatteryMode {
-        if state.isCharging { return .charging }
-        if monitor.activeDischarging { return .discharging }
-        if state.adapterConnected { return .onACNotCharging }
-        return .onBattery
+        BatteryModeRouter.compute(
+            amperage: state.amperage,
+            isCharging: state.isCharging,
+            activeDischarging: monitor.activeDischarging,
+            adapterConnected: state.adapterConnected
+        )
     }
 
     private func batteryHeader(_ state: BatteryState) -> some View {
@@ -486,9 +501,7 @@ struct ContentView: View {
                     .fill(statusColor(state))
                     .frame(width: 8, height: 8)
 
-                Text(displayedTimeRemaining(state).isEmpty
-                    ? statusText(state)
-                    : "\(statusText(state)) — \(displayedTimeRemaining(state))")
+                Text(statusLine(state))
                     .font(.system(size: 13, weight: .medium))
                     .foregroundColor(.secondary)
             }
@@ -500,6 +513,15 @@ struct ContentView: View {
                 .textSelection(.enabled)
                 .frame(height: 14)
         }
+    }
+
+    /// "Charging — Xh Ym to NN%" / "Discharging — Xm remaining" / etc.
+    /// Combines `statusText` with `displayedTimeRemaining` and computes
+    /// the ETA once per render (the prior inline form called the helper
+    /// twice — once for the empty check and again in the interpolation).
+    private func statusLine(_ state: BatteryState) -> String {
+        let trailing = displayedTimeRemaining(state)
+        return trailing.isEmpty ? statusText(state) : "\(statusText(state)) — \(trailing)"
     }
 
     /// Compute our own ETA from the live amperage so the label is consistent
@@ -528,41 +550,22 @@ struct ContentView: View {
         return state.timeRemaining
     }
 
-    /// Estimate of remaining time until `target`% is reached while charging,
-    /// derived from the live charging current. Returns "" when any input is
-    /// missing or the gap is non-positive — better silent than wrong.
     private func chargingETA(_ state: BatteryState, target: Int) -> String {
-        let gap = target - state.percentage
-        guard gap > 0, state.maxCapacity > 0,
-              let amperage = state.amperage, amperage > 0 else {
-            return ""
-        }
-        // amperage is in mA, capacity in mAh — hours = mAh / mA.
-        let remainingMAh = Double(gap) * Double(state.maxCapacity) / 100.0
-        let totalMinutes = Int((remainingMAh / amperage * 60).rounded())
-        let suffix = target == 100 ? "to full" : "to \(target)%"
-        return formatMinutes(totalMinutes, suffix: suffix)
+        BatteryETACalculator.chargingETA(
+            percentage: state.percentage,
+            maxCapacity: state.maxCapacity,
+            amperage: state.amperage,
+            target: target
+        )
     }
 
-    /// Estimate of remaining time until the battery drains to `target`% from
-    /// the live discharge current. Returns "" when any input is missing or
-    /// the gap is non-positive.
     private func dischargeETA(_ state: BatteryState, target: Int) -> String {
-        let gap = state.percentage - target
-        guard gap > 0, state.maxCapacity > 0,
-              let amperage = state.amperage, amperage < 0 else {
-            return ""
-        }
-        let remainingMAh = Double(gap) * Double(state.maxCapacity) / 100.0
-        let totalMinutes = Int((remainingMAh / abs(amperage) * 60).rounded())
-        let suffix = target == 0 ? "remaining" : "to \(target)%"
-        return formatMinutes(totalMinutes, suffix: suffix)
-    }
-
-    private func formatMinutes(_ totalMinutes: Int, suffix: String) -> String {
-        if totalMinutes < 1 { return "<1m \(suffix)" }
-        if totalMinutes < 60 { return "\(totalMinutes)m \(suffix)" }
-        return "\(totalMinutes / 60)h \(totalMinutes % 60)m \(suffix)"
+        BatteryETACalculator.dischargeETA(
+            percentage: state.percentage,
+            maxCapacity: state.maxCapacity,
+            amperage: state.amperage,
+            target: target
+        )
     }
 
     private func statusMessage(_ state: BatteryState) -> String {
@@ -588,7 +591,10 @@ struct ContentView: View {
             }
             return "Auto: holding — charges below \(monitor.chargeLowerBound)% or on demand"
         }
-        if monitor.autoManageEnabled && state.isCharging {
+        // Use amperage's sign rather than `state.isCharging` for the same
+        // transient-consistency reason as `BatteryModeRouter` — IOKit's
+        // `isCharging` can lag the actual current direction.
+        if monitor.autoManageEnabled, (state.amperage ?? 0) > 0 {
             return "Auto: charging to \(monitor.chargeUpperBound)%"
         }
         // chargingPaused can briefly persist after a manual-mode unplug
@@ -905,14 +911,135 @@ struct ContentView: View {
 
 // MARK: - Battery Shape
 
-enum BatteryMode {
+enum BatteryMode: Equatable {
     case charging
     case discharging
     case onACNotCharging
     case onBattery
 }
 
+/// Computes the "Xh Ym to NN%" / "Xh Ym remaining" labels shown next to
+/// the charging status. Pure inputs so it can be unit-tested independently
+/// of the SwiftUI view that consumes it.
+///
+/// Sign convention for `amperage`: positive = into battery (charging),
+/// negative = out of battery (discharging), zero/nil = no flow.
+enum BatteryETACalculator {
+    /// ETA to reach `target`% while charging. Returns "" when inputs don't
+    /// support a charging computation (gap ≤ 0, amperage missing or
+    /// non-positive, max capacity missing) or when the answer is so large
+    /// it's almost certainly a sensor artifact rather than a real estimate.
+    static func chargingETA(percentage: Int, maxCapacity: Int, amperage: Double?, target: Int) -> String {
+        let gap = target - percentage
+        guard gap > 0, maxCapacity > 0,
+              let amperage = amperage, amperage > 0 else {
+            return ""
+        }
+        // amperage is in mA, capacity in mAh — hours = mAh / mA.
+        let remainingMAh = Double(gap) * Double(maxCapacity) / 100.0
+        guard let totalMinutes = safeMinutes(remainingMAh: remainingMAh, currentMA: amperage) else {
+            return ""
+        }
+        let suffix = target == 100 ? "to full" : "to \(target)%"
+        return formatMinutes(totalMinutes, suffix: suffix)
+    }
+
+    /// ETA to drain to `target`% from the live discharge current.
+    static func dischargeETA(percentage: Int, maxCapacity: Int, amperage: Double?, target: Int) -> String {
+        let gap = percentage - target
+        guard gap > 0, maxCapacity > 0,
+              let amperage = amperage, amperage < 0 else {
+            return ""
+        }
+        let remainingMAh = Double(gap) * Double(maxCapacity) / 100.0
+        guard let totalMinutes = safeMinutes(remainingMAh: remainingMAh, currentMA: abs(amperage)) else {
+            return ""
+        }
+        let suffix = target == 0 ? "remaining" : "to \(target)%"
+        return formatMinutes(totalMinutes, suffix: suffix)
+    }
+
+    static func formatMinutes(_ totalMinutes: Int, suffix: String) -> String {
+        if totalMinutes < 1 { return "<1m \(suffix)" }
+        if totalMinutes < 60 { return "\(totalMinutes)m \(suffix)" }
+        return "\(totalMinutes / 60)h \(totalMinutes % 60)m \(suffix)"
+    }
+
+    /// Convert mAh / mA into rounded minutes, guarding against NaN/Inf and
+    /// absurdly large values caused by near-zero current readings during
+    /// state transitions. The 7-day ceiling is a sanity cap — no real
+    /// charge or discharge takes longer than that, and showing "5000h 0m"
+    /// labels would be worse than showing nothing.
+    private static func safeMinutes(remainingMAh: Double, currentMA: Double) -> Int? {
+        let minutes = (remainingMAh / currentMA * 60).rounded()
+        guard minutes.isFinite, minutes >= 0, minutes <= 60 * 24 * 7 else { return nil }
+        return Int(minutes)
+    }
+}
+
+/// Pure helper that picks the `BatteryMode` for stat-card tinting from the
+/// live inputs. Extracted from `ContentView.batteryMode(_:)` so the
+/// transient-consistency invariant (lean on amperage's sign before falling
+/// back to `isCharging` / `activeDischarging`) can be pinned by tests.
+enum BatteryModeRouter {
+    static func compute(
+        amperage: Double?,
+        isCharging: Bool,
+        activeDischarging: Bool,
+        adapterConnected: Bool
+    ) -> BatteryMode {
+        if let amperage = amperage {
+            if amperage > 0 { return .charging }
+            if amperage < 0 {
+                return adapterConnected ? .discharging : .onBattery
+            }
+        }
+        if isCharging { return .charging }
+        if activeDischarging { return .discharging }
+        if adapterConnected { return .onACNotCharging }
+        return .onBattery
+    }
+}
+
 // MARK: - Power Flow (Sankey) Diagram
+
+/// Which Sankey case to render. The choice is driven purely from live
+/// telemetry (adapter connected? adapter delivering? battery sign?), not
+/// from IOKit's `isCharging` flag — `isCharging` can lag the actual current
+/// direction during auto-manage transitions.
+///
+/// Exposed at module scope (rather than nested inside PowerFlowDiagram) so
+/// `PowerFlowRouterTests` can pin the routing invariant.
+enum PowerFlowCase: Equatable {
+    case acToBoth      // AC → Computer + Battery
+    case acAndBattery  // AC (weak) + Battery → Computer
+    case acOnly        // AC → Computer
+    case batteryOnly   // Battery → Computer
+}
+
+enum PowerFlowRouter {
+    static func compute(
+        adapterConnected: Bool,
+        adapterWatts: Double?,
+        batteryWatts: Double?
+    ) -> PowerFlowCase {
+        // nil adapterWatts (very old Macs without PowerTelemetryData) — assume
+        // the cable is delivering an unknown but non-zero amount. A measured
+        // exactly 0 W with the cable plugged in is the "dead adapter" case
+        // (broken cable, brick unplugged at the wall, etc.) and should render
+        // as pure on-battery so we don't draw an empty node.
+        let acDelivering: Bool = (adapterWatts ?? 1) != 0
+        if !adapterConnected || !acDelivering { return .batteryOnly }
+        // Base direction on batteryWatts' sign — the same raw measurement the
+        // Battery Load card displays. Relying on IOKit's `isCharging` here
+        // breaks consistency during state transitions (e.g. "Discharge to
+        // Upper Bound" startup, where isCharging is already false but the
+        // battery is still receiving current).
+        if (batteryWatts ?? 0) < 0 { return .acAndBattery }
+        if (batteryWatts ?? 0) > 0 { return .acToBoth }
+        return .acOnly
+    }
+}
 
 /// Sankey-style diagram of live power flow. Sources on the left, sinks on the
 /// right; band widths are proportional to the wattage of each flow. Four cases:
@@ -937,29 +1064,12 @@ private struct PowerFlowDiagram: View {
     // beneath each node would sit at different y positions.
     private static let glyphAreaH: CGFloat = 28
 
-    private enum Flow {
-        case acToBoth      // AC → Computer + Battery
-        case acAndBattery  // AC (weak) + Battery → Computer
-        case acOnly        // AC → Computer
-        case batteryOnly   // Battery → Computer
-    }
-
-    private var flow: Flow {
-        // nil adapterWatts (very old Macs without PowerTelemetryData) — assume
-        // the cable is delivering an unknown but non-zero amount. A measured
-        // exactly 0 W with the cable plugged in is the "dead adapter" case
-        // (broken cable, brick unplugged at the wall, etc.) and should render
-        // as pure on-battery so we don't draw an empty node.
-        let acDelivering: Bool = (adapterWatts ?? 1) != 0
-        if !adapterConnected || !acDelivering { return .batteryOnly }
-        // Base direction on batteryWatts' sign — the same raw measurement the
-        // Battery Load card displays. Relying on IOKit's `isCharging` here
-        // breaks consistency during state transitions (e.g. "Discharge to
-        // Upper Bound" startup, where isCharging is already false but the
-        // battery is still receiving current).
-        if (batteryWatts ?? 0) < 0 { return .acAndBattery }
-        if (batteryWatts ?? 0) > 0 { return .acToBoth }
-        return .acOnly
+    private var flow: PowerFlowCase {
+        PowerFlowRouter.compute(
+            adapterConnected: adapterConnected,
+            adapterWatts: adapterWatts,
+            batteryWatts: batteryWatts
+        )
     }
 
     private var acColor: Color { .cyan }
@@ -1108,44 +1218,41 @@ private struct PowerFlowDiagram: View {
         }
     }
 
-    @ViewBuilder
+    /// Always renders the node. Zero-flow visibility is handled at the
+    /// `flow`-getter level: a case body only references the nodes that
+    /// belong to its scenario, so hiding individual nodes here would only
+    /// strip out essential sinks (the Computer node renders `electronicsWatts`
+    /// which can clamp to 0 when adapter and battery telemetry briefly
+    /// disagree — the node must stay visible or the diagram makes no sense).
     private func node(icon: String, watts: Double?, tint: Color, at p: CGPoint) -> some View {
-        // Suppress nodes only when the reading is actually 0 W (or unknown).
-        // Sub-watt readings like 0.3 W are real flows and must appear in the
-        // diagram so the labels match the stat cards' "%.1f W" formatting.
-        if let watts, watts != 0 {
-            VStack(spacing: 1) {
-                Image(systemName: icon)
-                    .font(.system(size: 28, weight: .semibold))
-                    .foregroundColor(tint)
-                    .frame(height: Self.glyphAreaH)
-                Text(wattsLabel(watts))
-                    .font(.system(size: 12, weight: .medium, design: .rounded))
-                    .foregroundColor(.secondary)
-                    .lineLimit(1)
-            }
-            .frame(width: Self.nodeAreaWidth)
-            .position(p)
+        VStack(spacing: 1) {
+            Image(systemName: icon)
+                .font(.system(size: 28, weight: .semibold))
+                .foregroundColor(tint)
+                .frame(height: Self.glyphAreaH)
+            Text(wattsLabel(watts))
+                .font(.system(size: 12, weight: .medium, design: .rounded))
+                .foregroundColor(.secondary)
+                .lineLimit(1)
         }
+        .frame(width: Self.nodeAreaWidth)
+        .position(p)
     }
 
     /// Battery node that renders a proportional-fill battery glyph (instead
     /// of an SF Symbol) so the visible fill level matches the actual charge
-    /// percentage. Suppressed only when watts == 0 / nil, same as `node`.
-    @ViewBuilder
+    /// percentage. Always renders for the same reason as `node`.
     private func batteryNode(watts: Double?, tint: Color, at p: CGPoint) -> some View {
-        if let watts, watts != 0 {
-            VStack(spacing: 1) {
-                BatteryGlyph(percentage: percentage, tint: tint)
-                    .frame(width: 40, height: Self.glyphAreaH)
-                Text(wattsLabel(watts))
-                    .font(.system(size: 12, weight: .medium, design: .rounded))
-                    .foregroundColor(.secondary)
-                    .lineLimit(1)
-            }
-            .frame(width: Self.nodeAreaWidth)
-            .position(p)
+        VStack(spacing: 1) {
+            BatteryGlyph(percentage: percentage, tint: tint)
+                .frame(width: 40, height: Self.glyphAreaH)
+            Text(wattsLabel(watts))
+                .font(.system(size: 12, weight: .medium, design: .rounded))
+                .foregroundColor(.secondary)
+                .lineLimit(1)
         }
+        .frame(width: Self.nodeAreaWidth)
+        .position(p)
     }
 
     // Matches the stat cards' `wattsValue` formatter exactly. Signed values
