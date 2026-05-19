@@ -881,7 +881,7 @@ struct ContentView: View {
     }
 }
 
-// MARK: - Battery Shape
+// MARK: - Pure helpers (routers / formatters)
 
 enum BatteryMode: Equatable {
     case charging
