@@ -236,7 +236,11 @@ final class AutoManageTransitionTests: XCTestCase {
 
     // MARK: - Rule 3: between bounds never auto-charges
 
-    func testRule3_AtUpperBound_Inhibits() {
+    /// Tests branch 1 of `evaluateAutoManageStep` (`!chargingPaused && pct >= upper`),
+    /// which lives in the "rule 3" MARK section because it's the same inhibit
+    /// outcome — the rule-3 / branch-1 distinction is internal to the state
+    /// machine; the user-visible behavior is "stop at upper".
+    func testAtUpperBound_Inhibits() {
         let sim = Simulator(chargingPaused: false, lastAdapterConnected: true)
         let action = sim.step(percentage: 60, adapterConnected: true)
         XCTAssertEqual(action, .inhibit)
@@ -364,7 +368,7 @@ final class AutoManageTransitionTests: XCTestCase {
                       "Rule 2 must be transition-only, not apply on every tick")
     }
 
-    func testRule2_DoesNotFireIfAtLowerBoundExactly() {
+    func testRule2_FiresAtLowerBoundExactly() {
         // Edge: unplug exactly at lower bound. pct >= lower includes equality,
         // so rule 2 DOES fire at exactly the lower bound.
         let sim = Simulator(

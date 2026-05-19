@@ -5,49 +5,9 @@ import Foundation
 import IOKit
 import Shared
 
-// MARK: - SMC Data Types (duplicated to avoid cross-target dependency on AppKit)
-
-struct SMCKeyData {
-    struct Vers {
-        var major: UInt8 = 0
-        var minor: UInt8 = 0
-        var build: UInt8 = 0
-        var reserved: UInt8 = 0
-        var release: UInt16 = 0
-    }
-
-    struct PLimitData {
-        var version: UInt16 = 0
-        var length: UInt16 = 0
-        var cpuPLimit: UInt32 = 0
-        var gpuPLimit: UInt32 = 0
-        var memPLimit: UInt32 = 0
-    }
-
-    struct KeyInfo {
-        var dataSize: UInt32 = 0
-        var dataType: UInt32 = 0
-        var dataAttributes: UInt8 = 0
-    }
-
-    var key: UInt32 = 0
-    var vers: Vers = Vers()
-    var pLimitData: PLimitData = PLimitData()
-    var keyInfo: KeyInfo = KeyInfo()
-    var padding: UInt16 = 0
-    var result: UInt8 = 0
-    var status: UInt8 = 0
-    var data8: UInt8 = 0
-    var data32: UInt32 = 0
-    var bytes: (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
-                UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
-                UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
-                UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8) =
-        (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
-}
-
-private let smcCmdWriteBytes: UInt8 = 6
-private let smcCmdReadKeyInfo: UInt8 = 9
+// SMCKeyData, SMCCmd command codes, and smcFourCharCode live in the Shared
+// module so they can't drift between this binary and the main Ampere app's
+// SMC read path.
 
 // MARK: - Minimal SMC access
 
@@ -66,24 +26,16 @@ func smcOpen() -> io_connect_t? {
     return conn
 }
 
-func fourCharCode(_ str: String) -> UInt32 {
-    var result: UInt32 = 0
-    for char in str.utf8.prefix(4) {
-        result = (result << 8) | UInt32(char)
-    }
-    return result
-}
-
 func smcWriteKey(_ conn: io_connect_t, _ key: String, _ bytes: [UInt8]) -> Bool {
-    let smcKey = fourCharCode(key)
+    let smcKey = smcFourCharCode(key)
     var inputStruct = SMCKeyData()
     var outputStruct = SMCKeyData()
     inputStruct.key = smcKey
-    inputStruct.data8 = smcCmdReadKeyInfo
+    inputStruct.data8 = SMCCmd.readKeyInfo
     let inputSize = MemoryLayout<SMCKeyData>.size
     var outputSize = MemoryLayout<SMCKeyData>.size
 
-    var result = IOConnectCallStructMethod(conn, 2,
+    var result = IOConnectCallStructMethod(conn, SMCCmd.userClientSelector,
         &inputStruct, inputSize, &outputStruct, &outputSize)
     guard result == kIOReturnSuccess else { return false }
 
@@ -95,7 +47,7 @@ func smcWriteKey(_ conn: io_connect_t, _ key: String, _ bytes: [UInt8]) -> Bool 
     inputStruct.key = smcKey
     inputStruct.keyInfo.dataSize = dataSize
     inputStruct.keyInfo.dataType = dataType
-    inputStruct.data8 = smcCmdWriteBytes
+    inputStruct.data8 = SMCCmd.writeBytes
 
     withUnsafeMutablePointer(to: &inputStruct.bytes) { ptr in
         let raw = UnsafeMutableRawPointer(ptr)
@@ -105,15 +57,13 @@ func smcWriteKey(_ conn: io_connect_t, _ key: String, _ bytes: [UInt8]) -> Bool 
     }
 
     outputSize = MemoryLayout<SMCKeyData>.size
-    result = IOConnectCallStructMethod(conn, 2,
+    result = IOConnectCallStructMethod(conn, SMCCmd.userClientSelector,
         &inputStruct, inputSize, &outputStruct, &outputSize)
     return result == kIOReturnSuccess
 }
 
-private let smcCmdReadKey: UInt8 = 5
-
 func smcReadKey(_ conn: io_connect_t, _ key: String) -> [UInt8]? {
-    let smcKey = fourCharCode(key)
+    let smcKey = smcFourCharCode(key)
     let inputSize = MemoryLayout<SMCKeyData>.size
     var outputSize = MemoryLayout<SMCKeyData>.size
 
@@ -121,20 +71,20 @@ func smcReadKey(_ conn: io_connect_t, _ key: String) -> [UInt8]? {
     var input = SMCKeyData()
     var output = SMCKeyData()
     input.key = smcKey
-    input.data8 = smcCmdReadKeyInfo
-    guard IOConnectCallStructMethod(conn, 2, &input, inputSize, &output, &outputSize) == kIOReturnSuccess else { return nil }
+    input.data8 = SMCCmd.readKeyInfo
+    guard IOConnectCallStructMethod(conn, SMCCmd.userClientSelector, &input, inputSize, &output, &outputSize) == kIOReturnSuccess else { return nil }
 
     let dataSize = output.keyInfo.dataSize
-    guard dataSize > 0, dataSize <= 32 else { return nil }
+    guard dataSize > 0, dataSize <= SMCKeyData.bytesCapacity else { return nil }
 
     // Read value
     input = SMCKeyData()
     input.key = smcKey
     input.keyInfo.dataSize = dataSize
-    input.data8 = smcCmdReadKey
+    input.data8 = SMCCmd.readKey
     output = SMCKeyData()
     outputSize = MemoryLayout<SMCKeyData>.size
-    guard IOConnectCallStructMethod(conn, 2, &input, inputSize, &output, &outputSize) == kIOReturnSuccess else { return nil }
+    guard IOConnectCallStructMethod(conn, SMCCmd.userClientSelector, &input, inputSize, &output, &outputSize) == kIOReturnSuccess else { return nil }
 
     var raw = output.bytes
     return withUnsafeBytes(of: &raw) { Array($0.prefix(Int(dataSize))) }
@@ -156,7 +106,9 @@ func readPmsetValue(_ key: String) -> Int? {
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         guard let output = String(data: data, encoding: .utf8) else { return nil }
         for line in output.components(separatedBy: "\n") {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            // .whitespacesAndNewlines so a stray \r from CRLF-style output
+            // doesn't end up attached to the value, making Int() fail.
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmed.hasPrefix(key) {
                 let parts = trimmed.split(separator: " ")
                 if parts.count >= 2, parts[0] == Substring(key), let val = Int(parts[1]) {
@@ -173,6 +125,7 @@ func readPmsetSleep() -> Int? { readPmsetValue("sleep") }
 
 /// Path to store the original sleep value for restoration.
 let savedSleepPath = AppConstants.savedSleepPath
+let savedDisplaySleepPath = AppConstants.savedDisplaySleepPath
 
 /// Prevent or restore system/clamshell sleep using pmset. Requires root.
 @discardableResult
@@ -184,8 +137,8 @@ func setDischargeSleepPrevention(enabled: Bool) -> Bool {
         if !fm.fileExists(atPath: savedSleepPath), let original = readPmsetSleep() {
             try? "\(original)".write(toFile: savedSleepPath, atomically: true, encoding: .utf8)
         }
-        if !fm.fileExists(atPath: savedSleepPath + "-display"), let original = readPmsetValue("displaysleep") {
-            try? "\(original)".write(toFile: savedSleepPath + "-display", atomically: true, encoding: .utf8)
+        if !fm.fileExists(atPath: savedDisplaySleepPath), let original = readPmsetValue("displaysleep") {
+            try? "\(original)".write(toFile: savedDisplaySleepPath, atomically: true, encoding: .utf8)
         }
     }
 
@@ -200,19 +153,22 @@ func setDischargeSleepPrevention(enabled: Bool) -> Bool {
         // values close to the macOS factory defaults (sleep=10min, displaysleep=10min)
         // rather than 1min, so a wiped save file doesn't strand the user with
         // a Mac that sleeps after 60 seconds.
+        // Also: validate the saved value is numeric — pmset rejects the
+        // *entire* command atomically if any arg is invalid, which would
+        // leave disablesleep=1 stuck on after a corrupted save.
         let originalSleep: String
         if let saved = try? String(contentsOfFile: savedSleepPath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
-           !saved.isEmpty {
+           !saved.isEmpty, Int(saved) != nil {
             originalSleep = saved
             try? FileManager.default.removeItem(atPath: savedSleepPath)
         } else {
             originalSleep = "10"
         }
         let originalDisplaySleep: String
-        if let saved = try? String(contentsOfFile: savedSleepPath + "-display", encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
-           !saved.isEmpty {
+        if let saved = try? String(contentsOfFile: savedDisplaySleepPath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+           !saved.isEmpty, Int(saved) != nil {
             originalDisplaySleep = saved
-            try? FileManager.default.removeItem(atPath: savedSleepPath + "-display")
+            try? FileManager.default.removeItem(atPath: savedDisplaySleepPath)
         } else {
             originalDisplaySleep = "10"
         }
@@ -233,7 +189,7 @@ func setDischargeSleepPrevention(enabled: Bool) -> Bool {
 // MARK: - Main
 
 guard CommandLine.arguments.count == 2 else {
-    fputs("Usage: smc-writer inhibit|allow|discharge:pid|nodischarge|watchdog:pid\n", stderr)
+    fputs("Usage: smc-writer inhibit|allow|discharge:pid|nodischarge|spawn-watchdog:pid|watchdog:pid\n", stderr)
     exit(1)
 }
 
@@ -291,7 +247,16 @@ if action.hasPrefix("discharge:") {
         exit(1)
     }
 
-    _ = setDischargeSleepPrevention(enabled: true)
+    // Disable sleep BEFORE the CHIE write, since the CHIE write triggers
+    // USB-C PD renegotiation that can cause clamshell sleep on lid-closed
+    // setups (see "Clamshell Mode and the Black Screen Problem" in README).
+    // If pmset fails, refuse to proceed — writing CHIE without the sleep
+    // override is the exact failure mode the override exists to prevent.
+    guard setDischargeSleepPrevention(enabled: true) else {
+        IOServiceClose(conn)
+        fputs("ERROR: failed to disable sleep — refusing to write CHIE=0x08 without clamshell-sleep protection\n", stderr)
+        exit(4)
+    }
 
     guard smcWriteKey(conn, SMC.keyChargeInhibit, SMC.chieDischarge) else {
         _ = setDischargeSleepPrevention(enabled: false)
@@ -305,16 +270,26 @@ if action.hasPrefix("discharge:") {
     // it fails — running discharge without a crash safety net would leave
     // sleep disabled and CHIE=0x08 stuck on if the app dies.
     if !spawnWatchdog(appPID: appPID) {
+        var chieCleared = false
         if let conn = smcOpen() {
-            _ = smcWriteKey(conn, SMC.keyChargeInhibit, SMC.chieNormal)
+            chieCleared = smcWriteKey(conn, SMC.keyChargeInhibit, SMC.chieNormal)
             IOServiceClose(conn)
         }
-        // Wait for USB-C PD renegotiation to complete before re-enabling
-        // clamshell sleep — same reason as the nodischarge path. Without
-        // this, the rollback can itself black out external displays.
-        sleep(3)
-        _ = setDischargeSleepPrevention(enabled: false)
-        fputs("ERROR: watchdog spawn failed — rolled back discharge\n", stderr)
+        if chieCleared {
+            // Wait for USB-C PD renegotiation to complete before re-enabling
+            // clamshell sleep — same reason as the nodischarge path. Without
+            // this, the rollback can itself black out external displays.
+            sleep(3)
+            _ = setDischargeSleepPrevention(enabled: false)
+            fputs("ERROR: watchdog spawn failed — rolled back discharge\n", stderr)
+        } else {
+            // Could not clear CHIE; leave the sleep override in place. Sleep
+            // restored while CHIE=0x08 is active would black out external
+            // displays in clamshell mode — that's the failure mode we'd
+            // rather avoid even at the cost of leaving the override stuck
+            // until the watchdog or a subsequent nodischarge fixes it.
+            fputs("ERROR: watchdog spawn failed AND rollback CHIE write failed — discharge state may be stuck\n", stderr)
+        }
         exit(3)
     }
 
@@ -356,7 +331,7 @@ if action.hasPrefix("watchdog:") {
 // One-shot commands
 let validActions: Set<String> = ["inhibit", "allow", "nodischarge"]
 guard validActions.contains(action) else {
-    fputs("Usage: smc-writer inhibit|allow|discharge:pid|nodischarge|watchdog:pid\n", stderr)
+    fputs("Usage: smc-writer inhibit|allow|discharge:pid|nodischarge|spawn-watchdog:pid|watchdog:pid\n", stderr)
     exit(1)
 }
 
@@ -393,21 +368,29 @@ case "nodischarge":
     killTask.standardInput = FileHandle.nullDevice
     killTask.standardOutput = FileHandle.nullDevice
     killTask.standardError = FileHandle.nullDevice
-    try? killTask.run()
-    killTask.waitUntilExit()
+    // Guard waitUntilExit behind a successful run() — calling
+    // waitUntilExit on a never-launched Process blocks indefinitely,
+    // which would deadlock the caller. pkill missing is extremely
+    // rare on macOS, but the failure mode is unbounded so worth gating.
+    do {
+        try killTask.run()
+        killTask.waitUntilExit()
+    } catch {
+        fputs("WARNING: failed to run pkill: \(error.localizedDescription)\n", stderr)
+    }
 
-    // Clears CHIE and restores sleep if discharge was active.
-    let wasDischarging = smcReadKey(conn, SMC.keyChargeInhibit).map { $0.contains(where: { $0 != 0 }) } ?? false
+    // Use the save-sleep file as the marker for "we previously overrode
+    // pmset" instead of reading CHIE — if the SMC read fails, defaulting to
+    // wasDischarging=false would silently strand the user with sleep=0.
+    // The save file is reliably written before the CHIE=0x08 write and
+    // cleaned up by setDischargeSleepPrevention(false).
+    let saveFileExists = FileManager.default.fileExists(atPath: savedSleepPath)
     if smcWriteKey(conn, SMC.keyChargeInhibit, SMC.chieNormal) {
-        if wasDischarging {
+        if saveFileExists {
             // Wait for USB-C PD renegotiation to complete before re-enabling
             // clamshell sleep, otherwise the brief display disruption triggers sleep.
             sleep(3)
             _ = setDischargeSleepPrevention(enabled: false)
-        } else {
-            // Clean up stale sleep files without changing pmset settings
-            try? FileManager.default.removeItem(atPath: savedSleepPath)
-            try? FileManager.default.removeItem(atPath: savedSleepPath + "-display")
         }
         print("OK: active discharge disabled")
         exit(0)

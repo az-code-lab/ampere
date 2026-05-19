@@ -121,6 +121,36 @@ final class HealthCheckTests: XCTestCase {
             chie: SMC.chieNormalInt, chte: SMC.chteInhibitInt))
     }
 
+    func testAutoDischarge_Active_AtUpperBound_StillExpectsDischarge() {
+        // Transient: activeDischarging=true and pct=upperBound exactly
+        // (battery just reached target but refresh hasn't stopped the daemon
+        // yet). The check must still expect CHIE=discharge — the daemon's
+        // SMC write persists until we explicitly clear it.
+        XCTAssertTrue(autoHealthyDischarge(
+            pct: 60, activeDischarging: true,
+            chie: SMC.chieDischargeInt, chte: SMC.chteInhibitInt))
+        XCTAssertFalse(autoHealthyDischarge(
+            pct: 60, activeDischarging: true,
+            chie: SMC.chieNormalInt, chte: SMC.chteInhibitInt))
+    }
+
+    func testAutoDischarge_Active_AcceptsEitherCHTE() {
+        // Apple's SMC firmware on some Macs auto-clears CHTE while CHIE=0x08
+        // is active. The health check must accept either CHTE value as long
+        // as CHIE=discharge is set — otherwise affected users see a
+        // perpetually-failing health check during normal discharge.
+        XCTAssertTrue(autoHealthyDischarge(
+            pct: 75, activeDischarging: true,
+            chie: SMC.chieDischargeInt, chte: SMC.chteAllowInt))
+        XCTAssertTrue(autoHealthyDischarge(
+            pct: 75, activeDischarging: true,
+            chie: SMC.chieDischargeInt, chte: SMC.chteInhibitInt))
+        // Still rejects CHIE != discharge while activeDischarging
+        XCTAssertFalse(autoHealthyDischarge(
+            pct: 75, activeDischarging: true,
+            chie: SMC.chieNormalInt, chte: SMC.chteAllowInt))
+    }
+
     func testAutoDischarge_Inactive_BetweenBounds_ExpectsInhibit() {
         // Discharge-enabled but not currently discharging: between bounds → inhibit
         XCTAssertTrue(autoHealthyDischarge(
@@ -248,6 +278,32 @@ final class HealthCheckTests: XCTestCase {
                 BatteryMonitor.healthCheckManualMode(
                     pauseButtonPaused: paused, chie: SMC.chieNormalInt, chte: chteInt),
                 "expectedSMCValues and healthCheckManualMode disagree at paused=\(paused)")
+        }
+    }
+
+    func testRuleConsistency_AutoMode_DischargeEnabled_Sweep() {
+        // Same idea as the discharge-disabled sweep, but with discharge enabled
+        // and active/inactive permutations. Guards against drift between the
+        // discharge-enabled branches of expectedSMCValues and healthCheckAutoMode.
+        for pct in [10, 39, 40, 45, 50, 59, 60, 65, 75] {
+            for ctu in [false, true] {
+                for active in [false, true] {
+                    let expected = BatteryMonitor.expectedSMCValues(
+                        autoManageEnabled: true, pauseButtonPaused: false,
+                        chargeLevel: pct, lowerBound: 40, upperBound: 60,
+                        dischargeEnabled: true, activeDischarging: active,
+                        chargeToUpperBound: ctu)
+                    let chteInt = (expected.chte == SMC.chteInhibitHex) ? SMC.chteInhibitInt : SMC.chteAllowInt
+                    let chieInt = (expected.chie == SMC.chieDischargeHex) ? SMC.chieDischargeInt : SMC.chieNormalInt
+                    XCTAssertTrue(
+                        BatteryMonitor.healthCheckAutoMode(
+                            chargeLevel: pct, lowerBound: 40, upperBound: 60,
+                            dischargeEnabled: true, activeDischarging: active,
+                            chargeToUpperBound: ctu,
+                            chie: chieInt, chte: chteInt),
+                        "expectedSMCValues and healthCheckAutoMode disagree at pct=\(pct) ctu=\(ctu) active=\(active)")
+                }
+            }
         }
     }
 }

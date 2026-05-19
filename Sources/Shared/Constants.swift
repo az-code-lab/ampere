@@ -3,6 +3,82 @@ public enum AppConstants {
     public static let helperPath = "/usr/local/bin/\(appPrefix)-smc"
     public static let sudoersPath = "/etc/sudoers.d/\(appPrefix)"
     public static let savedSleepPath = "/tmp/.\(appPrefix)-saved-sleep"
+    public static let savedDisplaySleepPath = "/tmp/.\(appPrefix)-saved-sleep-display"
+}
+
+/// Pack a 4-character SMC key (e.g. "CHTE") into a UInt32 in big-endian
+/// order, matching what the SMC kernel extension expects.
+public func smcFourCharCode(_ str: String) -> UInt32 {
+    var result: UInt32 = 0
+    for char in str.utf8.prefix(4) { result = (result << 8) | UInt32(char) }
+    return result
+}
+
+/// SMC kernel command codes (the `data8` field of SMCKeyData specifies
+/// which operation the call invokes). Documented from reverse-engineered
+/// public Apple SMC headers — must match what AppleSMC's kernel extension
+/// expects.
+public enum SMCCmd {
+    public static let readKey: UInt8 = 5
+    public static let writeBytes: UInt8 = 6
+    public static let readKeyInfo: UInt8 = 9
+
+    /// Selector index for `IOConnectCallStructMethod` against both
+    /// `AppleSMCKeysEndpoint` and `AppleSMC` — all SMC keys-endpoint
+    /// operations go through this single selector and dispatch on the
+    /// `data8` field.
+    public static let userClientSelector: UInt32 = 2
+}
+
+/// SMC struct layout — used by both the Ampere app (for reads) and the
+/// SMCWriter helper (for reads + writes). Lives in Shared so the layout
+/// can't drift between the two targets.
+public struct SMCKeyData {
+    /// Capacity of the `bytes` tuple field — used as the upper bound when
+    /// validating `keyInfo.dataSize` from a kernel response.
+    public static let bytesCapacity: UInt32 = 32
+
+    public struct Vers {
+        public var major: UInt8 = 0
+        public var minor: UInt8 = 0
+        public var build: UInt8 = 0
+        public var reserved: UInt8 = 0
+        public var release: UInt16 = 0
+        public init() {}
+    }
+
+    public struct PLimitData {
+        public var version: UInt16 = 0
+        public var length: UInt16 = 0
+        public var cpuPLimit: UInt32 = 0
+        public var gpuPLimit: UInt32 = 0
+        public var memPLimit: UInt32 = 0
+        public init() {}
+    }
+
+    public struct KeyInfo {
+        public var dataSize: UInt32 = 0
+        public var dataType: UInt32 = 0
+        public var dataAttributes: UInt8 = 0
+        public init() {}
+    }
+
+    public var key: UInt32 = 0
+    public var vers: Vers = Vers()
+    public var pLimitData: PLimitData = PLimitData()
+    public var keyInfo: KeyInfo = KeyInfo()
+    public var padding: UInt16 = 0
+    public var result: UInt8 = 0
+    public var status: UInt8 = 0
+    public var data8: UInt8 = 0
+    public var data32: UInt32 = 0
+    public var bytes: (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+                       UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+                       UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+                       UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8) =
+        (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+
+    public init() {}
 }
 
 /// SMC key/value constants for charge control.

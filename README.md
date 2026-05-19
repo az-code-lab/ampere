@@ -86,7 +86,7 @@ When auto charge management is off and a power adapter is connected, a manual **
 
 | Scenario | Sleep → Wake | Quit → Restart |
 |---|---|---|
-| **Charge to Upper Bound** is ON (charging in progress between bounds) | Charging continues. The SMC is already in "allow" state; the wake handler confirms this and takes no further action. Toggle stays ON until the upper bound is reached. | **Charging stops.** The "Charge to Upper Bound" toggle is not persisted — it resets to OFF on restart. The app sees the battery is between bounds and inhibits charging (micro-charge prevention). The user must re-enable the toggle manually. |
+| **Charge to Upper Bound** is ON (charging in progress between bounds) | Charging continues. The SMC is already in "allow" state; the wake handler confirms this and takes no further action. Toggle stays ON until the upper bound is reached. | **Charging resumes automatically.** The "Charge to Upper Bound" toggle is persisted across restart so an in-progress charge resumes rather than parking at the current level. On launch the app sees `chargeToUpperBound = true` and leaves CHTE in the "allow" state; charging continues until the upper bound is reached, at which point the toggle clears itself. |
 | **Discharge to Upper Bound** is ON (discharging above upper bound) | Discharging continues. System sleep is prevented during discharge, so normal sleep should not occur. If forced (e.g. lid close), the wake handler re-asserts the discharge SMC state. Toggle stays ON. | **Discharging resumes automatically.** The "Discharge to Upper Bound" toggle is persisted. On restart, the app clears stale SMC state, then the first refresh cycle detects the battery is still above the upper bound and restarts discharge. Toggle stays ON. |
 
 ### Settings and Safety
@@ -237,12 +237,12 @@ A **watchdog daemon** is always running while the app is active. It is spawned v
 3. If the app dies (crash, `kill -9`, Ctrl+C, etc.), the watchdog cleans up within seconds:
    - Clears `CHTE = 0x00` (allows charging)
    - Clears `CHIE = 0x00` (stops discharge)
-   - Restores sleep settings via `pmset`
+   - Restores sleep settings via `pmset` — only if the save-sleep marker file exists (i.e. discharge had been active and overrode pmset); otherwise leaves the user's sleep settings untouched
    - Exits cleanly (no orphaned processes, no leftover files)
 
 The watchdog must be spawned with `posix_spawn` (not `fork`) because the Swift/ObjC runtime is not fork-safe — forked children crash when using Foundation, IOKit, or Objective-C APIs. Similarly, signal handlers (`SIGTERM`/`SIGHUP`) cannot be used for cleanup because they can only call async-signal-safe C functions, not Swift/Foundation/IOKit APIs.
 
-On app launch, any orphaned watchdog processes from a previous crash are killed via `pkill`, and CHIE/sleep settings are cleared. If auto charge management is enabled and the battery is at or above the lower bound, CHTE is set to inhibit (micro-charge prevention); otherwise CHTE is cleared. A fresh watchdog is then spawned.
+On app launch, any orphaned watchdog processes from a previous crash are killed via `pkill`, and CHIE/sleep settings are cleared. CHTE is set to inhibit only when auto charge management is enabled, the battery is at or above the lower bound, AND no in-progress charge-to-upper-bound is being resumed (i.e. `chargeToUpperBound` is not persisted as `true`); otherwise CHTE is cleared. A fresh watchdog is then spawned.
 
 ### Process Architecture
 
@@ -268,7 +268,7 @@ Ampere (GUI, user)
   |-- sudo SMCWriter nodischarge             (one-shot, root)
   |     |-- pkill watchdog                   kill existing watchdog
   |     |-- SMC write CHIE = 0x00            disable active discharge
-  |     |-- pmset restore sleep settings     re-enable sleep
+  |     |-- pmset restore sleep settings     only if save-sleep file exists
   |     \-- exit(0)
   |
   |-- sudo SMCWriter spawn-watchdog:<pid>    (one-shot, root)
@@ -280,7 +280,7 @@ Ampere (GUI, user)
         |-- if app PID gone:
         |     |-- SMC write CHTE = 0x00      allow charging
         |     |-- SMC write CHIE = 0x00      stop discharge
-        |     |-- pmset restore sleep        re-enable sleep
+        |     |-- pmset restore sleep        only if save-sleep file exists
         |     \-- exit(0)                    clean exit
         \-- (runs until app dies)
 ```

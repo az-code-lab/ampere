@@ -17,8 +17,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var statusItem: NSStatusItem!
     private var popover: NSPopover!
     private let monitor = BatteryMonitor()
-    private var pinnedObserver: Any?
-    private var stateObserver: Any?
+    private var pinnedObserver: AnyCancellable?
+    private var stateObserver: AnyCancellable?
     private var mouseMonitor: Any?
     private var globalMouseMonitor: Any?
 
@@ -149,6 +149,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     func popoverDidDetach(_ popover: NSPopover) {
+        // Pin unconditionally so the detached window doesn't immediately
+        // close on the next outside click (which would happen if pinned
+        // stayed false: pinnedObserver would leave popover.behavior=.transient
+        // and globalMouseMonitor would dismiss the detach). If we can't
+        // register the close observer for some reason, the worst case is
+        // fast polling staying on until the next app launch — invisible
+        // battery drain is a lesser evil than the popover the user just
+        // explicitly detached vanishing under them.
         monitor.pinned = true
         // Observe the detached window closing — popoverDidClose only fires
         // during the detach transition, NOT when the detached window is closed.
@@ -176,8 +184,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     deinit {
-        (pinnedObserver as? AnyCancellable)?.cancel()
-        (stateObserver as? AnyCancellable)?.cancel()
+        // pinnedObserver / stateObserver are AnyCancellable — they cancel
+        // automatically when this AppDelegate's stored properties go out of
+        // scope, so no explicit .cancel() needed here.
         animationTimer?.invalidate()
         if let mouseMonitor = mouseMonitor {
             NSEvent.removeMonitor(mouseMonitor)
@@ -612,6 +621,11 @@ struct ContentView: View {
                     } else {
                         monitor.autoManageEnabled = false
                         monitor.chargeToUpperBound = false
+                        // Any pending error in auto-manage mode (most commonly
+                        // "Admin access required for auto charge management"
+                        // from a failed prior enable) is no longer relevant
+                        // once the user has disabled auto-manage.
+                        monitor.lastError = nil
                         if monitor.chargingPaused {
                             monitor.toggleCharging()
                         }
