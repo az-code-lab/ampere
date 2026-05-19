@@ -55,7 +55,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         // Create popover with the battery panel
         popover = NSPopover()
-        popover.contentSize = NSSize(width: 580, height: 592)
+        popover.contentSize = NSSize(width: 580, height: 606)
         popover.behavior = .transient
         popover.delegate = self
         popover.contentViewController = NSHostingController(
@@ -491,7 +491,7 @@ struct ContentView: View {
                     electronicsWatts: state.electronicsWatts,
                     animate: monitor.isPopoverVisible
                 )
-                .frame(width: 240, height: 96)
+                .frame(width: 240, height: 110)
 
                 Text("\(state.percentage)%")
                     .font(.system(size: 18, weight: .bold, design: .rounded))
@@ -1081,6 +1081,15 @@ private struct PowerFlowDiagram: View {
     // node end up the same vertical size; without this the wattage labels
     // beneath each node would sit at different y positions.
     private static let glyphAreaH: CGFloat = 28
+    private static let nodeTextH: CGFloat = 14
+    private static let nodeVStackSpacing: CGFloat = 1
+    // Offset between the node VStack's geometric center and the icon's
+    // geometric center. The VStack stacks icon + spacing + text, so the
+    // icon sits `(text + spacing) / 2` above the VStack center; we shift
+    // the position by that amount so `.position(p)` lands the *icon* (not
+    // the icon+text midpoint) on the ribbon attach point — the Sankey
+    // bands then connect to where the visual symbol actually is.
+    private static let nodeIconOffsetY: CGFloat = (Self.nodeTextH + Self.nodeVStackSpacing) / 2
 
     private var flow: PowerFlowCase {
         PowerFlowRouter.compute(
@@ -1243,7 +1252,7 @@ private struct PowerFlowDiagram: View {
     /// which can clamp to 0 when adapter and battery telemetry briefly
     /// disagree — the node must stay visible or the diagram makes no sense).
     private func node(icon: String, watts: Double?, tint: Color, at p: CGPoint) -> some View {
-        VStack(spacing: 1) {
+        VStack(spacing: Self.nodeVStackSpacing) {
             Image(systemName: icon)
                 .font(.system(size: 28, weight: .semibold))
                 .foregroundColor(tint)
@@ -1252,25 +1261,27 @@ private struct PowerFlowDiagram: View {
                 .font(.system(size: 12, weight: .medium, design: .rounded))
                 .foregroundColor(.secondary)
                 .lineLimit(1)
+                .frame(height: Self.nodeTextH)
         }
         .frame(width: Self.nodeAreaWidth)
-        .position(p)
+        .position(x: p.x, y: p.y + Self.nodeIconOffsetY)
     }
 
     /// Battery node that renders a proportional-fill battery glyph (instead
     /// of an SF Symbol) so the visible fill level matches the actual charge
     /// percentage. Always renders for the same reason as `node`.
     private func batteryNode(watts: Double?, tint: Color, at p: CGPoint) -> some View {
-        VStack(spacing: 1) {
+        VStack(spacing: Self.nodeVStackSpacing) {
             BatteryGlyph(percentage: percentage, tint: tint)
                 .frame(width: 40, height: Self.glyphAreaH)
             Text(formatWatts(watts))
                 .font(.system(size: 12, weight: .medium, design: .rounded))
                 .foregroundColor(.secondary)
                 .lineLimit(1)
+                .frame(height: Self.nodeTextH)
         }
         .frame(width: Self.nodeAreaWidth)
-        .position(p)
+        .position(x: p.x, y: p.y + Self.nodeIconOffsetY)
     }
 }
 
