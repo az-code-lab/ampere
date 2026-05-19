@@ -36,7 +36,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         // Create popover with the battery panel
         popover = NSPopover()
-        popover.contentSize = NSSize(width: 340, height: 760)
+        popover.contentSize = NSSize(width: 580, height: 544)
         popover.behavior = .transient
         popover.delegate = self
         popover.contentViewController = NSHostingController(
@@ -236,7 +236,7 @@ struct ContentView: View {
     @State private var healthShowPercent = true
     @State private var ageShowYears = true
     @State private var amperageShowMA = false
-    @State private var capacityShowMAh = false
+    @State private var rawChargeShowMAh = false
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
 
     private var healthCheckTimeString: String {
@@ -254,7 +254,7 @@ struct ContentView: View {
                 noBatteryView
             }
         }
-        .frame(width: 340)
+        .frame(width: 580)
         .background(Color(.windowBackgroundColor))
     }
 
@@ -513,7 +513,9 @@ struct ContentView: View {
 
         let mode = batteryMode(state)
         let tint: Color = mode == .charging ? .green : (mode == .onBattery || mode == .discharging) ? .orange : .secondary
-        let twoColumns = [
+        let fourColumns = [
+            GridItem(.flexible()),
+            GridItem(.flexible()),
             GridItem(.flexible()),
             GridItem(.flexible()),
         ]
@@ -522,48 +524,46 @@ struct ContentView: View {
         // "—" or 0 readings are visually distinguished from live values.
         let adapterTint: Color = state.adapterConnected ? tint : .secondary
 
-        return VStack(spacing: 12) {
-            LazyVGrid(columns: twoColumns, spacing: 12) {
-                StatCard(title: "Cycle Count", value: "\(state.cycleCount)", icon: "arrow.triangle.2.circlepath", iconColor: tint)
-                StatCard(title: "Battery Served",
-                    value: ageShowYears
-                        ? (state.batteryAgeYears.isEmpty ? "—" : state.batteryAgeYears)
-                        : (state.batteryAgeDays.isEmpty ? "—" : state.batteryAgeDays),
-                    icon: "calendar.badge.clock", iconColor: tint, onTap: {
-                        ageShowYears.toggle()
-                    })
+        return LazyVGrid(columns: fourColumns, spacing: 8) {
+            // Row 0
+            StatCard(title: "Cycle Count", value: "\(state.cycleCount)", icon: "arrow.triangle.2.circlepath", iconColor: tint)
+            StatCard(title: "System Load", value: wattsValue(state.electronicsWatts), icon: "desktopcomputer", iconColor: tint)
+            StatCard(title: "Adapter Load", value: wattsValue(state.adapterWatts), icon: "bolt.horizontal.fill", iconColor: adapterTint)
+            StatCard(title: "Battery Load", value: wattsValue(state.batteryWatts), icon: "bolt.horizontal.fill", iconColor: tint)
 
-                StatCard(title: "Capacity",
-                    value: capacityShowMAh
-                        ? "\(state.currentCapacity)/\(state.maxCapacity) mAh"
-                        : (state.maxCapacity > 0
-                            ? String(format: "%.1f%%", Double(state.currentCapacity) / Double(state.maxCapacity) * 100)
-                            : "\(state.percentage)%"),
-                    icon: "battery.100", iconColor: tint, onTap: {
-                        capacityShowMAh.toggle()
-                    })
-                StatCard(title: "Health", value: healthValue, icon: "stethoscope", iconColor: tint, onTap: {
-                    healthShowPercent.toggle()
+            // Row 1
+            StatCard(title: "Battery Served",
+                value: ageShowYears
+                    ? (state.batteryAgeYears.isEmpty ? "—" : state.batteryAgeYears)
+                    : (state.batteryAgeDays.isEmpty ? "—" : state.batteryAgeDays),
+                icon: "calendar.badge.clock", iconColor: tint, onTap: {
+                    ageShowYears.toggle()
                 })
+            StatCard(title: "Temperature", value: tempValue, icon: "thermometer.medium", iconColor: tint, onTap: {
+                useFahrenheit.toggle()
+            })
+            StatCard(title: "Adapter Voltage", value: voltageValue(state.adapterVoltage), icon: "bolt.fill", iconColor: adapterTint)
+            StatCard(title: "Battery Voltage", value: voltageValue(state.voltage), icon: "bolt.fill", iconColor: tint)
 
-                StatCard(title: "Temperature", value: tempValue, icon: "thermometer.medium", iconColor: tint, onTap: {
-                    useFahrenheit.toggle()
+            // Row 2
+            StatCard(title: "Health", value: healthValue, icon: "stethoscope", iconColor: tint, onTap: {
+                healthShowPercent.toggle()
+            })
+            StatCard(title: "Raw Charge",
+                value: rawChargeShowMAh
+                    ? "\(state.currentCapacity)/\(state.maxCapacity) mAh"
+                    : (state.maxCapacity > 0
+                        ? String(format: "%.1f%%", Double(state.currentCapacity) / Double(state.maxCapacity) * 100)
+                        : "\(state.percentage)%"),
+                icon: "battery.100", iconColor: tint, onTap: {
+                    rawChargeShowMAh.toggle()
                 })
-                StatCard(title: "System Load", value: wattsValue(state.electronicsWatts), icon: "desktopcomputer", iconColor: tint)
-            }
-
-            LazyVGrid(columns: twoColumns, spacing: 8) {
-                StatCard(title: "Adapter Power", value: wattsValue(state.adapterWatts), icon: "bolt.horizontal.fill", iconColor: adapterTint)
-                StatCard(title: "Battery Power", value: wattsValue(state.batteryWatts), icon: "bolt.horizontal.fill", iconColor: tint)
-                StatCard(title: "Adapter Current", value: amperageValue(state.adapterAmperage), icon: "directcurrent", iconColor: adapterTint, onTap: {
-                    amperageShowMA.toggle()
-                })
-                StatCard(title: "Battery Current", value: amperageValue(state.amperage.map(Double.init)), icon: "directcurrent", iconColor: tint, onTap: {
-                    amperageShowMA.toggle()
-                })
-                StatCard(title: "Adapter Voltage", value: voltageValue(state.adapterVoltage), icon: "bolt.fill", iconColor: adapterTint)
-                StatCard(title: "Battery Voltage", value: voltageValue(state.voltage), icon: "bolt.fill", iconColor: tint)
-            }
+            StatCard(title: "Adapter Current", value: amperageValue(state.adapterAmperage), icon: "directcurrent", iconColor: adapterTint, onTap: {
+                amperageShowMA.toggle()
+            })
+            StatCard(title: "Battery Current", value: amperageValue(state.amperage.map(Double.init)), icon: "directcurrent", iconColor: tint, onTap: {
+                amperageShowMA.toggle()
+            })
         }
         .padding(.horizontal, 16)
     }
@@ -1058,24 +1058,25 @@ struct StatCard: View {
     var onTap: (() -> Void)? = nil
 
     var body: some View {
-        VStack(spacing: 4) {
+        VStack(spacing: 5) {
             Image(systemName: icon)
-                .font(.system(size: 16))
+                .font(.system(size: 20))
                 .foregroundColor(iconColor)
+                .frame(height: 24)
 
             Text(value)
-                .font(.system(size: 14, weight: .semibold, design: .rounded))
+                .font(.system(size: 15, weight: .semibold, design: .rounded))
                 .lineLimit(1)
-                .minimumScaleFactor(0.7)
+                .frame(height: 18)
 
             Text(title)
-                .font(.system(size: 12))
+                .font(.system(size: 11))
                 .foregroundColor(.secondary)
                 .lineLimit(1)
-                .minimumScaleFactor(0.75)
+                .frame(height: 14)
         }
         .frame(maxWidth: .infinity)
-        .frame(height: 60)
+        .frame(height: 76)
         .padding(.vertical, 8)
         .padding(.horizontal, 4)
         .background(Color.primary.opacity(0.04))

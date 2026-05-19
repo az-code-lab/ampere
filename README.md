@@ -10,7 +10,7 @@ A lightweight macOS menu bar app for monitoring battery status and controlling c
 
 ## Features
 
-- **Real-time battery stats** - percentage, cycle count, health, temperature, voltage, amperage, wattage, capacity, and battery age
+- **Real-time battery stats** - percentage, cycle count, health, temperature, raw charge, battery age, system load, plus per-source (adapter and battery) wattage, voltage, and current
 - **Charge control** - pause and resume charging via SMC
 - **Auto charge management** - configurable upper/lower bounds to keep your battery in an optimal charge range
 - **Micro-charge prevention** - inhibits charging between bounds after restart; only charges from below the lower bound or on explicit user request
