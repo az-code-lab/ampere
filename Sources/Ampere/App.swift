@@ -16,7 +16,11 @@ struct AmpereApp: App {
 class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var statusItem: NSStatusItem!
     private var popover: NSPopover!
-    private let monitor = BatteryMonitor()
+    // Late-initialized: BatteryMonitor's init blocks on three sequential
+    // `sudo SMCWriter` subprocess calls (nodischarge / inhibit-or-allow /
+    // spawn-watchdog), ~1-2s total. Holding off on it until the status bar
+    // item exists lets the icon appear immediately on launch.
+    private var monitor: BatteryMonitor!
     private var pinnedObserver: AnyCancellable?
     private var stateObserver: AnyCancellable?
     private var mouseMonitor: Any?
@@ -26,17 +30,32 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // Activation policy is set in main.swift before SwiftUI launches,
         // so we don't need to change it here (avoids external monitor blackout).
 
-        // Create status bar item
+        // 1. Status bar item first, with a placeholder icon and no click
+        // handler. The OS draws the menu bar slot before the heavy
+        // BatteryMonitor init runs below, so the user sees Ampere appear
+        // immediately rather than after a 1-2s blank gap.
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
-            updateMenuBarIcon()
+            button.image = buildMenuBarIcon(percentage: 0, hasWarning: false)
+        }
+
+        // 2. Heavy init — blocks the main thread on sudo SMC writes. The
+        // placeholder icon is already visible during this; clicks land on a
+        // button with no action and are no-ops, which is the right behavior
+        // until the popover is wired up below.
+        monitor = BatteryMonitor()
+
+        // 3. Wire the button to togglePopover and refresh the icon with real
+        // data. Done after monitor is ready so updateMenuBarIcon can read it.
+        if let button = statusItem.button {
             button.action = #selector(togglePopover)
             button.target = self
         }
+        updateMenuBarIcon()
 
         // Create popover with the battery panel
         popover = NSPopover()
-        popover.contentSize = NSSize(width: 580, height: 544)
+        popover.contentSize = NSSize(width: 580, height: 592)
         popover.behavior = .transient
         popover.delegate = self
         popover.contentViewController = NSHostingController(
@@ -443,19 +462,18 @@ struct ContentView: View {
         return .onBattery
     }
 
-    private func batteryIcon(_ state: BatteryState) -> StaticBatteryBody {
-        StaticBatteryBody(
-            percentage: Double(state.percentage),
-            mode: batteryMode(state),
-            animate: monitor.isPopoverVisible
-        )
-    }
-
     private func batteryHeader(_ state: BatteryState) -> some View {
         VStack(spacing: 8) {
             VStack(spacing: 12) {
-                batteryIcon(state)
-                    .frame(width: 100, height: 48)
+                PowerFlowDiagram(
+                    adapterConnected: state.adapterConnected,
+                    percentage: state.percentage,
+                    adapterWatts: state.adapterWatts,
+                    batteryWatts: state.batteryWatts,
+                    electronicsWatts: state.electronicsWatts,
+                    animate: monitor.isPopoverVisible
+                )
+                .frame(width: 240, height: 96)
 
                 Text("\(state.percentage)%")
                     .font(.system(size: 18, weight: .bold, design: .rounded))
@@ -468,9 +486,9 @@ struct ContentView: View {
                     .fill(statusColor(state))
                     .frame(width: 8, height: 8)
 
-                Text(state.timeRemaining.isEmpty
+                Text(displayedTimeRemaining(state).isEmpty
                     ? statusText(state)
-                    : "\(statusText(state)) — \(state.timeRemaining)")
+                    : "\(statusText(state)) — \(displayedTimeRemaining(state))")
                     .font(.system(size: 13, weight: .medium))
                     .foregroundColor(.secondary)
             }
@@ -484,10 +502,80 @@ struct ContentView: View {
         }
     }
 
+    /// Compute our own ETA from the live amperage so the label is consistent
+    /// across charging/discharging modes and doesn't go silent in scenarios
+    /// IOKit doesn't track (active SMC discharge, weak adapter making the
+    /// battery supplement). Falls back to `state.timeRemaining` only when
+    /// the computation can't run — that path still serves the on-battery
+    /// "Xh Ym remaining" case via IOKit's smart `TimeToEmpty` estimator.
+    private func displayedTimeRemaining(_ state: BatteryState) -> String {
+        // Drive branching from the live current's sign rather than from
+        // `state.isCharging`. IOKit's `isCharging` can lag the actual current
+        // direction during auto-manage transitions or when an underpowered
+        // adapter forces the battery to supplement — leaning on amperage
+        // keeps the ETA correct in those moments.
+        if let amperage = state.amperage {
+            if amperage > 0 {
+                let target = monitor.autoManageEnabled ? monitor.chargeUpperBound : 100
+                let eta = chargingETA(state, target: target)
+                if !eta.isEmpty { return eta }
+            } else if amperage < 0 {
+                let target = monitor.activeDischarging ? monitor.chargeUpperBound : 0
+                let eta = dischargeETA(state, target: target)
+                if !eta.isEmpty { return eta }
+            }
+        }
+        return state.timeRemaining
+    }
+
+    /// Estimate of remaining time until `target`% is reached while charging,
+    /// derived from the live charging current. Returns "" when any input is
+    /// missing or the gap is non-positive — better silent than wrong.
+    private func chargingETA(_ state: BatteryState, target: Int) -> String {
+        let gap = target - state.percentage
+        guard gap > 0, state.maxCapacity > 0,
+              let amperage = state.amperage, amperage > 0 else {
+            return ""
+        }
+        // amperage is in mA, capacity in mAh — hours = mAh / mA.
+        let remainingMAh = Double(gap) * Double(state.maxCapacity) / 100.0
+        let totalMinutes = Int((remainingMAh / amperage * 60).rounded())
+        let suffix = target == 100 ? "to full" : "to \(target)%"
+        return formatMinutes(totalMinutes, suffix: suffix)
+    }
+
+    /// Estimate of remaining time until the battery drains to `target`% from
+    /// the live discharge current. Returns "" when any input is missing or
+    /// the gap is non-positive.
+    private func dischargeETA(_ state: BatteryState, target: Int) -> String {
+        let gap = state.percentage - target
+        guard gap > 0, state.maxCapacity > 0,
+              let amperage = state.amperage, amperage < 0 else {
+            return ""
+        }
+        let remainingMAh = Double(gap) * Double(state.maxCapacity) / 100.0
+        let totalMinutes = Int((remainingMAh / abs(amperage) * 60).rounded())
+        let suffix = target == 0 ? "remaining" : "to \(target)%"
+        return formatMinutes(totalMinutes, suffix: suffix)
+    }
+
+    private func formatMinutes(_ totalMinutes: Int, suffix: String) -> String {
+        if totalMinutes < 1 { return "<1m \(suffix)" }
+        if totalMinutes < 60 { return "\(totalMinutes)m \(suffix)" }
+        return "\(totalMinutes / 60)h \(totalMinutes % 60)m \(suffix)"
+    }
+
     private func statusMessage(_ state: BatteryState) -> String {
         if let error = monitor.lastError { return error }
         if let warning = monitor.healthWarning { return warning }
         if monitor.activeDischarging {
+            // SMC discharge has been requested but may not have engaged yet
+            // (transient at startup or just after toggling the feature on).
+            // Be honest about the *current* state — the battery is still
+            // gaining charge — instead of claiming the system is discharging.
+            if (state.amperage ?? 0) > 0 {
+                return "Discharge starting — sleep is temporarily disabled"
+            }
             return "Discharging to \(monitor.chargeUpperBound)% — sleep is temporarily disabled"
         }
         if monitor.autoManageEnabled && monitor.chargingPaused {
@@ -792,6 +880,12 @@ struct ContentView: View {
     }
 
     private func statusColor(_ state: BatteryState) -> Color {
+        // Match the diagram/cards by deferring to the live current direction
+        // first. This keeps the status dot consistent with the Sankey ribbons
+        // during transients where IOKit's `isCharging` / `activeDischarging`
+        // intent disagrees with the actual amperage sign (e.g. just after a
+        // "Discharge to Upper Bound" restart, before the SMC has engaged).
+        if (state.amperage ?? 0) > 0 { return .green }
         if state.isCharging { return .green }
         if monitor.activeDischarging { return .orange }
         if state.adapterConnected { return .blue }
@@ -800,6 +894,7 @@ struct ContentView: View {
     }
 
     private func statusText(_ state: BatteryState) -> String {
+        if (state.amperage ?? 0) > 0 { return "Charging" }
         if monitor.activeDischarging { return "Discharging" }
         if monitor.chargingPaused && state.adapterConnected { return "On AC Power (Not Charging)" }
         if state.isCharging { return "Charging" }
@@ -817,91 +912,319 @@ enum BatteryMode {
     case onBattery
 }
 
-private struct StaticBatteryBody: View {
-    let percentage: Double
-    let mode: BatteryMode
+// MARK: - Power Flow (Sankey) Diagram
+
+/// Sankey-style diagram of live power flow. Sources on the left, sinks on the
+/// right; band widths are proportional to the wattage of each flow. Four cases:
+/// - charging: AC → (Computer + Battery)
+/// - AC too weak: (AC + Battery) → Computer (battery supplements an underpowered adapter)
+/// - AC, not charging: AC → Computer
+/// - on battery: Battery → Computer
+private struct PowerFlowDiagram: View {
+    let adapterConnected: Bool
+    let percentage: Int
+    let adapterWatts: Double?
+    let batteryWatts: Double?     // + = into battery (charging), - = out of battery (drain)
+    let electronicsWatts: Double?
     var animate: Bool = false
 
-    private static let shimmerDuration: TimeInterval = 5.0
+    private static let nodeAreaWidth: CGFloat = 44
+    private static let maxRibbonH: CGFloat = 26
+    private static let twoNodeOffset: CGFloat = 24
+    private static let flowDuration: TimeInterval = 2.0
+    // Fixed icon-row height so SF Symbol nodes and the custom BatteryGlyph
+    // node end up the same vertical size; without this the wattage labels
+    // beneath each node would sit at different y positions.
+    private static let glyphAreaH: CGFloat = 28
 
-    private var fillColor: Color {
-        if percentage <= 15 { return .red }
-        if percentage <= 30 { return .orange }
-        return .green
+    private enum Flow {
+        case acToBoth      // AC → Computer + Battery
+        case acAndBattery  // AC (weak) + Battery → Computer
+        case acOnly        // AC → Computer
+        case batteryOnly   // Battery → Computer
     }
 
-    private var iconName: String {
-        switch mode {
-        case .charging: return "bolt.fill"
-        case .discharging, .onBattery: return "bolt.slash"
-        case .onACNotCharging: return "powerplug.fill"
+    private var flow: Flow {
+        // nil adapterWatts (very old Macs without PowerTelemetryData) — assume
+        // the cable is delivering an unknown but non-zero amount. A measured
+        // exactly 0 W with the cable plugged in is the "dead adapter" case
+        // (broken cable, brick unplugged at the wall, etc.) and should render
+        // as pure on-battery so we don't draw an empty node.
+        let acDelivering: Bool = (adapterWatts ?? 1) != 0
+        if !adapterConnected || !acDelivering { return .batteryOnly }
+        // Base direction on batteryWatts' sign — the same raw measurement the
+        // Battery Load card displays. Relying on IOKit's `isCharging` here
+        // breaks consistency during state transitions (e.g. "Discharge to
+        // Upper Bound" startup, where isCharging is already false but the
+        // battery is still receiving current).
+        if (batteryWatts ?? 0) < 0 { return .acAndBattery }
+        if (batteryWatts ?? 0) > 0 { return .acToBoth }
+        return .acOnly
+    }
+
+    private var acColor: Color { .cyan }
+    private var chargeColor: Color { .green }
+    private var drainColor: Color { .orange }
+
+    var body: some View {
+        GeometryReader { geo in
+            let w = geo.size.width
+            let h = geo.size.height
+            let leftX = Self.nodeAreaWidth / 2
+            let rightX = w - Self.nodeAreaWidth / 2
+            let leftRX = Self.nodeAreaWidth
+            let rightRX = w - Self.nodeAreaWidth
+            let midY = h / 2
+
+            ZStack {
+                switch flow {
+                case .acToBoth:
+                    acToBothBody(leftX: leftX, rightX: rightX,
+                                  leftRX: leftRX, rightRX: rightRX, midY: midY)
+                case .acAndBattery:
+                    acAndBatteryBody(leftX: leftX, rightX: rightX,
+                                      leftRX: leftRX, rightRX: rightRX, midY: midY)
+                case .acOnly:
+                    singleBandBody(leftX: leftX, rightX: rightX,
+                                    leftRX: leftRX, rightRX: rightRX, midY: midY,
+                                    sourceIcon: "powerplug.fill", sourceLabel: adapterWatts,
+                                    sinkIcon: "laptopcomputer", sinkLabel: electronicsWatts,
+                                    color: acColor)
+                case .batteryOnly:
+                    batteryOnlyBody(leftX: leftX, rightX: rightX,
+                                     leftRX: leftRX, rightRX: rightRX, midY: midY)
+                }
+            }
+            .frame(width: w, height: h)
         }
     }
 
-    private var shouldAnimate: Bool {
-        animate && (mode == .charging || mode == .discharging)
+    // MARK: case bodies
+
+    @ViewBuilder
+    private func acToBothBody(leftX: CGFloat, rightX: CGFloat,
+                               leftRX: CGFloat, rightRX: CGFloat, midY: CGFloat) -> some View {
+        let elec = max(0.1, electronicsWatts ?? 0)
+        let batt = max(0.1, batteryWatts ?? 0)
+        let total = elec + batt
+        let elecH = Self.maxRibbonH * CGFloat(elec / total)
+        let battH = Self.maxRibbonH * CGFloat(batt / total)
+        let acTop = midY - Self.maxRibbonH / 2
+        let acElecBot = acTop + elecH
+        let acBattBot = acElecBot + battH
+        let elecY = midY - Self.twoNodeOffset
+        let battY = midY + Self.twoNodeOffset
+
+        let elecRibbon = RibbonShape(x1: leftRX, y1a: acTop, y1b: acElecBot,
+                                     x2: rightRX, y2a: elecY - elecH / 2, y2b: elecY + elecH / 2)
+        let battRibbon = RibbonShape(x1: leftRX, y1a: acElecBot, y1b: acBattBot,
+                                     x2: rightRX, y2a: battY - battH / 2, y2b: battY + battH / 2)
+
+        flowRibbon(elecRibbon, color: acColor)
+        flowRibbon(battRibbon, color: chargeColor)
+        node(icon: "powerplug.fill", watts: adapterWatts, tint: acColor, at: CGPoint(x: leftX, y: midY))
+        node(icon: "laptopcomputer", watts: electronicsWatts, tint: acColor, at: CGPoint(x: rightX, y: elecY))
+        batteryNode(watts: batteryWatts, tint: chargeColor, at: CGPoint(x: rightX, y: battY))
     }
 
-    var body: some View {
-        HStack(spacing: 0) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 6)
-                    .stroke(Color.primary.opacity(0.4), lineWidth: 2)
+    @ViewBuilder
+    private func acAndBatteryBody(leftX: CGFloat, rightX: CGFloat,
+                                   leftRX: CGFloat, rightRX: CGFloat, midY: CGFloat) -> some View {
+        let fromAC = max(0.1, adapterWatts ?? 0)
+        let fromBatt = max(0.1, -(batteryWatts ?? 0))
+        let total = fromAC + fromBatt
+        let acH = Self.maxRibbonH * CGFloat(fromAC / total)
+        let battH = Self.maxRibbonH * CGFloat(fromBatt / total)
+        let acY = midY - Self.twoNodeOffset
+        let battY = midY + Self.twoNodeOffset
+        let compTop = midY - Self.maxRibbonH / 2
+        let compACBot = compTop + acH
+        let compBattBot = compACBot + battH
 
-                // Battery fill
-                GeometryReader { geo in
-                    let inset: CGFloat = 3
-                    let totalWidth = geo.size.width - inset * 2
-                    let fillWidth = totalWidth * percentage / 100
-                    let fillHeight = geo.size.height - inset * 2
+        let acRibbon = RibbonShape(x1: leftRX, y1a: acY - acH / 2, y1b: acY + acH / 2,
+                                   x2: rightRX, y2a: compTop, y2b: compACBot)
+        let battRibbon = RibbonShape(x1: leftRX, y1a: battY - battH / 2, y1b: battY + battH / 2,
+                                     x2: rightRX, y2a: compACBot, y2b: compBattBot)
 
-                    ZStack {
-                        // Base color
-                        RoundedRectangle(cornerRadius: 3.5)
-                            .fill(fillColor)
-                            .frame(width: fillWidth, height: fillHeight)
+        flowRibbon(acRibbon, color: acColor)
+        flowRibbon(battRibbon, color: drainColor)
+        node(icon: "powerplug.fill", watts: adapterWatts, tint: acColor, at: CGPoint(x: leftX, y: acY))
+        batteryNode(watts: batteryWatts, tint: drainColor, at: CGPoint(x: leftX, y: battY))
+        node(icon: "laptopcomputer", watts: electronicsWatts, tint: drainColor, at: CGPoint(x: rightX, y: midY))
+    }
 
-                        // Animated shimmer overlay — uses TimelineView for
-                        // reliable animation that survives mode changes.
-                        if shouldAnimate {
-                            TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: false)) { timeline in
-                                let phase = timeline.date.timeIntervalSinceReferenceDate
-                                    .truncatingRemainder(dividingBy: Self.shimmerDuration) / Self.shimmerDuration
-                                let offset = (mode == .discharging ? (1.0 - phase * 2.0) : (phase * 2.0 - 1.0)) * fillWidth
-                                let shimmerWidth = fillWidth * 2
-                                LinearGradient(
-                                    colors: [
-                                        .clear,
-                                        .white.opacity(0.3),
-                                        .white.opacity(0.5),
-                                        .white.opacity(0.3),
-                                        .clear
-                                    ],
-                                    startPoint: .leading,
-                                    endPoint: .trailing
-                                )
-                                .frame(width: shimmerWidth * 0.5, height: fillHeight)
-                                .offset(x: offset)
-                                .frame(width: fillWidth, height: fillHeight)
-                                .clipShape(RoundedRectangle(cornerRadius: 3.5))
-                            }
-                        }
+    @ViewBuilder
+    private func singleBandBody(leftX: CGFloat, rightX: CGFloat,
+                                 leftRX: CGFloat, rightRX: CGFloat, midY: CGFloat,
+                                 sourceIcon: String, sourceLabel: Double?,
+                                 sinkIcon: String, sinkLabel: Double?,
+                                 color: Color) -> some View {
+        let h2 = Self.maxRibbonH / 2
+        let ribbon = RibbonShape(x1: leftRX, y1a: midY - h2, y1b: midY + h2,
+                                 x2: rightRX, y2a: midY - h2, y2b: midY + h2)
+        flowRibbon(ribbon, color: color)
+        node(icon: sourceIcon, watts: sourceLabel, tint: color, at: CGPoint(x: leftX, y: midY))
+        node(icon: sinkIcon, watts: sinkLabel, tint: color, at: CGPoint(x: rightX, y: midY))
+    }
+
+    @ViewBuilder
+    private func batteryOnlyBody(leftX: CGFloat, rightX: CGFloat,
+                                  leftRX: CGFloat, rightRX: CGFloat, midY: CGFloat) -> some View {
+        let h2 = Self.maxRibbonH / 2
+        let ribbon = RibbonShape(x1: leftRX, y1a: midY - h2, y1b: midY + h2,
+                                 x2: rightRX, y2a: midY - h2, y2b: midY + h2)
+        flowRibbon(ribbon, color: drainColor)
+        batteryNode(watts: batteryWatts, tint: drainColor, at: CGPoint(x: leftX, y: midY))
+        node(icon: "laptopcomputer", watts: electronicsWatts, tint: drainColor, at: CGPoint(x: rightX, y: midY))
+    }
+
+    // MARK: ribbon + node helpers
+
+    /// Filled ribbon with an optional animated highlight gliding from source
+    /// (left) to sink (right). The highlight uses TimelineView, the same
+    /// approach the prior battery shimmer used.
+    @ViewBuilder
+    private func flowRibbon(_ shape: RibbonShape, color: Color) -> some View {
+        ZStack {
+            shape.fill(color.opacity(0.55))
+            shape.stroke(color.opacity(0.85), lineWidth: 0.6)
+            if animate {
+                TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: false)) { timeline in
+                    GeometryReader { geo in
+                        let phase = timeline.date.timeIntervalSinceReferenceDate
+                            .truncatingRemainder(dividingBy: Self.flowDuration) / Self.flowDuration
+                        let travel = geo.size.width + geo.size.width * 0.4
+                        let dx = CGFloat(phase) * travel - geo.size.width * 0.4
+                        LinearGradient(
+                            colors: [.clear, .white.opacity(0.45), .clear],
+                            startPoint: .leading, endPoint: .trailing
+                        )
+                        .frame(width: geo.size.width * 0.4)
+                        .offset(x: dx)
                     }
-                    .offset(x: inset, y: inset)
-                    .frame(width: fillWidth, height: fillHeight, alignment: .leading)
+                    .clipShape(shape)
                 }
-
-                Image(systemName: iconName)
-                    .font(.system(size: mode == .onACNotCharging ? 14 : 18,
-                                  weight: mode == .onACNotCharging ? .medium : .bold))
-                    .foregroundColor(.white)
-                    .opacity(0.8)
             }
+        }
+    }
 
-            RoundedRectangle(cornerRadius: 2)
-                .fill(Color.primary.opacity(0.4))
-                .frame(width: 5, height: 16)
-                .padding(.leading, -1)
+    @ViewBuilder
+    private func node(icon: String, watts: Double?, tint: Color, at p: CGPoint) -> some View {
+        // Suppress nodes only when the reading is actually 0 W (or unknown).
+        // Sub-watt readings like 0.3 W are real flows and must appear in the
+        // diagram so the labels match the stat cards' "%.1f W" formatting.
+        if let watts, watts != 0 {
+            VStack(spacing: 1) {
+                Image(systemName: icon)
+                    .font(.system(size: 28, weight: .semibold))
+                    .foregroundColor(tint)
+                    .frame(height: Self.glyphAreaH)
+                Text(wattsLabel(watts))
+                    .font(.system(size: 12, weight: .medium, design: .rounded))
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+            }
+            .frame(width: Self.nodeAreaWidth)
+            .position(p)
+        }
+    }
+
+    /// Battery node that renders a proportional-fill battery glyph (instead
+    /// of an SF Symbol) so the visible fill level matches the actual charge
+    /// percentage. Suppressed only when watts == 0 / nil, same as `node`.
+    @ViewBuilder
+    private func batteryNode(watts: Double?, tint: Color, at p: CGPoint) -> some View {
+        if let watts, watts != 0 {
+            VStack(spacing: 1) {
+                BatteryGlyph(percentage: percentage, tint: tint)
+                    .frame(width: 40, height: Self.glyphAreaH)
+                Text(wattsLabel(watts))
+                    .font(.system(size: 12, weight: .medium, design: .rounded))
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+            }
+            .frame(width: Self.nodeAreaWidth)
+            .position(p)
+        }
+    }
+
+    // Matches the stat cards' `wattsValue` formatter exactly. Signed values
+    // are preserved so the Battery node's label reads e.g. "-7.0 W" when
+    // discharging, mirroring the Battery Load card.
+    private func wattsLabel(_ w: Double?) -> String {
+        guard let w else { return "—" }
+        return String(format: "%.1f W", w)
+    }
+}
+
+/// Horizontal battery glyph (rounded body + cap) with a proportional fill
+/// from the left. Drawn manually because SF Symbols' battery variants only
+/// come in 0/25/50/75/100 increments and can't render an arbitrary level.
+private struct BatteryGlyph: View {
+    let percentage: Int
+    let tint: Color
+
+    var body: some View {
+        GeometryReader { geo in
+            // Pick the largest body that fits within the parent frame while
+            // keeping a sensible aspect ratio (~2.5:1) and leaving room for
+            // the cap. Centered both axes so the glyph sits mid-row.
+            let availW = geo.size.width
+            let availH = geo.size.height
+            let aspect: CGFloat = 2.5
+            let bodyH = min(min(availH, availW / aspect / 1.1), 18)
+            let bodyW = bodyH * aspect
+            let capW = max(1, bodyH * 0.18)
+            let capH = bodyH * 0.5
+            let totalW = bodyW + capW + 0.5
+            let originX = (availW - totalW) / 2
+            let originY = (availH - bodyH) / 2
+
+            let inset = max(1, bodyH * 0.18)
+            let fillMaxW = bodyW - inset * 2
+            let pct = max(0, min(100, percentage))
+            let fillW = fillMaxW * CGFloat(pct) / 100
+
+            ZStack(alignment: .topLeading) {
+                RoundedRectangle(cornerRadius: bodyH * 0.22)
+                    .stroke(tint, lineWidth: max(0.8, bodyH * 0.09))
+                    .frame(width: bodyW, height: bodyH)
+                    .offset(x: originX, y: originY)
+
+                RoundedRectangle(cornerRadius: bodyH * 0.12)
+                    .fill(tint)
+                    .frame(width: fillW, height: bodyH - inset * 2)
+                    .offset(x: originX + inset, y: originY + inset)
+
+                RoundedRectangle(cornerRadius: capW * 0.4)
+                    .fill(tint)
+                    .frame(width: capW, height: capH)
+                    .offset(x: originX + bodyW + 0.5, y: originY + (bodyH - capH) / 2)
+            }
+        }
+    }
+}
+
+private struct RibbonShape: Shape {
+    let x1: CGFloat
+    let y1a: CGFloat
+    let y1b: CGFloat
+    let x2: CGFloat
+    let y2a: CGFloat
+    let y2b: CGFloat
+
+    func path(in rect: CGRect) -> Path {
+        Path { p in
+            let midX = (x1 + x2) / 2
+            p.move(to: CGPoint(x: x1, y: y1a))
+            p.addCurve(to: CGPoint(x: x2, y: y2a),
+                       control1: CGPoint(x: midX, y: y1a),
+                       control2: CGPoint(x: midX, y: y2a))
+            p.addLine(to: CGPoint(x: x2, y: y2b))
+            p.addCurve(to: CGPoint(x: x1, y: y1b),
+                       control1: CGPoint(x: midX, y: y2b),
+                       control2: CGPoint(x: midX, y: y1b))
+            p.closeSubpath()
         }
     }
 }
