@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import CryptoKit
 import IOKit.ps
 import Shared
 
@@ -279,7 +280,16 @@ final class BatteryMonitor: ObservableObject {
             object: nil, queue: .main
         ) { [weak self] _ in
             guard let self = self, self.isSudoRuleInstalled else { return }
+            // Take the same in-flight token every other SMC dispatch site
+            // uses, so the wake write can't interleave with a concurrent
+            // timer-refresh dispatch. If one is already in flight, skip —
+            // its completion refresh() re-runs the state machine anyway.
+            guard !self.autoManageInFlight else {
+                NSLog("Ampere: System wake — SMC op in flight, deferring to refresh")
+                return
+            }
             NSLog("Ampere: System wake — re-asserting SMC state")
+            self.autoManageInFlight = true
 
             // Capture all state on main queue to avoid cross-queue reads.
             let activeDischarging = self.activeDischarging
@@ -307,12 +317,18 @@ final class BatteryMonitor: ObservableObject {
                             NSLog("Ampere: Wake — watchdog respawn after failed discharge restart also failed")
                         }
                     }
-                    DispatchQueue.main.async { self.refresh() }
+                    DispatchQueue.main.async {
+                        self.autoManageInFlight = false
+                        self.refresh()
+                    }
                     return
                 }
 
                 guard let battery = Self.readBattery() else {
-                    DispatchQueue.main.async { self.refresh() }
+                    DispatchQueue.main.async {
+                        self.autoManageInFlight = false
+                        self.refresh()
+                    }
                     return
                 }
 
@@ -341,6 +357,7 @@ final class BatteryMonitor: ObservableObject {
                 if let op = op {
                     let ok = self.runSMCWrite(op)
                     DispatchQueue.main.async {
+                        self.autoManageInFlight = false
                         // Only mirror the state-machine's decision into
                         // in-memory state if the SMC write actually landed.
                         // Otherwise we'd report "paused" while CHTE still
@@ -355,7 +372,10 @@ final class BatteryMonitor: ObservableObject {
                         self.refresh()
                     }
                 } else {
-                    DispatchQueue.main.async { self.refresh() }
+                    DispatchQueue.main.async {
+                        self.autoManageInFlight = false
+                        self.refresh()
+                    }
                 }
             }
         }
@@ -422,9 +442,13 @@ final class BatteryMonitor: ObservableObject {
     }
 
     /// Compare two dotted version strings (e.g. "0.0.18" > "0.0.17").
-    private static func isNewerVersion(_ remote: String, than current: String) -> Bool {
-        let r = remote.split(separator: ".").compactMap { Int($0) }
-        let c = current.split(separator: ".").compactMap { Int($0) }
+    /// Returns false unless BOTH parse fully as dotted integers: dev builds
+    /// report a git hash ("6d18eea") or describe string ("v0.0.18-3-g6d18eea"),
+    /// and a lenient partial parse would flag every release as an update.
+    /// Internal (not private) so the comparison rules can be pinned by tests.
+    static func isNewerVersion(_ remote: String, than current: String) -> Bool {
+        guard let r = parseDottedVersion(remote),
+              let c = parseDottedVersion(current) else { return false }
         for i in 0 ..< max(r.count, c.count) {
             let rv = i < r.count ? r[i] : 0
             let cv = i < c.count ? c[i] : 0
@@ -432,6 +456,15 @@ final class BatteryMonitor: ObservableObject {
             if rv < cv { return false }
         }
         return false
+    }
+
+    /// "1.2.3" → [1, 2, 3]; nil if any component is non-numeric or the
+    /// string is empty.
+    private static func parseDottedVersion(_ s: String) -> [Int]? {
+        let parts = s.split(separator: ".")
+        guard !parts.isEmpty else { return nil }
+        let nums = parts.compactMap { Int($0) }
+        return nums.count == parts.count ? nums : nil
     }
 
     // MARK: - Sudo Setup
@@ -466,7 +499,14 @@ final class BatteryMonitor: ObservableObject {
         smcQueue.async { [weak self] in
             guard let self = self else { return }
 
+            // Also remove the saved-pmset state dir and any legacy /tmp
+            // markers — the nodischarge below has already restored sleep
+            // settings, so leftover markers would only mislead a future
+            // install into "restoring" values from a stale session.
             let cmd = "rm -f \(Self.shQuote(Self.sudoersPath)) \(Self.shQuote(Self.helperPath))"
+                + " \(Self.shQuote(AppConstants.legacySavedSleepPath))"
+                + " \(Self.shQuote(AppConstants.legacySavedDisplaySleepPath))"
+                + " && rm -rf \(Self.shQuote(AppConstants.stateDirPath))"
 
             // Always clear all SMC state BEFORE removing the helper (need sudo access).
             // Use unconditional writes since in-memory state may not reflect actual SMC state.
@@ -551,10 +591,23 @@ final class BatteryMonitor: ObservableObject {
     /// Install the SMCWriter binary at a root-owned fixed path, plus a sudoers rule.
     /// Shows the native macOS password dialog (one-time).
     private func installSudo() -> Bool {
+        // Digest-pin the sudoers rule to the exact binary being installed. A
+        // path-only NOPASSWD rule trusts whatever sits at helperPath — if the
+        // directory is ever non-root-writable (e.g. a migrated Intel-Homebrew
+        // /usr/local), swapping the binary would grant passwordless root.
+        // sudo verifies the digest on every invocation; a helper update
+        // rewrites the binary and this rule together, so they can't drift.
+        // (cp/xattr/chmod/chown don't alter the data fork, so the digest of
+        // the bundled source equals the digest of the installed copy.)
+        guard let helperData = try? Data(contentsOf: URL(fileURLWithPath: smcWriterPath)) else {
+            NSLog("Ampere: bundled SMCWriter unreadable at %@ — cannot install", smcWriterPath)
+            return false
+        }
+        let digest = SHA256.hash(data: helperData).map { String(format: "%02x", $0) }.joined()
         let writer = Self.shQuote(smcWriterPath)
         let helper = Self.shQuote(Self.helperPath)
         let sudoers = Self.shQuote(Self.sudoersPath)
-        let rule = Self.shQuote("\(NSUserName()) ALL=(root) NOPASSWD: \(Self.helperPath)\n")
+        let rule = Self.shQuote("\(NSUserName()) ALL=(root) NOPASSWD: sha256:\(digest) \(Self.helperPath)\n")
         let cmd = [
             "mkdir -p /usr/local/bin",
             "cp \(writer) \(helper)",
@@ -782,6 +835,16 @@ final class BatteryMonitor: ObservableObject {
         // Auto-manage SMC decisions only apply on AC with auto-manage enabled.
         guard inputs.autoManageEnabled, inputs.adapterConnected else {
             return AutoManageDecision(action: .none, newState: next)
+        }
+
+        // chargeToUpperBound is only meaningful below the upper bound (init
+        // repairs persisted state the same way). A stale true here — e.g. the
+        // toggle flipped from a UI rendered against the previous poll's
+        // reading, just as the battery crossed the bound — would otherwise
+        // make the paused branch below issue a spurious allow at/above the
+        // bound, immediately reverted by an inhibit on the next cycle.
+        if next.chargeToUpperBound, inputs.percentage >= inputs.upperBound {
+            next.chargeToUpperBound = false
         }
 
         if !next.chargingPaused && inputs.percentage >= inputs.upperBound {
@@ -1078,7 +1141,9 @@ final class BatteryMonitor: ObservableObject {
             lastAdapterConnected = decision.newState.lastAdapterConnected
             if chargeToUpperBound != decision.newState.chargeToUpperBound, decision.action == .none {
                 chargeToUpperBound = decision.newState.chargeToUpperBound
-                NSLog("Ampere: Cleared chargeToUpperBound on AC disconnect at %d%%", b.percentage)
+                // Two pure-clear paths: rule 2 (AC disconnect above lower) and
+                // the at/above-upper staleness repair.
+                NSLog("Ampere: Cleared chargeToUpperBound at %d%%", b.percentage)
             }
 
             if autoManageEnabled, b.adapterConnected, lastError != nil { lastError = nil }
@@ -1214,16 +1279,17 @@ final class BatteryMonitor: ObservableObject {
 
         let chteHex = Self.formatHex(chteBytes)
         let chieHex = Self.formatHex(chieBytes)
-        lastHealthCheckTime = Date()
-        lastHealthCheckSMC = "\(SMC.keyChargeTerminate)=\(chteHex)\n\(SMC.keyChargeInhibit)=\(chieHex)"
+        let newSMC = "\(SMC.keyChargeTerminate)=\(chteHex)\n\(SMC.keyChargeInhibit)=\(chieHex)"
+        let newStatus: String
+        var newExpected = ""
+        var newCHTEMatch = true
+        var newCHIEMatch = true
+        let newWarning: String?
         if healthy {
-            lastHealthCheckStatus = "pass"
-            lastHealthCheckExpected = ""
-            lastHealthCheckCHTEMatch = true
-            lastHealthCheckCHIEMatch = true
-            healthWarning = nil
+            newStatus = "pass"
+            newWarning = nil
         } else {
-            lastHealthCheckStatus = "FAIL"
+            newStatus = "FAIL"
             let expected = Self.expectedSMCValues(
                 autoManageEnabled: autoManageEnabled,
                 pauseButtonPaused: chargingPaused,
@@ -1234,14 +1300,38 @@ final class BatteryMonitor: ObservableObject {
                 activeDischarging: activeDischarging,
                 chargeToUpperBound: chargeToUpperBound
             )
-            lastHealthCheckExpected = "\(SMC.keyChargeTerminate)=\(expected.chte)\n\(SMC.keyChargeInhibit)=\(expected.chie)"
-            lastHealthCheckCHTEMatch = chteHex == expected.chte
-            lastHealthCheckCHIEMatch = chieHex == expected.chie
+            newExpected = "\(SMC.keyChargeTerminate)=\(expected.chte)\n\(SMC.keyChargeInhibit)=\(expected.chie)"
+            newCHTEMatch = chteHex == expected.chte
+            newCHIEMatch = chieHex == expected.chie
             NSLog("Ampere: Health check failed — CHTE=%d CHIE=%d charge=%d%% paused=%d auto=%d discharge=%d bounds=[%d,%d]",
                   chte, chie, battery.percentage, chargingPaused, autoManageEnabled, autoDischargeEnabled,
                   chargeLowerBound, chargeUpperBound)
-            healthWarning = "SMC mismatch — revoke & re-grant admin"
+            newWarning = "SMC mismatch — revoke & re-grant admin"
         }
+
+        // Publishing any of these fires objectWillChange, which redraws the
+        // menu bar and re-renders the (possibly hidden) SwiftUI tree — the
+        // very churn publishStateIfNeeded exists to avoid. When the popover
+        // is hidden and the result is identical to the last check, skip the
+        // publish entirely; only the timestamp would move, and the About
+        // sheet that displays it can't be visible. Opening the popover
+        // triggers an immediate refresh, so the timestamp is fresh by the
+        // time it can be seen.
+        let changed = lastHealthCheckStatus != newStatus
+            || lastHealthCheckSMC != newSMC
+            || lastHealthCheckExpected != newExpected
+            || lastHealthCheckCHTEMatch != newCHTEMatch
+            || lastHealthCheckCHIEMatch != newCHIEMatch
+            || healthWarning != newWarning
+        guard isPopoverVisible || changed else { return }
+
+        lastHealthCheckTime = Date()
+        lastHealthCheckSMC = newSMC
+        lastHealthCheckStatus = newStatus
+        lastHealthCheckExpected = newExpected
+        lastHealthCheckCHTEMatch = newCHTEMatch
+        lastHealthCheckCHIEMatch = newCHIEMatch
+        healthWarning = newWarning
     }
 
     /// Re-run the health check immediately (e.g. after revoke/re-grant admin).

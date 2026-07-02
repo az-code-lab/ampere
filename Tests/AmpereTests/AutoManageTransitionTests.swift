@@ -289,6 +289,47 @@ final class AutoManageTransitionTests: XCTestCase {
         XCTAssertEqual(sim.issued.count, 0, "No SMC action should fire for a valid paused state")
     }
 
+    func testStaleChargeToUpperAtOrAboveUpperBound_ClearsWithoutAllow() {
+        // Race: the user flips "Charge to Upper Bound" from a UI rendered
+        // against the previous poll's reading, just as the battery crosses
+        // the upper bound. The next refresh then sees paused=true, ctu=true,
+        // pct >= upper. Without the staleness repair, the paused branch
+        // would issue a spurious allow at the bound, immediately reverted by
+        // an inhibit on the next cycle. The repair must clear the toggle
+        // with NO SMC action — CHTE is already in the correct inhibit state.
+        for pct in [60, 65] {  // exactly at the bound, and above it
+            let sim = Simulator(
+                chargingPaused: true,
+                chargeToUpperBound: true,
+                lastAdapterConnected: true
+            )
+            let action = sim.step(percentage: pct, adapterConnected: true)
+            XCTAssertEqual(action, .none,
+                           "Stale ctu at \(pct)% must not issue an SMC action")
+            XCTAssertFalse(sim.state.chargeToUpperBound,
+                           "Stale ctu at \(pct)% must be cleared")
+            XCTAssertTrue(sim.state.chargingPaused,
+                          "Inhibited state must be preserved at \(pct)%")
+            sim.stepUntilSettled(percentage: pct, adapterConnected: true)
+            XCTAssertEqual(sim.issued.count, 0,
+                           "The repair must not trigger any allow/inhibit churn")
+        }
+    }
+
+    func testChargeToUpperJustBelowUpperBound_StillAllows() {
+        // Complement of the staleness repair: one percent below the bound
+        // the toggle is legitimate and must still drive the allow branch.
+        let sim = Simulator(
+            chargingPaused: true,
+            chargeToUpperBound: true,
+            lastAdapterConnected: true
+        )
+        let action = sim.step(percentage: 59, adapterConnected: true)
+        XCTAssertEqual(action, .allow)
+        XCTAssertFalse(sim.state.chargingPaused)
+        XCTAssertTrue(sim.state.chargeToUpperBound)
+    }
+
     func testRule3_UserExplicitToggleBetweenBounds_ChargesToUpper() {
         // User in the between-bounds state explicitly sets chargeToUpperBound
         // → must charge to upper bound, then clear the toggle on arrival.

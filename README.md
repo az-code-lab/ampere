@@ -3,9 +3,7 @@
 A lightweight macOS menu bar app for monitoring battery status and controlling charging on Apple Silicon Macs.
 
 <p align="center">
-  <img src="screenshot-auto.png" alt="Ampere — Auto charge mode" height="560">
-  &nbsp;&nbsp;
-  <img src="screenshot-manual.png" alt="Ampere — Manual pause charging" height="560">
+  <img src="ampere.png" alt="Ampere — Auto charge mode" height="560">
 </p>
 
 ## Features
@@ -48,7 +46,7 @@ Download the latest `.dmg` from the [GitHub Releases](https://github.com/az-code
 Pausing/resuming charging requires root access to write to the SMC. Ampere handles this as follows:
 
 1. **On launch** - the app installs (or updates) its helper binary. If the helper is missing or outdated, macOS prompts for your admin password. If cancelled, the app exits.
-2. **Setup** - a compiled helper binary (`SMCWriter`) is installed at `/usr/local/bin/az-ampere-smc` (owned by root), along with a sudoers rule at `/etc/sudoers.d/az-ampere` that allows passwordless execution of the helper.
+2. **Setup** - a compiled helper binary (`SMCWriter`) is installed at `/usr/local/bin/az-ampere-smc` (owned by root), along with a sudoers rule at `/etc/sudoers.d/az-ampere` that allows passwordless execution of the helper. The rule is pinned to the helper's SHA-256 digest, so sudo refuses to run a swapped or tampered binary at that path.
 3. **Subsequent launches** - the helper is verified at startup. If unchanged, no password is needed. After a Homebrew upgrade, the new helper is installed automatically (one password prompt).
 
 ### Auto Charge Management
@@ -138,18 +136,20 @@ Or delete `Ampere.app` from Applications.
 
 ### Remove SMCWriter and admin access
 
-Charge control installs two privileged files that persist after the app is deleted:
+Charge control installs privileged files that persist after the app is deleted:
 
 - `/usr/local/bin/az-ampere-smc` - the SMCWriter helper binary (runs as root to write SMC keys)
 - `/etc/sudoers.d/az-ampere` - the sudoers rule that allows passwordless execution of the helper
+- `/Library/Application Support/az-ampere/` - state directory for the saved-sleep markers (only exists if discharge was ever used)
 
-**From the UI:** Click **Revoke Admin Access** in the app's popover panel. This removes both files (prompts for your admin password).
+**From the UI:** Click **Revoke Admin Access** in the app's popover panel. This removes all of them (prompts for your admin password).
 
 **From the command line:**
 
 ```bash
 sudo rm -f /usr/local/bin/az-ampere-smc
 sudo rm -f /etc/sudoers.d/az-ampere
+sudo rm -rf '/Library/Application Support/az-ampere'
 ```
 
 ## Troubleshooting
@@ -226,7 +226,7 @@ With the lid open, the internal display keeps the system awake through the brief
 
 **`pmset -a sleep 0 disablesleep 1`** before the CHIE write. This disables all system sleep at the OS level, preventing macOS from sleeping during the PD disruption.
 
-When discharge is stopped, sleep is restored to the user's original setting via `pmset -a sleep <original> disablesleep 0`. The original sleep value is saved to `/tmp/.az-ampere-saved-sleep` before being overridden.
+When discharge is stopped, sleep is restored to the user's original setting via `pmset -a sleep <original> disablesleep 0`. The original sleep value is saved to `/Library/Application Support/az-ampere/saved-sleep` before being overridden. The marker deliberately lives outside `/tmp`: macOS wipes `/tmp` at boot while `pmset -a` overrides persist across reboots, so a crash + reboot during discharge would otherwise lose the saved value and leave sleep permanently disabled. With the persistent marker, the next launch's cleanup finds it and restores the original setting. (Markers written to the legacy `/tmp` location by older builds are still honored.)
 
 ### Watchdog Daemon
 

@@ -29,6 +29,17 @@ BUILD_DIR="/tmp/${SCHEME}Build"
 APP_DIR="$BUILD_DIR/$SCHEME.app"
 DMG_PATH="/tmp/${SCHEME}.dmg"
 
+cd "$REPO_DIR"
+
+echo "==> Verifying clean working tree..."
+if ! git diff --quiet HEAD; then
+    echo "ERROR: uncommitted changes — commit or stash before releasing"
+    exit 1
+fi
+
+echo "==> Running tests..."
+swift test
+
 echo "==> Tagging v$VERSION..."
 git tag -f "v$VERSION"
 

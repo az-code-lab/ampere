@@ -4,8 +4,17 @@ public enum AppConstants {
     private static let appPrefix = "az-ampere"
     public static let helperPath = "/usr/local/bin/\(appPrefix)-smc"
     public static let sudoersPath = "/etc/sudoers.d/\(appPrefix)"
-    public static let savedSleepPath = "/tmp/.\(appPrefix)-saved-sleep"
-    public static let savedDisplaySleepPath = "/tmp/.\(appPrefix)-saved-sleep-display"
+    /// Root-owned state directory for the saved-pmset markers. Deliberately
+    /// NOT under /tmp: macOS wipes /tmp at boot, while `pmset -a` overrides
+    /// persist across reboots — a crash + reboot during discharge would lose
+    /// a /tmp marker and strand the user with sleep permanently disabled.
+    public static let stateDirPath = "/Library/Application Support/\(appPrefix)"
+    public static let savedSleepPath = "\(stateDirPath)/saved-sleep"
+    public static let savedDisplaySleepPath = "\(stateDirPath)/saved-sleep-display"
+    /// Legacy marker locations used by older builds. Readers fall back to
+    /// these so an upgrade with a marker still outstanding restores correctly.
+    public static let legacySavedSleepPath = "/tmp/.\(appPrefix)-saved-sleep"
+    public static let legacySavedDisplaySleepPath = "/tmp/.\(appPrefix)-saved-sleep-display"
 }
 
 /// Pack a 4-character SMC key (e.g. "CHTE") into a UInt32 in big-endian

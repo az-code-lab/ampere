@@ -117,34 +117,43 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let hasWarning = monitor.healthWarning != nil
 
         let isAnimatingDown = monitor.activeDischarging
-
-        // Manage animation timer
         let needsAnimation = isCharging || isAnimatingDown
-        if isCharging != lastIconCharging || pct != lastIconPct || hasWarning != lastIconWarning
-            || needsAnimation != (animationTimer != nil) {
-            animationTimer?.invalidate()
-            animationTimer = nil
-            if needsAnimation {
-                animationPct = pct
-                animationTimer = Timer.scheduledTimer(withTimeInterval: 0.6, repeats: true) { [weak self] _ in
-                    guard let self, let button = self.statusItem.button else { return }
-                    let curPct = self.monitor.state?.percentage ?? 0
-                    let target: Int
-                    if self.effectivelyCharging() {
-                        target = self.monitor.autoManageEnabled ? self.monitor.chargeUpperBound : 100
-                        self.animationPct += 5
-                        if self.animationPct > target { self.animationPct = curPct }
-                    } else {
-                        target = self.monitor.chargeUpperBound
-                        self.animationPct -= 5
-                        if self.animationPct < target { self.animationPct = curPct }
-                    }
-                    let warn = self.monitor.healthWarning != nil
-                    button.image = self.buildMenuBarIcon(
-                        percentage: CGFloat(self.animationPct),
-                        hasWarning: warn
-                    )
+
+        // Every @Published change lands here via objectWillChange (health
+        // check timestamps, error strings, …). Skip the NSImage rebuild when
+        // nothing the menu bar renders has changed and the animation timer
+        // already matches the desired state — the timer redraws animated
+        // frames on its own.
+        if pct == lastIconPct, isCharging == lastIconCharging, hasWarning == lastIconWarning,
+           needsAnimation == (animationTimer != nil) {
+            return
+        }
+
+        // Reset the animation timer — the early return above is the exact
+        // complement of the old "did anything change" condition, so reaching
+        // this point always means the timer needs to be torn down or rebuilt.
+        animationTimer?.invalidate()
+        animationTimer = nil
+        if needsAnimation {
+            animationPct = pct
+            animationTimer = Timer.scheduledTimer(withTimeInterval: 0.6, repeats: true) { [weak self] _ in
+                guard let self, let button = self.statusItem.button else { return }
+                let curPct = self.monitor.state?.percentage ?? 0
+                let target: Int
+                if self.effectivelyCharging() {
+                    target = self.monitor.autoManageEnabled ? self.monitor.chargeUpperBound : 100
+                    self.animationPct += 5
+                    if self.animationPct > target { self.animationPct = curPct }
+                } else {
+                    target = self.monitor.chargeUpperBound
+                    self.animationPct -= 5
+                    if self.animationPct < target { self.animationPct = curPct }
                 }
+                let warn = self.monitor.healthWarning != nil
+                button.image = self.buildMenuBarIcon(
+                    percentage: CGFloat(self.animationPct),
+                    hasWarning: warn
+                )
             }
         }
 
@@ -700,7 +709,12 @@ struct ContentView: View {
                             monitor.chargeToUpperBound = true
                         }
                         monitor.ensureSudoInstalled { ok in
-                            if !ok {
+                            if ok {
+                                // Act on the new mode now (inhibit/allow per
+                                // the state machine) instead of waiting up to
+                                // a poll cycle.
+                                monitor.refresh()
+                            } else {
                                 monitor.autoManageEnabled = false
                                 monitor.lastError = "Admin access required for auto charge management"
                             }
@@ -716,6 +730,12 @@ struct ContentView: View {
                         if monitor.chargingPaused {
                             monitor.toggleCharging()
                         }
+                        // If a discharge is active, refresh()'s
+                        // "!autoManageEnabled" branch stops it (CHIE + sleep
+                        // restore) immediately rather than on the next tick —
+                        // without this, the UI shows manual mode while the
+                        // SMC is still actively discharging.
+                        monitor.refresh()
                     }
                 }
             ))
@@ -756,6 +776,9 @@ struct ContentView: View {
                         get: { monitor.autoDischargeEnabled },
                         set: { newValue in
                             monitor.autoDischargeEnabled = newValue
+                            // Start/stop the discharge now — refresh()'s
+                            // auto-discharge branches handle both directions.
+                            monitor.refresh()
                         }
                     ))
                     .toggleStyle(.switch)
@@ -773,7 +796,11 @@ struct ContentView: View {
                         get: { monitor.chargeToUpperBound },
                         set: { newValue in
                             monitor.chargeToUpperBound = newValue
-                            if !newValue {
+                            if newValue {
+                                // Kick the state machine so charging starts
+                                // now, not on the next poll tick.
+                                monitor.refresh()
+                            } else {
                                 monitor.inhibitCharging()
                             }
                         }

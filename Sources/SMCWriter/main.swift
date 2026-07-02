@@ -126,9 +126,42 @@ func readPmsetValue(_ key: String) -> Int? {
 /// Convenience: read the current `sleep` value.
 func readPmsetSleep() -> Int? { readPmsetValue("sleep") }
 
-/// Path to store the original sleep value for restoration.
-let savedSleepPath = AppConstants.savedSleepPath
-let savedDisplaySleepPath = AppConstants.savedDisplaySleepPath
+/// Marker files storing the pre-override pmset values, checked in order.
+/// The primary location is the persistent state dir (survives reboot); the
+/// legacy /tmp path is still honored so an upgrade that happens while a
+/// marker from an older build is outstanding can restore correctly.
+let savedSleepPaths = [AppConstants.savedSleepPath, AppConstants.legacySavedSleepPath]
+let savedDisplaySleepPaths = [AppConstants.savedDisplaySleepPath, AppConstants.legacySavedDisplaySleepPath]
+
+func markerExists(_ paths: [String]) -> Bool {
+    paths.contains { FileManager.default.fileExists(atPath: $0) }
+}
+
+func readMarker(_ paths: [String]) -> String? {
+    for path in paths {
+        if let value = try? String(contentsOfFile: path, encoding: .utf8) {
+            return value.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+    }
+    return nil
+}
+
+func removeMarkers(_ paths: [String]) {
+    for path in paths { try? FileManager.default.removeItem(atPath: path) }
+}
+
+/// Write a marker to the primary (persistent) path, creating the root-owned
+/// state dir on first use. We run as root, so created files/dirs are
+/// root-owned; 0755 keeps them world-readable (the values are just minutes)
+/// but root-only writable.
+func writeMarker(_ value: Int, to paths: [String]) {
+    let primary = paths[0]
+    let dir = (primary as NSString).deletingLastPathComponent
+    try? FileManager.default.createDirectory(
+        atPath: dir, withIntermediateDirectories: true,
+        attributes: [.posixPermissions: 0o755])
+    try? "\(value)".write(toFile: primary, atomically: true, encoding: .utf8)
+}
 
 /// Prevent or restore system/clamshell sleep using pmset. Requires root.
 @discardableResult
@@ -136,12 +169,11 @@ func setDischargeSleepPrevention(enabled: Bool) -> Bool {
     if enabled {
         // Save original values before overriding, but only if not already saved
         // (avoids overwriting with already-overridden values on re-entry)
-        let fm = FileManager.default
-        if !fm.fileExists(atPath: savedSleepPath), let original = readPmsetSleep() {
-            try? "\(original)".write(toFile: savedSleepPath, atomically: true, encoding: .utf8)
+        if !markerExists(savedSleepPaths), let original = readPmsetSleep() {
+            writeMarker(original, to: savedSleepPaths)
         }
-        if !fm.fileExists(atPath: savedDisplaySleepPath), let original = readPmsetValue("displaysleep") {
-            try? "\(original)".write(toFile: savedDisplaySleepPath, atomically: true, encoding: .utf8)
+        if !markerExists(savedDisplaySleepPaths), let original = readPmsetValue("displaysleep") {
+            writeMarker(original, to: savedDisplaySleepPaths)
         }
     }
 
@@ -164,18 +196,14 @@ func setDischargeSleepPrevention(enabled: Bool) -> Bool {
             return n >= 0 && n <= 1440
         }
         let originalSleep: String
-        if let saved = try? String(contentsOfFile: savedSleepPath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
-           !saved.isEmpty, validPmsetMinutes(saved) {
+        if let saved = readMarker(savedSleepPaths), !saved.isEmpty, validPmsetMinutes(saved) {
             originalSleep = saved
-            try? FileManager.default.removeItem(atPath: savedSleepPath)
         } else {
             originalSleep = "10"
         }
         let originalDisplaySleep: String
-        if let saved = try? String(contentsOfFile: savedDisplaySleepPath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
-           !saved.isEmpty, validPmsetMinutes(saved) {
+        if let saved = readMarker(savedDisplaySleepPaths), !saved.isEmpty, validPmsetMinutes(saved) {
             originalDisplaySleep = saved
-            try? FileManager.default.removeItem(atPath: savedDisplaySleepPath)
         } else {
             originalDisplaySleep = "10"
         }
@@ -190,6 +218,16 @@ func setDischargeSleepPrevention(enabled: Bool) -> Bool {
         if task.terminationStatus != 0 {
             fputs("WARNING: pmset exited with status \(task.terminationStatus)\n", stderr)
             return false
+        }
+        if !enabled {
+            // Markers are consumed only after pmset succeeds — a failed
+            // restore keeps the originals in place so the watchdog or a
+            // later nodischarge can retry with the real values instead of
+            // falling back to the 10/10 defaults. (The previous code also
+            // left an *invalid* marker in place forever; now any marker is
+            // cleared once a restore has actually landed.)
+            removeMarkers(savedSleepPaths)
+            removeMarkers(savedDisplaySleepPaths)
         }
         return true
     } catch {
@@ -326,11 +364,11 @@ if action.hasPrefix("watchdog:") {
                 _ = smcWriteKey(conn, SMC.keyChargeTerminate, SMC.chteAllow)
                 IOServiceClose(conn)
             }
-            // Only restore pmset if the save file shows we previously
+            // Only restore pmset if a save marker shows we previously
             // overrode it (i.e. discharge was active). If the app died
             // without ever enabling discharge, blindly running pmset would
             // overwrite the user's actual sleep setting with our fallback.
-            if FileManager.default.fileExists(atPath: savedSleepPath) {
+            if markerExists(savedSleepPaths) {
                 // Wait for PD renegotiation to settle before restoring sleep
                 sleep(3)
                 _ = setDischargeSleepPrevention(enabled: false)
@@ -391,12 +429,12 @@ case "nodischarge":
         fputs("WARNING: failed to run pkill: \(error.localizedDescription)\n", stderr)
     }
 
-    // Use the save-sleep file as the marker for "we previously overrode
-    // pmset" instead of reading CHIE — if the SMC read fails, defaulting to
+    // Use the save-sleep marker for "we previously overrode pmset" instead
+    // of reading CHIE — if the SMC read fails, defaulting to
     // wasDischarging=false would silently strand the user with sleep=0.
-    // The save file is reliably written before the CHIE=0x08 write and
+    // The marker is reliably written before the CHIE=0x08 write and
     // cleaned up by setDischargeSleepPrevention(false).
-    let saveFileExists = FileManager.default.fileExists(atPath: savedSleepPath)
+    let saveFileExists = markerExists(savedSleepPaths)
     if smcWriteKey(conn, SMC.keyChargeInhibit, SMC.chieNormal) {
         if saveFileExists {
             // Wait for USB-C PD renegotiation to complete before re-enabling
