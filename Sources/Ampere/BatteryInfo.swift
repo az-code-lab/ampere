@@ -53,8 +53,19 @@ final class BatteryMonitor: ObservableObject {
     @Published var lastHealthCheckCHTEMatch: Bool = true
     @Published var lastHealthCheckCHIEMatch: Bool = true
     @Published var lastHealthCheckTime: Date?
-    @Published var updateAvailable: String?  // nil = no update, otherwise the new version string
+    /// nil = no update; otherwise the newer release advertised by the
+    /// Homebrew cask, carrying everything installUpdate needs to fetch and
+    /// verify the DMG (see Updater.swift).
+    @Published var updateAvailable: AvailableUpdate?
+    /// Lifecycle of an in-flight click-to-update install (see Updater.swift).
+    @Published var updateState: UpdateState = .idle
     @Published var isPopoverVisible: Bool = false
+    /// True while a sheet (About) is presented over the panel.
+    /// Pure UI state like `isPopoverVisible` — not persisted. While true the
+    /// popover must not close: tearing down an NSPopover underneath an
+    /// attached SwiftUI sheet strands the sheet's presentation state, and
+    /// the reopened panel sits behind an invisible modal, dead to clicks.
+    @Published var sheetVisible: Bool = false
 
     @Published var autoManageEnabled: Bool {
         didSet {
@@ -85,6 +96,11 @@ final class BatteryMonitor: ObservableObject {
 
     private var timer: Timer?
     private var updateCheckTimer: Timer?
+    // Self-update plumbing, used by the extension in Updater.swift. Not
+    // `private`: stored properties can't live in a cross-file extension,
+    // but the logic that touches them does.
+    var updateDownloadTask: URLSessionDownloadTask?
+    var updateProgressObservation: NSKeyValueObservation?
     private var terminationObserver: NSObjectProtocol?
     private var wakeObserver: NSObjectProtocol?
     private var autoManageInFlight = false
@@ -384,6 +400,7 @@ final class BatteryMonitor: ObservableObject {
     deinit {
         timer?.invalidate()
         updateCheckTimer?.invalidate()
+        updateDownloadTask?.cancel()
         if let observer = terminationObserver {
             NotificationCenter.default.removeObserver(observer)
         }
@@ -424,17 +441,27 @@ final class BatteryMonitor: ObservableObject {
         let task = URLSession.shared.dataTask(with: Self.caskURL) { [weak self] data, _, error in
             guard let self, error == nil,
                   let data, let content = String(data: data, encoding: .utf8) else { return }
-            // Parse: version "X.Y.Z" from the cask file
-            guard let range = content.range(of: #"version\s+"([^"]+)""#, options: .regularExpression),
-                  let versionRange = content[range].range(of: #""([^"]+)""#, options: .regularExpression) else { return }
-            let remote = String(content[versionRange]).trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+            guard let update = Self.parseCask(content) else { return }
             let current = AppVersion.current.trimmingCharacters(in: CharacterSet(charactersIn: "v"))
             DispatchQueue.main.async {
-                if Self.isNewerVersion(remote, than: current) {
-                    self.updateAvailable = remote
-                    NSLog("Ampere: Update available: %@ → %@", current, remote)
+                // Never mutate updateAvailable under an in-flight install —
+                // installUpdate captured its own copy, but the UI's progress
+                // row keys off this property.
+                switch self.updateState {
+                case .downloading, .installing: return
+                case .idle, .failed: break
+                }
+                if Self.isNewerVersion(update.version, than: current) {
+                    if self.updateAvailable != update {
+                        self.updateAvailable = update
+                        // A .failed from an older offer doesn't apply to this
+                        // one; keep it only while the same update is retried.
+                        self.updateState = .idle
+                        NSLog("Ampere: Update available: %@ → %@", current, update.version)
+                    }
                 } else {
                     self.updateAvailable = nil
+                    self.updateState = .idle
                 }
             }
         }

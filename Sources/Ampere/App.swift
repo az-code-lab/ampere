@@ -21,6 +21,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     // spawn-watchdog), ~1-2s total. Holding off on it until the status bar
     // item exists lets the icon appear immediately on launch.
     private var monitor: BatteryMonitor!
+    private var registration: RegistrationManager!
+    // Registration lives in a real window, not a sheet on the popover:
+    // sheets over the popover's non-activating panel never reliably regain
+    // key status after the app loses and regains focus, leaving their text
+    // fields without an insertion point. A plain window gets standard
+    // click-to-activate/key behavior.
+    private var registrationWindow: NSWindow?
+    private var registrationShowObserver: NSObjectProtocol?
     private var pinnedObserver: AnyCancellable?
     private var stateObserver: AnyCancellable?
     private var mouseMonitor: Any?
@@ -44,6 +52,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // button with no action and are no-ops, which is the right behavior
         // until the popover is wired up below.
         monitor = BatteryMonitor()
+        registration = RegistrationManager()
 
         // 3. Wire the button to togglePopover and refresh the icon with real
         // data. Done after monitor is ready so updateMenuBarIcon can read it.
@@ -55,16 +64,28 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         // Create popover with the battery panel
         popover = NSPopover()
-        popover.contentSize = NSSize(width: 580, height: 606)
+        popover.contentSize = NSSize(width: 580, height: 632)
         popover.behavior = .transient
         popover.delegate = self
         popover.contentViewController = NSHostingController(
-            rootView: ContentView(monitor: monitor)
+            rootView: ContentView(monitor: monitor, registration: registration)
         )
 
-        // Observe pinned state to change popover behavior
-        pinnedObserver = monitor.$pinned.sink { [weak self] pinned in
-            self?.popover.behavior = pinned ? .applicationDefined : .transient
+        // Keep popover behavior in sync: transient (auto-closes on outside
+        // clicks / app deactivation) only while neither pinned nor showing a
+        // sheet. A visible sheet pins the popover open exactly like the pin
+        // button — see BatteryMonitor.sheetVisible for why closing under a
+        // sheet must never happen.
+        pinnedObserver = monitor.$pinned.combineLatest(monitor.$sheetVisible)
+            .sink { [weak self] pinned, sheetVisible in
+                self?.popover.behavior = (pinned || sheetVisible) ? .applicationDefined : .transient
+            }
+
+        // The panel's Registration row posts this; the window is owned here.
+        registrationShowObserver = NotificationCenter.default.addObserver(
+            forName: .ampereShowRegistrationWindow, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.showRegistrationWindow()
         }
 
         // Update menu bar icon whenever monitor state changes
@@ -173,6 +194,36 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         button.attributedTitle = NSAttributedString(string: " \(pct)%", attributes: titleAttrs)
     }
 
+    private func showRegistrationWindow() {
+        // Already open: just bring it forward — replacing the content view
+        // mid-flight would wipe whatever the user has typed.
+        if let window = registrationWindow, window.isVisible {
+            NSApp.activate(ignoringOtherApps: true)
+            window.makeKeyAndOrderFront(nil)
+            return
+        }
+        popover.performClose(nil)
+        let window = registrationWindow ?? {
+            let window = NSWindow(contentRect: .zero,
+                                  styleMask: [.titled, .closable],
+                                  backing: .buffered, defer: false)
+            window.title = "Ampere Registration"
+            // Reused across opens; a fresh RegistrationView is installed
+            // each time below so the form starts clean.
+            window.isReleasedWhenClosed = false
+            registrationWindow = window
+            return window
+        }()
+        window.contentViewController = NSHostingController(
+            rootView: RegistrationView(registration: registration) { [weak self] in
+                self?.registrationWindow?.close()
+            }
+        )
+        window.center()
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+    }
+
     @objc private func togglePopover() {
         guard let button = statusItem.button else { return }
         if popover.isShown {
@@ -187,6 +238,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     func popoverShouldDetach(_ popover: NSPopover) -> Bool {
         true
+    }
+
+    func popoverShouldClose(_ popover: NSPopover) -> Bool {
+        // Refuse every close request while a sheet is up — including the
+        // programmatic performClose from togglePopover (menu bar icon click).
+        // The sheet must be dismissed first; then the popover closes normally.
+        !monitor.sheetVisible
     }
 
     func popoverDidDetach(_ popover: NSPopover) {
@@ -229,6 +287,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // automatically when this AppDelegate's stored properties go out of
         // scope, so no explicit .cancel() needed here.
         animationTimer?.invalidate()
+        if let registrationShowObserver {
+            NotificationCenter.default.removeObserver(registrationShowObserver)
+        }
         if let mouseMonitor = mouseMonitor {
             NSEvent.removeMonitor(mouseMonitor)
         }
@@ -284,6 +345,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
 struct ContentView: View {
     @ObservedObject var monitor: BatteryMonitor
+    @ObservedObject var registration: RegistrationManager
     // Display preferences persist across restarts per CLAUDE.md requirement 3.
     // showAbout / launchAtLogin remain @State: the former is sheet visibility,
     // the latter is derived from SMAppService and isn't a user preference.
@@ -312,6 +374,11 @@ struct ContentView: View {
         }
         .frame(width: 580)
         .background(Color(.windowBackgroundColor))
+        .onChange(of: showAbout) {
+            // Mirror sheet visibility into the monitor so AppDelegate keeps
+            // the popover from closing (and breaking) underneath the sheet.
+            monitor.sheetVisible = showAbout
+        }
     }
 
     // MARK: - Battery View
@@ -383,6 +450,9 @@ struct ContentView: View {
             }
             .padding(.horizontal, 16)
 
+            // Registration status
+            registrationRow()
+
             Divider().padding(.horizontal).padding(.top, 8)
 
             // Footer actions
@@ -396,11 +466,8 @@ struct ContentView: View {
                     .buttonStyle(.plain)
                 }
                 Spacer()
-                if let newVersion = monitor.updateAvailable {
-                    Image(systemName: "arrow.up.circle.fill")
-                        .font(.system(size: 12))
-                        .foregroundColor(.orange)
-                        .help("Update available: \(AppVersion.current) → \(newVersion)")
+                if let update = monitor.updateAvailable {
+                    updateControl(update)
                 }
                 Button("About") {
                     showAbout = true
@@ -827,6 +894,71 @@ struct ContentView: View {
                 }
                 .buttonStyle(ChargeButtonStyle(color: .orange))
             }
+        }
+        .padding(.horizontal, 16)
+    }
+
+    // MARK: - Registration
+
+    /// Footer control for a pending update. Idle/failed → a clickable
+    /// "Update to X" button (failed adds a warning icon whose tooltip carries
+    /// the error and the brew fallback); while working → progress text. The
+    /// install quits and relaunches the app, which is the same
+    /// persisted-state path as a normal quit/restart.
+    @ViewBuilder
+    private func updateControl(_ update: AvailableUpdate) -> some View {
+        switch monitor.updateState {
+        case .downloading(let fraction):
+            Text("Downloading… \(Int((fraction * 100).rounded()))%")
+                .font(.system(size: 12))
+                .foregroundColor(.secondary)
+        case .installing:
+            Text("Installing…")
+                .font(.system(size: 12))
+                .foregroundColor(.secondary)
+        case .idle, .failed:
+            HStack(spacing: 4) {
+                if case .failed(let message) = monitor.updateState {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 12))
+                        .foregroundColor(.orange)
+                        .help("Update failed: \(message)\n\nFallback: brew upgrade --cask ampere")
+                }
+                Button {
+                    monitor.installUpdate()
+                } label: {
+                    HStack(spacing: 3) {
+                        Image(systemName: "arrow.up.circle.fill")
+                        Text("Update to \(update.version)")
+                    }
+                }
+                .font(.system(size: 12))
+                .foregroundColor(.orange)
+                .buttonStyle(.plain)
+                .help("Download v\(update.version), verify, install, and relaunch. Currently on \(AppVersion.current).")
+            }
+        }
+    }
+
+    private func registrationRow() -> some View {
+        HStack {
+            Image(systemName: registration.isRegistered ? "checkmark.seal.fill" : "xmark.seal.fill")
+                .font(.system(size: 14))
+                .foregroundColor(registration.isRegistered ? .accentColor : .orange)
+            Text("Registration")
+                .font(.system(size: 13, weight: .semibold))
+            Spacer()
+            Button(action: {
+                NotificationCenter.default.post(name: .ampereShowRegistrationWindow, object: nil)
+            }) {
+                Text(registration.isRegistered ? registration.email : "Unregistered")
+                    .font(.system(size: 12))
+                    .foregroundColor(registration.isRegistered ? .secondary : .orange)
+            }
+            .buttonStyle(.plain)
+            .help(registration.isRegistered
+                ? "Registered to \(registration.email) — click to manage"
+                : "Unregistered — click to enter your registration key")
         }
         .padding(.horizontal, 16)
     }
@@ -1513,6 +1645,171 @@ struct BatteryRangeSlider: View {
                                 upper = snap(min(100, max(raw, lower + minGap)))
                             }
                     )
+            }
+        }
+    }
+}
+
+// MARK: - Registration Window
+
+extension Notification.Name {
+    /// Posted by the panel's Registration row; AppDelegate owns the window.
+    static let ampereShowRegistrationWindow = Notification.Name("ampere.showRegistrationWindow")
+}
+
+/// Content of the standalone registration window. A fresh instance is
+/// installed on every open, so state resets and `onAppear` prefills reliably.
+struct RegistrationView: View {
+    @ObservedObject var registration: RegistrationManager
+    var close: () -> Void
+
+    @State private var emailInput = ""
+    @State private var keyInput = ""
+    private enum Field: Hashable { case email, key }
+    @FocusState private var focus: Field?
+    @State private var lastFocus: Field = .email
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if registration.isRegistered {
+                HStack(spacing: 6) {
+                    Image(systemName: "checkmark.seal.fill")
+                        .foregroundColor(.green)
+                    Text("Registered to \(registration.email)")
+                        .font(.system(size: 12, weight: .semibold))
+                }
+                if let error = registration.lastError {
+                    Text(error)
+                        .font(.system(size: 12))
+                        .foregroundColor(.red)
+                }
+                Divider()
+                Text("Deregistering frees the key so it can be registered on another Mac.")
+                    .font(.system(size: 12))
+                    .foregroundColor(.secondary)
+                HStack {
+                    Button(registration.isBusy ? "Deregistering…" : "Deregister This Mac") {
+                        registration.deregister { _ in }
+                    }
+                    .disabled(registration.isBusy)
+                    Spacer()
+                    Button("Done") { close() }
+                        .keyboardShortcut(.defaultAction)
+                }
+            } else {
+                Text("Enter the email you purchased with and your registration key to activate Ampere on this Mac.")
+                    .font(.system(size: 12))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                TextField("Email", text: $emailInput)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 12))
+                    .focused($focus, equals: .email)
+                TextField("Registration Key", text: $keyInput)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 12, design: .monospaced))
+                    .focused($focus, equals: .key)
+                if let error = registration.lastError {
+                    Text(error)
+                        .font(.system(size: 12))
+                        .foregroundColor(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                HStack {
+                    Spacer()
+                    Button("Cancel") { close() }
+                        .keyboardShortcut(.cancelAction)
+                    Button(registration.isBusy ? "Registering…" : "Register") {
+                        registration.register(email: emailInput, key: keyInput) { _ in }
+                    }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(registration.isBusy
+                        || emailInput.trimmingCharacters(in: .whitespaces).isEmpty
+                        || keyInput.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+            }
+        }
+        .textSelection(.enabled)
+        .padding(20)
+        .frame(width: 340)
+        .onChange(of: focus) {
+            if let focus { lastFocus = focus }
+        }
+        .background(SheetKeyActivator {
+            guard !registration.isRegistered else { return }
+            // Focus is torn down while the app is inactive, and re-setting
+            // the same FocusState value is a no-op — bounce through nil so
+            // SwiftUI re-establishes the first responder.
+            focus = nil
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                focus = lastFocus
+            }
+        })
+        .onAppear {
+            emailInput = registration.email
+            keyInput = registration.licenseKey
+            registration.lastError = nil
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                if !registration.isRegistered { focus = .email }
+            }
+        }
+    }
+}
+
+// MARK: - Sheet Key Activator
+
+/// Keeps the hosting window key while it's on screen. Accessory-app windows
+/// don't always become key when shown or when the app regains focus, which
+/// leaves text fields without a blinking insertion point and Return-key
+/// shortcuts dead. Drop into the root view's background; `onReactivate`
+/// fires after key status is re-asserted so the host can restore focus.
+struct SheetKeyActivator: NSViewRepresentable {
+    /// Called after key status is re-asserted on app reactivation, so the
+    /// host view can restore field focus (SwiftUI tears down the first
+    /// responder while the app is inactive; key status alone won't bring
+    /// the insertion point back).
+    var onReactivate: (() -> Void)? = nil
+
+    func makeNSView(context: Context) -> NSView {
+        let view = KeyGrabView()
+        view.onReactivate = onReactivate
+        return view
+    }
+    func updateNSView(_ nsView: NSView, context: Context) {
+        (nsView as? KeyGrabView)?.onReactivate = onReactivate
+    }
+
+    private class KeyGrabView: NSView {
+        var onReactivate: (() -> Void)?
+        private var activationObserver: NSObjectProtocol?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if let activationObserver {
+                NotificationCenter.default.removeObserver(activationObserver)
+                self.activationObserver = nil
+            }
+            guard let window else { return }
+            NSApp.activate(ignoringOtherApps: true)
+            window.makeKey()
+            activationObserver = NotificationCenter.default.addObserver(
+                forName: NSApplication.didBecomeActiveNotification,
+                object: NSApp, queue: .main
+            ) { [weak self] _ in
+                // Let AppKit finish its own post-activation key-window
+                // juggling first — it hands key back to the popover's
+                // panel, and an immediate makeKey here would lose the race.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                    guard let self, let window = self.window else { return }
+                    window.makeKey()
+                    self.onReactivate?()
+                }
+            }
+        }
+
+        deinit {
+            if let activationObserver {
+                NotificationCenter.default.removeObserver(activationObserver)
             }
         }
     }

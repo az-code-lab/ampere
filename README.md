@@ -15,10 +15,11 @@ A lightweight macOS menu bar app for monitoring battery status and controlling c
 - **Charge to upper bound** - explicitly allow charging from the current level to the upper bound
 - **Discharge to upper bound** - optionally drain the battery to the target level while on AC power
 - **Health check** - periodically verifies SMC state matches expected values
-- **Update notifications** - checks for new versions via Homebrew cask
+- **In-app updates** - checks the Homebrew cask for new versions about once a day; click **Update to X** in the panel to download, verify, install, and relaunch
 - **Menu bar icon** - battery shape with live charge level and animated fill when charging or discharging
 - **Pinnable popover** - pin the panel to keep it open while you work
 - **Launch at login** - start automatically when you log in
+- **Registration** - register with an email and registration key, bound to this Mac; the panel shows "Unregistered" until then. The registration is re-verified against the license server about once a day — network failures never clear it — and can be deregistered from the panel to move the key to another Mac.
 
 ## Requirements
 
@@ -110,6 +111,18 @@ The app polls battery state on a timer. Health checks run every poll cycle after
 \* The cycle counter is global and does not reset when switching between fast and slow polling. If the app has already been running, the first health check after opening the popover depends on the current cycle count.
 
 Health checks also run immediately after revoking or re-granting admin access, so the warning clears (or appears) without waiting for the next scheduled check.
+
+### Updates
+
+The app checks the Homebrew cask for a newer version 5 minutes after launch and about once a day after that. When one is found, the footer shows an **Update to X** button. Clicking it:
+
+1. Downloads the release DMG from GitHub Releases (progress shown in the footer).
+2. Verifies the download: SHA-256 must match the cask, the code signature must be intact, and the Team ID must match the running app.
+3. Swaps the new bundle into place (two atomic renames) and relaunches.
+
+The relaunch takes the normal quit → restart path: SMC overrides are restored on the way down, and persisted state (auto charge management, bounds, an in-progress charge/discharge to upper bound) resumes in the new copy. If the bundled SMCWriter changed, the next launch asks for your admin password once to install the new helper — same as after a Homebrew upgrade.
+
+If any step fails (e.g. the install location isn't writable), the error is shown next to the button and nothing is changed; `brew upgrade --cask ampere` always works as a fallback. Updating in-app leaves Homebrew's recorded version behind until the next `brew upgrade`, which harmlessly reinstalls the current release.
 
 ## Build from Source
 
