@@ -16,7 +16,7 @@ A lightweight macOS menu bar app for monitoring battery status and controlling c
 - **Discharge to upper bound** - optionally drain the battery to the target level while on AC power
 - **Health check** - periodically verifies SMC state matches expected values
 - **In-app updates** - checks the Homebrew cask for new versions about once a day; click **Update to X** in the panel to download, verify, install, and relaunch
-- **Menu bar icon** - battery shape with live charge level and animated fill when charging or discharging
+- **Menu bar icon** - battery shape with live charge level and animated fill when charging or discharging; the percent readout beside it can be hidden (Settings → Percent in Menu Bar) for a narrower menu bar footprint
 - **Pinnable popover** - pin the panel to keep it open while you work
 - **Launch at login** - start automatically when you log in
 - **Registration** - register with an email and registration key, bound to this Mac; the panel shows "Unregistered" until then. The registration is re-verified against the license server about once a day — network failures never clear it — and can be deregistered from the panel to move the key to another Mac.
@@ -97,9 +97,11 @@ When auto charge management is off and a power adapter is connected, a manual **
 
 The app periodically verifies that the actual SMC key values (`CHTE` and `CHIE`) match the expected state. If a mismatch is detected, a warning is shown in the popover and the menu bar battery icon turns orange.
 
+Health checks only run while a power adapter is connected — on battery the app is not managing charging, so there is no expected SMC state to verify. Until the first check of a session has run, the About panel shows the check as **waiting for power adapter** (on battery) or **pending** (plugged in, during the warm-up below).
+
 #### Polling and Health Check Timing
 
-The app polls battery state on a timer. Health checks run every poll cycle after an initial 3-cycle warm-up (to let launch cleanup settle).
+The app polls battery state on a timer. Health checks run every poll cycle after an initial 3-cycle warm-up (to let launch cleanup settle), whenever a power adapter is connected.
 
 |  | Popover closed (slow) | Popover open (fast) |
 |---|---|---|
@@ -110,7 +112,7 @@ The app polls battery state on a timer. Health checks run every poll cycle after
 
 \* The cycle counter is global and does not reset when switching between fast and slow polling. If the app has already been running, the first health check after opening the popover depends on the current cycle count.
 
-Health checks also run immediately after revoking or re-granting admin access, so the warning clears (or appears) without waiting for the next scheduled check.
+Health checks also run immediately after revoking admin access, and after re-granting it from inside the app (when enabling a charge-control feature reinstalls the helper), so the warning clears (or appears) without waiting for the next scheduled check. After an app relaunch — including the revoke → relaunch → re-grant flow — the first check follows the normal warm-up schedule above.
 
 ### Updates
 

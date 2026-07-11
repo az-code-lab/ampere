@@ -44,6 +44,13 @@ final class BatteryMonitor: ObservableObject {
     @Published var chargeToUpperBound: Bool {
         didSet { UserDefaults.standard.set(chargeToUpperBound, forKey: "chargeToUpperBound") }
     }
+    /// Show the "77%" text beside the menu bar battery icon; off = icon
+    /// only, halving the menu bar footprint. Lives here rather than in
+    /// @AppStorage because AppDelegate (not the SwiftUI tree) renders the
+    /// menu bar item and needs a change signal via objectWillChange.
+    @Published var showMenuBarPercent: Bool {
+        didSet { UserDefaults.standard.set(showMenuBarPercent, forKey: "showMenuBarPercent") }
+    }
     @Published var lastError: String?
     @Published var pinned: Bool = false
     @Published var healthWarning: String?
@@ -151,6 +158,8 @@ final class BatteryMonitor: ObservableObject {
         let autoManage = defaults.bool(forKey: "autoManageEnabled")
         self.autoManageEnabled = autoManage
         self.autoDischargeEnabled = defaults.bool(forKey: "autoDischargeEnabled")
+        // Default true (shown) — bool(forKey:) would read a missing key as false.
+        self.showMenuBarPercent = defaults.object(forKey: "showMenuBarPercent") as? Bool ?? true
         let originalLower = defaults.object(forKey: "chargeLowerBound") as? Int
         let originalUpper = defaults.object(forKey: "chargeUpperBound") as? Int
         var lower = originalLower ?? 40
@@ -1316,7 +1325,10 @@ final class BatteryMonitor: ObservableObject {
     private func performHealthCheck(battery: BatteryState) {
         guard let chteBytes = Self.smcReadKey(SMC.keyChargeTerminate), chteBytes.count == 4,
               let chieBytes = Self.smcReadKey(SMC.keyChargeInhibit), chieBytes.count == 1 else {
-            // Cannot read SMC — preserve any existing warning rather than clearing it
+            // Cannot read SMC — preserve any existing warning rather than
+            // clearing it. Log it: without this the check silently never
+            // completes and About shows "pending" with no clue why.
+            NSLog("Ampere: Health check skipped — CHTE/CHIE read failed")
             return
         }
 

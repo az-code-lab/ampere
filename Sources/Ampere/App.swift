@@ -115,6 +115,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var lastIconPct: Int = -1
     private var lastIconCharging: Bool = false
     private var lastIconWarning: Bool = false
+    private var lastIconShowPct: Bool = true
+    private var lastIconPanelAnchored: Bool = false
+    /// Whether the last rendered title occupied its full width (visible or
+    /// clear glyphs, as opposed to the empty icon-only title).
+    private var lastTitleWide = true
+    /// True while the popover is (or is about to be) anchored to the status
+    /// item — set before showing, cleared on close/detach. While set, the
+    /// item width may grow but never shrink; see the title logic in
+    /// updateMenuBarIcon.
+    private var panelAnchored = false
     private var animationTimer: Timer?
     private var animationPct: Int = 0
 
@@ -136,6 +146,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let pct = monitor.state?.percentage ?? 0
         let isCharging = effectivelyCharging()
         let hasWarning = monitor.healthWarning != nil
+        let showPct = monitor.showMenuBarPercent
 
         let isAnimatingDown = monitor.activeDischarging
         let needsAnimation = isCharging || isAnimatingDown
@@ -146,6 +157,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // already matches the desired state — the timer redraws animated
         // frames on its own.
         if pct == lastIconPct, isCharging == lastIconCharging, hasWarning == lastIconWarning,
+           showPct == lastIconShowPct, panelAnchored == lastIconPanelAnchored,
            needsAnimation == (animationTimer != nil) {
             return
         }
@@ -181,17 +193,36 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         lastIconPct = pct
         lastIconCharging = isCharging
         lastIconWarning = hasWarning
+        lastIconShowPct = showPct
+        lastIconPanelAnchored = panelAnchored
 
         let displayPct = needsAnimation ? animationPct : pct
         button.image = buildMenuBarIcon(
             percentage: CGFloat(displayPct),
             hasWarning: hasWarning
         )
-        let titleAttrs: [NSAttributedString.Key: Any] = hasWarning
-            ? [.font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular),
-               .foregroundColor: NSColor.systemOrange]
-            : [.font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)]
-        button.attributedTitle = NSAttributedString(string: " \(pct)%", attributes: titleAttrs)
+        // Menu bar items resize from the LEFT edge, so narrowing this item
+        // drags the icon — and the panel anchored to it — sideways. While
+        // the panel is anchored the width may therefore grow (percent
+        // toggled on: it must, to fit the text) but never shrink: hiding
+        // renders the same glyphs in clear color, which reflects instantly
+        // at identical width, and the item narrows once the panel closes.
+        let wide = showPct || (panelAnchored && lastTitleWide)
+        lastTitleWide = wide
+        if wide {
+            var titleAttrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+            ]
+            if !showPct {
+                titleAttrs[.foregroundColor] = NSColor.clear
+            } else if hasWarning {
+                titleAttrs[.foregroundColor] = NSColor.systemOrange
+            }
+            button.attributedTitle = NSAttributedString(string: " \(pct)%", attributes: titleAttrs)
+        } else {
+            // Icon-only mode: a health warning still shows via the orange icon.
+            button.attributedTitle = NSAttributedString(string: "")
+        }
     }
 
     private func showRegistrationWindow() {
@@ -230,6 +261,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             popover.performClose(nil)
         } else {
             monitor.setFastPolling(true)
+            // Set before the pre-show render: the width-shrink deferral in
+            // updateMenuBarIcon must be active from the first anchored frame.
+            panelAnchored = true
             updateMenuBarIcon()
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             NSApp.activate(ignoringOtherApps: true)
@@ -256,6 +290,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // fast polling staying on until the next app launch — invisible
         // battery drain is a lesser evil than the popover the user just
         // explicitly detached vanishing under them.
+        // The detached window floats free of the status item, so item
+        // resizes can't move it — release the deferred width shrink now.
+        panelAnchored = false
+        updateMenuBarIcon()
         monitor.pinned = true
         // Observe the detached window closing — popoverDidClose only fires
         // during the detach transition, NOT when the detached window is closed.
@@ -280,6 +318,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         guard !popover.isDetached else { return }
         monitor.pinned = false
         monitor.setFastPolling(false)
+        // Nothing is anchored to the item anymore — release the deferred
+        // width shrink (this is where the item narrows when the percent
+        // was hidden while the panel was open).
+        panelAnchored = false
+        updateMenuBarIcon()
     }
 
     deinit {
@@ -441,6 +484,7 @@ struct ContentView: View {
             if settingsExpanded {
                 autoManageToggle()
                 launchAtLoginRow()
+                menuBarPercentRow()
                 registrationRow()
             }
 
@@ -508,10 +552,27 @@ struct ContentView: View {
                     HStack(spacing: 4) {
                         Text("Health check:")
                             .font(.system(size: 12))
-                        Text(monitor.lastHealthCheckStatus)
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundColor(monitor.lastHealthCheckStatus == "pass" ? .green
-                                : monitor.lastHealthCheckStatus == "FAIL" ? .red : .primary)
+                        // Health checks only run while an adapter is connected
+                        // (see the gate in refresh()), so on battery "pending"
+                        // would never resolve — say what it's waiting for.
+                        if monitor.lastHealthCheckStatus == "pending",
+                           monitor.state?.adapterConnected != true {
+                            Text("waiting for power adapter")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundColor(.secondary)
+                        } else {
+                            Text(monitor.lastHealthCheckStatus)
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundColor(monitor.lastHealthCheckStatus == "pass" ? .green
+                                    : monitor.lastHealthCheckStatus == "FAIL" ? .red : .primary)
+                        }
+                        Spacer()
+                        Link(destination: URL(string: "https://amperebattery.app/tech.html#health")!) {
+                            Image(systemName: "info.circle")
+                                .font(.system(size: 12))
+                                .foregroundColor(.secondary)
+                        }
+                        .help("How health checks work — opens amperebattery.app")
                     }
                     if monitor.lastHealthCheckStatus == "FAIL" {
                         let expectedLines = monitor.lastHealthCheckExpected.split(separator: "\n", omittingEmptySubsequences: false)
@@ -535,7 +596,7 @@ struct ContentView: View {
                                 expectedValue: String(expectedLines.count > 1 ? expectedLines[1] : ""),
                                 actualValue: String(actualLines.count > 1 ? actualLines[1] : ""))
                         }
-                    } else {
+                    } else if !monitor.lastHealthCheckSMC.isEmpty {
                         Text(monitor.lastHealthCheckSMC)
                             .font(.system(size: 12, design: .monospaced))
                     }
@@ -543,7 +604,12 @@ struct ContentView: View {
                         .font(.system(size: 12))
                         .foregroundColor(.secondary)
                     Divider()
-                    Text("Requires admin privileges for charge control.")
+                    // Reflect the actual grant state — a static "requires
+                    // admin privileges" line reads as an error when access
+                    // is already granted.
+                    Text(monitor.isSudoRuleInstalled
+                        ? "Admin access granted for charge control."
+                        : "Requires admin privileges for charge control.")
                         .font(.system(size: 12))
                         .foregroundColor(.secondary)
                     HStack {
@@ -785,6 +851,9 @@ struct ContentView: View {
                     Image(systemName: "arrow.right.circle.fill")
                         .font(.system(size: 12))
                         .foregroundColor(launchAtLogin ? .accentColor : .secondary)
+                    Image(systemName: "percent")
+                        .font(.system(size: 12))
+                        .foregroundColor(monitor.showMenuBarPercent ? .accentColor : .secondary)
                     Image(systemName: registration.isRegistered ? "checkmark.seal.fill" : "xmark.seal.fill")
                         .font(.system(size: 12))
                         .foregroundColor(registration.isRegistered ? .accentColor : .orange)
@@ -817,6 +886,25 @@ struct ContentView: View {
                 }
         }
         .padding(.horizontal, 16)
+    }
+
+    private func menuBarPercentRow() -> some View {
+        HStack {
+            Image(systemName: "percent")
+                .font(.system(size: 14))
+                .foregroundColor(monitor.showMenuBarPercent ? .accentColor : .secondary)
+            Text("Percent in Menu Bar")
+                .font(.system(size: 13, weight: .semibold))
+            Spacer()
+            Toggle("", isOn: Binding(
+                get: { monitor.showMenuBarPercent },
+                set: { monitor.showMenuBarPercent = $0 }
+            ))
+            .toggleStyle(.switch)
+            .controlSize(.small)
+        }
+        .padding(.horizontal, 16)
+        .help("Show the charge percentage next to the battery icon in the menu bar; off shows the icon only (the freed space is reclaimed when this panel closes)")
     }
 
     private func autoManageToggle() -> some View {
