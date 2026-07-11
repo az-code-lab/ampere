@@ -41,8 +41,8 @@ func smcWriteKey(_ conn: io_connect_t, _ key: String, _ bytes: [UInt8]) -> Bool 
 
     let dataType = outputStruct.keyInfo.dataType
     let dataSize = outputStruct.keyInfo.dataSize
-    // Symmetric bounds check with smcReadKey — a malformed dataSize > 32
-    // would overrun the bytes tuple in the write loop below.
+    // Bounds check (same guard as the app-side smcReadKey) — a malformed
+    // dataSize > 32 would overrun the bytes tuple in the write loop below.
     guard dataSize > 0, dataSize <= SMCKeyData.bytesCapacity else { return false }
 
     inputStruct = SMCKeyData()
@@ -65,66 +65,55 @@ func smcWriteKey(_ conn: io_connect_t, _ key: String, _ bytes: [UInt8]) -> Bool 
     return result == kIOReturnSuccess
 }
 
-func smcReadKey(_ conn: io_connect_t, _ key: String) -> [UInt8]? {
-    let smcKey = smcFourCharCode(key)
-    let inputSize = MemoryLayout<SMCKeyData>.size
-    var outputSize = MemoryLayout<SMCKeyData>.size
-
-    // Get key info
-    var input = SMCKeyData()
-    var output = SMCKeyData()
-    input.key = smcKey
-    input.data8 = SMCCmd.readKeyInfo
-    guard IOConnectCallStructMethod(conn, SMCCmd.userClientSelector, &input, inputSize, &output, &outputSize) == kIOReturnSuccess else { return nil }
-
-    let dataSize = output.keyInfo.dataSize
-    guard dataSize > 0, dataSize <= SMCKeyData.bytesCapacity else { return nil }
-
-    // Read value
-    input = SMCKeyData()
-    input.key = smcKey
-    input.keyInfo.dataSize = dataSize
-    input.data8 = SMCCmd.readKey
-    output = SMCKeyData()
-    outputSize = MemoryLayout<SMCKeyData>.size
-    guard IOConnectCallStructMethod(conn, SMCCmd.userClientSelector, &input, inputSize, &output, &outputSize) == kIOReturnSuccess else { return nil }
-
-    var raw = output.bytes
-    return withUnsafeBytes(of: &raw) { Array($0.prefix(Int(dataSize))) }
-}
+// (No smcReadKey here: the helper only writes. Reads live in the app,
+// which doesn't need root for them.)
 
 // MARK: - Sleep control
 
-/// Read a pmset value by key name (e.g. "sleep", "displaysleep").
-func readPmsetValue(_ key: String) -> Int? {
+/// Run pmset with the given arguments, discarding output. Returns success.
+func runPmset(_ arguments: [String]) -> Bool {
     let task = Process()
     task.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
-    task.arguments = ["-g"]
-    let pipe = Pipe()
-    task.standardOutput = pipe
+    task.arguments = arguments
+    task.standardInput = FileHandle.nullDevice
+    task.standardOutput = FileHandle.nullDevice
     task.standardError = FileHandle.nullDevice
     do {
         try task.run()
         task.waitUntilExit()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        guard let output = String(data: data, encoding: .utf8) else { return nil }
-        for line in output.components(separatedBy: "\n") {
-            // .whitespacesAndNewlines so a stray \r from CRLF-style output
-            // doesn't end up attached to the value, making Int() fail.
-            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.hasPrefix(key) {
-                let parts = trimmed.split(separator: " ")
-                if parts.count >= 2, parts[0] == Substring(key), let val = Int(parts[1]) {
-                    return val
-                }
-            }
+        if task.terminationStatus != 0 {
+            fputs("WARNING: pmset \(arguments.joined(separator: " ")) exited with status \(task.terminationStatus)\n", stderr)
+            return false
         }
-    } catch {}
-    return nil
+        return true
+    } catch {
+        fputs("WARNING: Failed to run pmset: \(error.localizedDescription)\n", stderr)
+        return false
+    }
 }
 
-/// Convenience: read the current `sleep` value.
-func readPmsetSleep() -> Int? { readPmsetValue("sleep") }
+/// Read `pmset -g custom` (the stored per-profile settings — Battery Power
+/// and AC Power sections). This is the save-side source: `pmset -g` only
+/// shows the *active* profile, and saving that single value then restoring
+/// it with `-a` would blanket the AC value over the user's Battery-profile
+/// settings.
+func readPmsetCustomOutput() -> String? {
+    let task = Process()
+    task.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
+    task.arguments = ["-g", "custom"]
+    let pipe = Pipe()
+    task.standardInput = FileHandle.nullDevice
+    task.standardOutput = pipe
+    task.standardError = FileHandle.nullDevice
+    do {
+        try task.run()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        task.waitUntilExit()
+        return String(data: data, encoding: .utf8)
+    } catch {
+        return nil
+    }
+}
 
 /// Marker files storing the pre-override pmset values, checked in order.
 /// The primary location is the persistent state dir (survives reboot); the
@@ -153,87 +142,93 @@ func removeMarkers(_ paths: [String]) {
 /// Write a marker to the primary (persistent) path, creating the root-owned
 /// state dir on first use. We run as root, so created files/dirs are
 /// root-owned; 0755 keeps them world-readable (the values are just minutes)
-/// but root-only writable.
-func writeMarker(_ value: Int, to paths: [String]) {
+/// but root-only writable. Returns success — a marker that failed to land
+/// must abort the discharge (see setDischargeSleepPrevention).
+func writeMarker(_ value: String, to paths: [String]) -> Bool {
     let primary = paths[0]
     let dir = (primary as NSString).deletingLastPathComponent
     try? FileManager.default.createDirectory(
         atPath: dir, withIntermediateDirectories: true,
         attributes: [.posixPermissions: 0o755])
-    try? "\(value)".write(toFile: primary, atomically: true, encoding: .utf8)
+    do {
+        try value.write(toFile: primary, atomically: true, encoding: .utf8)
+        return true
+    } catch {
+        fputs("WARNING: failed to write marker \(primary): \(error.localizedDescription)\n", stderr)
+        return false
+    }
+}
+
+/// Capture the pre-override per-profile values for `key` into its marker.
+/// Returns false when the values can't be parsed out of the `pmset -g
+/// custom` output or the marker can't be written.
+func savePmsetMarker(key: String, paths: [String], customOutput: String?) -> Bool {
+    guard let output = customOutput,
+          let values = PmsetState.profileValues(forKey: key, inCustomOutput: output)
+    else { return false }
+    return writeMarker(PmsetState.markerString(values), to: paths)
+}
+
+/// Read a marker back as per-profile values, falling back to 10/10 (≈ the
+/// macOS factory default, rather than 1 min) when it's missing, unparseable,
+/// or out of pmset's accepted range — a wiped save file must not strand the
+/// user with a Mac that sleeps after 60 seconds.
+func restoredPmsetValues(_ paths: [String]) -> PmsetProfileValues {
+    if let raw = readMarker(paths), let values = PmsetState.parseMarker(raw),
+       PmsetState.validMinutes(values.battery), PmsetState.validMinutes(values.ac) {
+        return values
+    }
+    return PmsetProfileValues(battery: 10, ac: 10)
 }
 
 /// Prevent or restore system/clamshell sleep using pmset. Requires root.
+///
+/// The override still uses `-a` (sleep must be prevented, period), but the
+/// originals are captured and restored PER PROFILE (`-b` / `-c`): discharge
+/// always runs on AC, so the previous single-value save captured the AC
+/// profile and its `-a` restore stamped that value over the user's Battery
+/// profile too.
 @discardableResult
 func setDischargeSleepPrevention(enabled: Bool) -> Bool {
     if enabled {
-        // Save original values before overriding, but only if not already saved
-        // (avoids overwriting with already-overridden values on re-entry)
-        if !markerExists(savedSleepPaths), let original = readPmsetSleep() {
-            writeMarker(original, to: savedSleepPaths)
-        }
-        if !markerExists(savedDisplaySleepPaths), let original = readPmsetValue("displaysleep") {
-            writeMarker(original, to: savedDisplaySleepPaths)
-        }
-    }
-
-    let task = Process()
-    task.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
-    if enabled {
-        // Disable both system sleep and display sleep to prevent clamshell issues
-        task.arguments = ["-a", "sleep", "0", "disablesleep", "1", "displaysleep", "0"]
-    } else {
-        // Restore original values
-        // Fallbacks if the saved-original files are missing/unreadable: pick
-        // values close to the macOS factory defaults (sleep=10min, displaysleep=10min)
-        // rather than 1min, so a wiped save file doesn't strand the user with
-        // a Mac that sleeps after 60 seconds.
-        // Validate: pmset rejects the *entire* command atomically if any arg
-        // is invalid, which would leave disablesleep=1 stuck. Accept only
-        // 0–1440 (= up to 24h, well past any sensible user setting).
-        func validPmsetMinutes(_ s: String) -> Bool {
-            guard let n = Int(s) else { return false }
-            return n >= 0 && n <= 1440
-        }
-        let originalSleep: String
-        if let saved = readMarker(savedSleepPaths), !saved.isEmpty, validPmsetMinutes(saved) {
-            originalSleep = saved
-        } else {
-            originalSleep = "10"
-        }
-        let originalDisplaySleep: String
-        if let saved = readMarker(savedDisplaySleepPaths), !saved.isEmpty, validPmsetMinutes(saved) {
-            originalDisplaySleep = saved
-        } else {
-            originalDisplaySleep = "10"
-        }
-        task.arguments = ["-a", "sleep", originalSleep, "disablesleep", "0", "displaysleep", originalDisplaySleep]
-    }
-    task.standardInput = FileHandle.nullDevice
-    task.standardOutput = FileHandle.nullDevice
-    task.standardError = FileHandle.nullDevice
-    do {
-        try task.run()
-        task.waitUntilExit()
-        if task.terminationStatus != 0 {
-            fputs("WARNING: pmset exited with status \(task.terminationStatus)\n", stderr)
+        // Save originals before overriding — only markers that don't already
+        // exist (re-entry must not overwrite the genuine originals with
+        // already-overridden values). Refuse to proceed if a needed marker
+        // can't be captured: overriding without one would strand the user —
+        // the restore paths (nodischarge, watchdog) skip pmset when no
+        // marker exists, and the next save would then capture the
+        // *overridden* values as "original", making sleep=0 permanent.
+        let needSleep = !markerExists(savedSleepPaths)
+        let needDisplay = !markerExists(savedDisplaySleepPaths)
+        let customOutput = (needSleep || needDisplay) ? readPmsetCustomOutput() : nil
+        if needSleep, !savePmsetMarker(key: "sleep", paths: savedSleepPaths,
+                                       customOutput: customOutput) {
+            fputs("ERROR: cannot save original sleep values — refusing to override sleep\n", stderr)
             return false
         }
-        if !enabled {
-            // Markers are consumed only after pmset succeeds — a failed
-            // restore keeps the originals in place so the watchdog or a
-            // later nodischarge can retry with the real values instead of
-            // falling back to the 10/10 defaults. (The previous code also
-            // left an *invalid* marker in place forever; now any marker is
-            // cleared once a restore has actually landed.)
-            removeMarkers(savedSleepPaths)
-            removeMarkers(savedDisplaySleepPaths)
+        if needDisplay, !savePmsetMarker(key: "displaysleep", paths: savedDisplaySleepPaths,
+                                         customOutput: customOutput) {
+            fputs("ERROR: cannot save original displaysleep values — refusing to override sleep\n", stderr)
+            return false
         }
-        return true
-    } catch {
-        fputs("WARNING: Failed to run pmset: \(error.localizedDescription)\n", stderr)
-        return false
+        // Disable both system sleep and display sleep to prevent clamshell issues
+        return runPmset(["-a", "sleep", "0", "disablesleep", "1", "displaysleep", "0"])
     }
+
+    // Restore the original values per profile, then clear disablesleep.
+    let sleep = restoredPmsetValues(savedSleepPaths)
+    let display = restoredPmsetValues(savedDisplaySleepPaths)
+    let okBattery = runPmset(["-b", "sleep", "\(sleep.battery)", "displaysleep", "\(display.battery)"])
+    let okAC = runPmset(["-c", "sleep", "\(sleep.ac)", "displaysleep", "\(display.ac)"])
+    let okDisable = runPmset(["-a", "disablesleep", "0"])
+    guard okBattery && okAC && okDisable else { return false }
+    // Markers are consumed only after every pmset call succeeds — a failed
+    // restore keeps the originals in place so the watchdog or a later
+    // nodischarge can retry with the real values instead of falling back
+    // to the 10/10 defaults.
+    removeMarkers(savedSleepPaths)
+    removeMarkers(savedDisplaySleepPaths)
+    return true
 }
 
 // MARK: - Main
@@ -256,10 +251,19 @@ func spawnWatchdog(appPID: Int32) -> Bool {
     posix_spawn_file_actions_addopen(&fileActions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0)
     posix_spawn_file_actions_addopen(&fileActions, STDERR_FILENO, "/dev/null", O_WRONLY, 0)
 
+    // Detach into its own session (setsid): otherwise the watchdog inherits
+    // the app's process group, and a terminal Ctrl+C (dev runs via run.sh)
+    // delivers SIGINT to the whole foreground group — killing the watchdog
+    // at the same instant as the app it exists to clean up after.
+    var spawnAttrs: posix_spawnattr_t?
+    posix_spawnattr_init(&spawnAttrs)
+    posix_spawnattr_setflags(&spawnAttrs, Int16(POSIX_SPAWN_SETSID))
+
     let arg0 = strdup(execPath)!
     let arg1 = strdup("watchdog:\(appPID)")!
     var args: [UnsafeMutablePointer<CChar>?] = [arg0, arg1, nil]
-    let result = posix_spawn(&spawnPid, execPath, &fileActions, nil, &args, nil)
+    let result = posix_spawn(&spawnPid, execPath, &fileActions, &spawnAttrs, &args, nil)
+    posix_spawnattr_destroy(&spawnAttrs)
     posix_spawn_file_actions_destroy(&fileActions)
     free(arg0)
     free(arg1)

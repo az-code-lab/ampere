@@ -50,6 +50,8 @@ Pausing/resuming charging requires root access to write to the SMC. Ampere handl
 2. **Setup** - a compiled helper binary (`SMCWriter`) is installed at `/usr/local/bin/az-ampere-smc` (owned by root), along with a sudoers rule at `/etc/sudoers.d/az-ampere` that allows passwordless execution of the helper. The rule is pinned to the helper's SHA-256 digest, so sudo refuses to run a swapped or tampered binary at that path.
 3. **Subsequent launches** - the helper is verified at startup. If unchanged, no password is needed. After a Homebrew upgrade, the new helper is installed automatically (one password prompt).
 
+> **Note:** Admin access is granted per macOS user account — the sudoers rule names the account that installed it. If another account on the same Mac grants access, the rule is rewritten for that account, and the first account will be prompted for its password again on its next launch.
+
 ### Auto Charge Management
 
 When enabled, the app automatically manages charging between configurable bounds:
@@ -72,6 +74,8 @@ This ensures charge cycles are always full (lower → upper) rather than fragmen
 When the battery is above the upper bound, this toggle appears. When enabled, the app actively discharges the battery down to the upper bound, rather than waiting for passive drain under load.
 
 **Note:** While discharge is active, system sleep is temporarily disabled (displayed as a warning in the UI). Sleep is restored immediately when discharge stops (either by reaching the target or toggling off). If the app is force-killed or crashes, a watchdog daemon automatically cleans up within a few seconds.
+
+When a discharge stops, the app explicitly re-writes the charging-inhibit key: on some Macs the firmware clears it while discharge is active, and without the re-write charging would silently resume past the upper bound.
 
 #### Charge to Upper Bound
 
@@ -239,9 +243,11 @@ With the lid open, the internal display keeps the system awake through the brief
 
 #### Solution
 
-**`pmset -a sleep 0 disablesleep 1`** before the CHIE write. This disables all system sleep at the OS level, preventing macOS from sleeping during the PD disruption.
+**`pmset -a sleep 0 disablesleep 1 displaysleep 0`** before the CHIE write. This disables all system sleep at the OS level, preventing macOS from sleeping during the PD disruption.
 
-When discharge is stopped, sleep is restored to the user's original setting via `pmset -a sleep <original> disablesleep 0`. The original sleep value is saved to `/Library/Application Support/az-ampere/saved-sleep` before being overridden. The marker deliberately lives outside `/tmp`: macOS wipes `/tmp` at boot while `pmset -a` overrides persist across reboots, so a crash + reboot during discharge would otherwise lose the saved value and leave sleep permanently disabled. With the persistent marker, the next launch's cleanup finds it and restores the original setting. (Markers written to the legacy `/tmp` location by older builds are still honored.)
+Because the `-a` override stamps **all** power profiles, the original `sleep` and `displaysleep` values are captured per profile (Battery and AC, from `pmset -g custom`) before the override, and restored per profile (`pmset -b` / `pmset -c`) when discharge stops — a user with different battery-vs-AC sleep settings gets both back exactly. If the originals cannot be captured (pmset unreadable, marker unwritable), the discharge refuses to start rather than override sleep with no way to restore it.
+
+The saved values live in `/Library/Application Support/az-ampere/saved-sleep` (and `saved-sleep-display`). The markers deliberately live outside `/tmp`: macOS wipes `/tmp` at boot while `pmset -a` overrides persist across reboots, so a crash + reboot during discharge would otherwise lose the saved values and leave sleep permanently disabled. With the persistent markers, the next launch's cleanup finds them and restores the original settings. (Single-value markers written by older builds — including to the legacy `/tmp` location — are still honored; their one value is applied to both profiles, matching what those builds' `-a` restore did.)
 
 ### Watchdog Daemon
 
@@ -255,7 +261,7 @@ A **watchdog daemon** is always running while the app is active. It is spawned v
    - Restores sleep settings via `pmset` — only if the save-sleep marker file exists (i.e. discharge had been active and overrode pmset); otherwise leaves the user's sleep settings untouched
    - Exits cleanly (no orphaned processes, no leftover files)
 
-The watchdog must be spawned with `posix_spawn` (not `fork`) because the Swift/ObjC runtime is not fork-safe — forked children crash when using Foundation, IOKit, or Objective-C APIs. Similarly, signal handlers (`SIGTERM`/`SIGHUP`) cannot be used for cleanup because they can only call async-signal-safe C functions, not Swift/Foundation/IOKit APIs.
+The watchdog must be spawned with `posix_spawn` (not `fork`) because the Swift/ObjC runtime is not fork-safe — forked children crash when using Foundation, IOKit, or Objective-C APIs. Similarly, signal handlers (`SIGTERM`/`SIGHUP`) cannot be used for cleanup because they can only call async-signal-safe C functions, not Swift/Foundation/IOKit APIs. It is spawned with `POSIX_SPAWN_SETSID` so it runs in its own session: without that it would share the app's foreground process group, and a terminal Ctrl+C (dev runs via `run.sh`) would SIGINT the watchdog at the same instant as the app it exists to clean up after.
 
 On app launch, any orphaned watchdog processes from a previous crash are killed via `pkill`, and CHIE/sleep settings are cleared. CHTE is set to inhibit only when auto charge management is enabled, the battery is at or above the lower bound, AND no in-progress charge-to-upper-bound is being resumed (i.e. `chargeToUpperBound` is not persisted as `true`); otherwise CHTE is cleared. A fresh watchdog is then spawned.
 

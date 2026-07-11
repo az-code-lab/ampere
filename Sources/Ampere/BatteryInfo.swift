@@ -286,17 +286,23 @@ final class BatteryMonitor: ObservableObject {
             guard let self = self else { return }
             guard self.chargingPaused || self.activeDischarging else { return }
 
+            // Capture on the main thread; the block below runs on smcQueue.
+            let wasDischarging = self.activeDischarging
             let done = DispatchSemaphore(value: 0)
             self.smcQueue.async {
                 // Always restore system defaults on quit.
                 // Use runSMCWriteViaSudo directly to avoid stopDischarge()
                 // spawning a redundant watchdog during shutdown.
-                if self.activeDischarging {
+                if wasDischarging {
                     _ = self.runSMCWriteViaSudo("nodischarge")
                 }
-                if self.chargingPaused {
-                    _ = self.runSMCWriteViaSudo("allow")
-                }
+                // CHTE=allow unconditionally (not just when chargingPaused):
+                // a discharge can be active before the state machine has
+                // marked chargingPaused, and firmware on some Macs flips
+                // CHTE during discharge — either way, quit must leave the
+                // system at its default. nodischarge above pkills the
+                // watchdog, so nothing re-cleans after we exit.
+                _ = self.runSMCWriteViaSudo("allow")
 
                 done.signal()
             }
@@ -1104,9 +1110,22 @@ final class BatteryMonitor: ObservableObject {
         // adapter=false, where the chargingPaused-gated cleanup would miss it.
         if activeDischarging, let b = battery, !b.adapterConnected, !autoManageInFlight {
             autoManageInFlight = true
+            // Some Macs' firmware auto-clears CHTE while CHIE=0x08 is active
+            // (see healthCheckAutoMode), so the pre-discharge inhibit may be
+            // gone by the time the discharge stops. Re-assert CHTE explicitly
+            // after every stop — the state machine won't: it trusts
+            // chargingPaused, which still says inhibited. Without this,
+            // affected Macs resume charging past the upper bound and the
+            // discharge re-triggers, oscillating around the bound forever.
+            // In manual mode (auto-manage just turned off) the desired state
+            // is allow: the UI's disable handler resumes charging.
+            let reassert: SMCWriteOp = (autoManageEnabled && chargingPaused) ? .inhibit : .allow
             smcQueue.async { [weak self] in
                 guard let self = self else { return }
                 let ok = self.runSMCWrite(.nodischarge)
+                if ok, !self.runSMCWrite(reassert) {
+                    NSLog("Ampere: CHTE re-assert after discharge stop failed")
+                }
                 DispatchQueue.main.async {
                     self.autoManageInFlight = false
                     if ok {
@@ -1122,9 +1141,15 @@ final class BatteryMonitor: ObservableObject {
         // Stop discharge if the toggle was turned off or auto-manage was disabled
         if activeDischarging && (!autoDischargeEnabled || !autoManageEnabled) && !autoManageInFlight {
             autoManageInFlight = true
+            // Firmware may have cleared CHTE during discharge — re-assert.
+            // See the adapter-disconnect stop above for the full rationale.
+            let reassert: SMCWriteOp = (autoManageEnabled && chargingPaused) ? .inhibit : .allow
             smcQueue.async { [weak self] in
                 guard let self = self else { return }
                 let ok = self.runSMCWrite(.nodischarge)
+                if ok, !self.runSMCWrite(reassert) {
+                    NSLog("Ampere: CHTE re-assert after discharge stop failed")
+                }
                 DispatchQueue.main.async {
                     self.autoManageInFlight = false
                     if ok {
@@ -1176,9 +1201,15 @@ final class BatteryMonitor: ObservableObject {
             } else if activeDischarging && b.percentage <= chargeUpperBound {
                 autoManageInFlight = true
                 let upper = chargeUpperBound
+                // Firmware may have cleared CHTE during discharge — re-assert.
+                // See the adapter-disconnect stop above for the full rationale.
+                let reassert: SMCWriteOp = (autoManageEnabled && chargingPaused) ? .inhibit : .allow
                 smcQueue.async { [weak self] in
                     guard let self = self else { return }
                     let ok = self.runSMCWrite(.nodischarge)
+                    if ok, !self.runSMCWrite(reassert) {
+                        NSLog("Ampere: CHTE re-assert after discharge stop failed")
+                    }
                     DispatchQueue.main.async {
                         self.autoManageInFlight = false
                         if ok {
@@ -1286,7 +1317,7 @@ final class BatteryMonitor: ObservableObject {
                         batteryAgeYears: b.batteryAgeYears, batteryAgeDays: b.batteryAgeDays
                     )
                 }
-            } else if !autoManageEnabled {
+            } else if !autoManageEnabled, !autoManageInFlight {
                 // Manual mode: clear inhibit/discharge so charging works
                 // when plugged back in. Only mirror the state mutation into
                 // memory after the SMC writes land — same gating as the
@@ -1294,12 +1325,17 @@ final class BatteryMonitor: ObservableObject {
                 // SMC-write failure would leave the in-memory state lying
                 // (UI says "not paused" while CHTE is still inhibit), and
                 // refresh's state machine wouldn't reconcile in manual mode.
+                // Takes the same in-flight token as every other SMC dispatch
+                // site so it can't interleave with the wake handler's
+                // re-assert; if one is in flight, the next tick retries.
                 chargeToUpperBound = false  // in-memory only; safe to clear unconditionally
+                autoManageInFlight = true
                 smcQueue.async { [weak self] in
                     guard let self = self else { return }
                     let okAllow = self.runSMCWrite(.allow)
                     let okNoDischarge = self.runSMCWrite(.nodischarge)
                     DispatchQueue.main.async {
+                        self.autoManageInFlight = false
                         if okAllow { self.chargingPaused = false }
                         if okNoDischarge { self.activeDischarging = false }
                     }
@@ -1637,7 +1673,11 @@ final class BatteryMonitor: ObservableObject {
     func toggleCharging() {
         let shouldPause = !chargingPaused
         if shouldPause {
-            guard let state = state, state.adapterConnected else {
+            // Fresh read rather than the published `state`: with the popover
+            // closed the snapshot can be a full slow-poll interval (60s) old
+            // and miss a just-unplugged adapter. Fall back to the snapshot
+            // if the fresh read fails.
+            guard let battery = Self.readBattery() ?? state, battery.adapterConnected else {
                 lastError = Self.noAdapterError
                 return
             }
