@@ -59,6 +59,13 @@ final class BatteryMonitor: ObservableObject {
     @Published var updateAvailable: AvailableUpdate?
     /// Lifecycle of an in-flight click-to-update install (see Updater.swift).
     @Published var updateState: UpdateState = .idle
+    /// Feedback for a user-initiated "Check for Updates" click. Automatic
+    /// (daily) checks stay silent and never touch this.
+    enum ManualUpdateCheck { case none, checking, upToDate, failed }
+    @Published var manualUpdateCheck: ManualUpdateCheck = .none
+    /// Invalidates the delayed reset of an outcome when a newer manual
+    /// check starts before the previous outcome's text has cleared.
+    private var manualCheckGeneration = 0
     @Published var isPopoverVisible: Bool = false
     /// True while a sheet (About) is presented over the panel.
     /// Pure UI state like `isPopoverVisible` — not persisted. While true the
@@ -437,18 +444,48 @@ final class BatteryMonitor: ObservableObject {
         }
     }
 
-    private func checkForUpdate() {
+    /// User-initiated check from the footer button: same fetch as the daily
+    /// check, but reports its outcome through manualUpdateCheck.
+    func checkForUpdateNow() {
+        manualCheckGeneration += 1
+        manualUpdateCheck = .checking
+        checkForUpdate(manual: true)
+    }
+
+    /// Publish a manual-check outcome; transient outcomes clear after a few
+    /// seconds unless a newer manual check has started since.
+    private func finishManualCheck(_ outcome: ManualUpdateCheck) {
+        manualUpdateCheck = outcome
+        guard outcome != .none else { return }
+        let generation = manualCheckGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
+            guard let self, self.manualCheckGeneration == generation else { return }
+            self.manualUpdateCheck = .none
+        }
+    }
+
+    private func checkForUpdate(manual: Bool = false) {
         let task = URLSession.shared.dataTask(with: Self.caskURL) { [weak self] data, _, error in
-            guard let self, error == nil,
-                  let data, let content = String(data: data, encoding: .utf8) else { return }
-            guard let update = Self.parseCask(content) else { return }
+            guard let self else { return }
+            guard error == nil,
+                  let data, let content = String(data: data, encoding: .utf8),
+                  let update = Self.parseCask(content) else {
+                // Automatic checks fail silently; a clicked check owes the
+                // user an answer.
+                if manual {
+                    DispatchQueue.main.async { self.finishManualCheck(.failed) }
+                }
+                return
+            }
             let current = AppVersion.current.trimmingCharacters(in: CharacterSet(charactersIn: "v"))
             DispatchQueue.main.async {
                 // Never mutate updateAvailable under an in-flight install —
                 // installUpdate captured its own copy, but the UI's progress
                 // row keys off this property.
                 switch self.updateState {
-                case .downloading, .installing: return
+                case .downloading, .installing:
+                    if manual { self.finishManualCheck(.none) }
+                    return
                 case .idle, .failed: break
                 }
                 if Self.isNewerVersion(update.version, than: current) {
@@ -459,9 +496,12 @@ final class BatteryMonitor: ObservableObject {
                         self.updateState = .idle
                         NSLog("Ampere: Update available: %@ → %@", current, update.version)
                     }
+                    // The update row appearing is the answer; no text needed.
+                    if manual { self.finishManualCheck(.none) }
                 } else {
                     self.updateAvailable = nil
                     self.updateState = .idle
+                    if manual { self.finishManualCheck(.upToDate) }
                 }
             }
         }

@@ -356,6 +356,10 @@ struct ContentView: View {
     @AppStorage("ui.rawChargeShowMAh") private var rawChargeShowMAh = false
     @State private var showAbout = false
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
+    // Deliberately @State, not persisted: the settings section starts folded
+    // on every launch, but keeps its state while the app runs (the popover
+    // closing does not recreate this view).
+    @State private var settingsExpanded = false
 
     private var healthCheckTimeString: String {
         guard let time = monitor.lastHealthCheckTime else { return "n/a" }
@@ -430,28 +434,15 @@ struct ContentView: View {
 
             Divider().padding(.horizontal).padding(.top, 8)
 
-            // Auto charge management toggle
-            autoManageToggle()
+            // Settings disclosure: auto charge management, launch at login,
+            // and registration. Always collapsed on a fresh launch.
+            settingsHeader()
 
-            // Launch at login
-            HStack {
-                Image(systemName: "arrow.right.circle.fill")
-                    .font(.system(size: 14))
-                    .foregroundColor(launchAtLogin ? .accentColor : .secondary)
-                Text("Launch at Login")
-                    .font(.system(size: 13, weight: .semibold))
-                Spacer()
-                Toggle("", isOn: $launchAtLogin)
-                    .toggleStyle(.switch)
-                    .controlSize(.small)
-                    .onChange(of: launchAtLogin) {
-                        setLaunchAtLogin(launchAtLogin)
-                    }
+            if settingsExpanded {
+                autoManageToggle()
+                launchAtLoginRow()
+                registrationRow()
             }
-            .padding(.horizontal, 16)
-
-            // Registration status
-            registrationRow()
 
             Divider().padding(.horizontal).padding(.top, 8)
 
@@ -468,6 +459,28 @@ struct ContentView: View {
                 Spacer()
                 if let update = monitor.updateAvailable {
                     updateControl(update)
+                } else {
+                    switch monitor.manualUpdateCheck {
+                    case .none:
+                        Button("Check for Updates") {
+                            monitor.checkForUpdateNow()
+                        }
+                        .font(.system(size: 12))
+                        .foregroundColor(.secondary)
+                        .buttonStyle(.plain)
+                    case .checking:
+                        Text("Checking…")
+                            .font(.system(size: 12))
+                            .foregroundColor(.secondary)
+                    case .upToDate:
+                        Text("Up to Date")
+                            .font(.system(size: 12))
+                            .foregroundColor(.secondary)
+                    case .failed:
+                        Text("Check Failed")
+                            .font(.system(size: 12))
+                            .foregroundColor(.orange)
+                    }
                 }
                 Button("About") {
                     showAbout = true
@@ -751,6 +764,61 @@ struct ContentView: View {
         return String(format: "%.2f V", volts)
     }
 
+    /// Disclosure header for the settings rows. While collapsed it shows
+    /// compact status icons so auto-manage / launch-at-login / registration
+    /// state stays visible at a glance — the registration row is the only
+    /// entry point to the registration window, so its status must not
+    /// disappear entirely when folded.
+    private func settingsHeader() -> some View {
+        Button(action: { settingsExpanded.toggle() }) {
+            HStack {
+                Image(systemName: "gearshape.fill")
+                    .font(.system(size: 14))
+                    .foregroundColor(.secondary)
+                Text("Settings")
+                    .font(.system(size: 13, weight: .semibold))
+                Spacer()
+                if !settingsExpanded {
+                    Image(systemName: "arrow.up.arrow.down.circle.fill")
+                        .font(.system(size: 12))
+                        .foregroundColor(monitor.autoManageEnabled ? .accentColor : .secondary)
+                    Image(systemName: "arrow.right.circle.fill")
+                        .font(.system(size: 12))
+                        .foregroundColor(launchAtLogin ? .accentColor : .secondary)
+                    Image(systemName: registration.isRegistered ? "checkmark.seal.fill" : "xmark.seal.fill")
+                        .font(.system(size: 12))
+                        .foregroundColor(registration.isRegistered ? .accentColor : .orange)
+                }
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(.secondary)
+                    .rotationEffect(.degrees(settingsExpanded ? 90 : 0))
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .padding(.horizontal, 16)
+        .help(settingsExpanded ? "Collapse settings" : "Expand settings")
+    }
+
+    private func launchAtLoginRow() -> some View {
+        HStack {
+            Image(systemName: "arrow.right.circle.fill")
+                .font(.system(size: 14))
+                .foregroundColor(launchAtLogin ? .accentColor : .secondary)
+            Text("Launch at Login")
+                .font(.system(size: 13, weight: .semibold))
+            Spacer()
+            Toggle("", isOn: $launchAtLogin)
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .onChange(of: launchAtLogin) {
+                    setLaunchAtLogin(launchAtLogin)
+                }
+        }
+        .padding(.horizontal, 16)
+    }
+
     private func autoManageToggle() -> some View {
         HStack {
             Image(systemName: "arrow.up.arrow.down.circle.fill")
@@ -951,7 +1019,11 @@ struct ContentView: View {
             Button(action: {
                 NotificationCenter.default.post(name: .ampereShowRegistrationWindow, object: nil)
             }) {
-                Text(registration.isRegistered ? registration.email : "Unregistered")
+                // Licensee name when known; the registration window this
+                // opens shows the email, so the row doesn't need to.
+                Text(registration.isRegistered
+                    ? (registration.name.isEmpty ? registration.email : registration.name)
+                    : "Unregistered")
                     .font(.system(size: 12))
                     .foregroundColor(registration.isRegistered ? .secondary : .orange)
             }
@@ -1675,18 +1747,23 @@ struct RegistrationView: View {
                 HStack(spacing: 6) {
                     Image(systemName: "checkmark.seal.fill")
                         .foregroundColor(.green)
-                    Text("Registered to \(registration.email)")
+                    Text(registration.name.isEmpty
+                        ? "Registered to \(registration.email)"
+                        : "Registered to \(registration.name) (\(registration.email))")
                         .font(.system(size: 12, weight: .semibold))
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 if let error = registration.lastError {
                     Text(error)
                         .font(.system(size: 12))
                         .foregroundColor(.red)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 Divider()
                 Text("Deregistering frees the key so it can be registered on another Mac.")
                     .font(.system(size: 12))
                     .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
                 HStack {
                     Button(registration.isBusy ? "Deregistering…" : "Deregister This Mac") {
                         registration.deregister { _ in }
