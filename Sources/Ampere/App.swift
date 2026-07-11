@@ -403,6 +403,8 @@ struct ContentView: View {
     // on every launch, but keeps its state while the app runs (the popover
     // closing does not recreate this view).
     @State private var settingsExpanded = false
+    @State private var settingsHeaderHovering = false
+    @State private var pinHovering = false
 
     private var healthCheckTimeString: String {
         guard let time = monitor.lastHealthCheckTime else { return "n/a" }
@@ -443,10 +445,13 @@ struct ContentView: View {
                     Button(action: { monitor.pinned.toggle() }) {
                         Image(systemName: monitor.pinned ? "pin.fill" : "pin")
                             .font(.system(size: 12))
-                            .foregroundColor(monitor.pinned ? .accentColor : .secondary)
+                            .foregroundColor(monitor.pinned ? .accentColor : (pinHovering ? .primary : .secondary))
                             .rotationEffect(.degrees(monitor.pinned ? 0 : 45))
                     }
                     .buttonStyle(.plain)
+                    .onHover { pinHovering = $0 }
+                    .animation(.easeOut(duration: 0.15), value: monitor.pinned)
+                    .animation(.easeOut(duration: 0.12), value: pinHovering)
                     .help(monitor.pinned ? "Unpin panel" : "Pin panel open")
                 }
             }
@@ -496,9 +501,7 @@ struct ContentView: View {
                     Button("Revoke Admin Access") {
                         monitor.removeSudoRule()
                     }
-                    .font(.system(size: 12))
-                    .foregroundColor(.secondary)
-                    .buttonStyle(.plain)
+                    .buttonStyle(FooterButtonStyle())
                 }
                 Spacer()
                 if let update = monitor.updateAvailable {
@@ -509,9 +512,7 @@ struct ContentView: View {
                         Button("Check for Updates") {
                             monitor.checkForUpdateNow()
                         }
-                        .font(.system(size: 12))
-                        .foregroundColor(.secondary)
-                        .buttonStyle(.plain)
+                        .buttonStyle(FooterButtonStyle())
                     case .checking:
                         Text("Checking…")
                             .font(.system(size: 12))
@@ -529,15 +530,11 @@ struct ContentView: View {
                 Button("About") {
                     showAbout = true
                 }
-                .font(.system(size: 12))
-                .foregroundColor(.secondary)
-                .buttonStyle(.plain)
+                .buttonStyle(FooterButtonStyle())
                 Button("Quit") {
                     NSApp.terminate(nil)
                 }
-                .font(.system(size: 12))
-                .foregroundColor(.secondary)
-                .buttonStyle(.plain)
+                .buttonStyle(FooterButtonStyle())
             }
             .padding(.horizontal, 16)
             .padding(.top, 4)
@@ -649,8 +646,11 @@ struct ContentView: View {
                 .frame(width: 240, height: 110)
 
                 Text("\(state.percentage)%")
-                    .font(.system(size: 18, weight: .bold, design: .rounded))
+                    .font(.system(size: 28, weight: .bold, design: .rounded))
+                    .monospacedDigit()
                     .foregroundColor(.primary)
+                    .contentTransition(.numericText(value: Double(state.percentage)))
+                    .animation(.snappy(duration: 0.3), value: state.percentage)
             }
 
             // Charging status label + time remaining
@@ -775,10 +775,14 @@ struct ContentView: View {
 
         return LazyVGrid(columns: fourColumns, spacing: 8) {
             // Row 0
-            StatCard(title: "Cycle Count", value: "\(state.cycleCount)", icon: "arrow.triangle.2.circlepath", iconColor: tint)
-            StatCard(title: "System Load", value: formatWatts(state.electronicsWatts), icon: "desktopcomputer", iconColor: tint)
-            StatCard(title: "Adapter Load", value: formatWatts(state.adapterWatts), icon: "bolt.horizontal.fill", iconColor: adapterTint)
-            StatCard(title: "Battery Load", value: formatWatts(state.batteryWatts), icon: "bolt.horizontal.fill", iconColor: tint)
+            StatCard(title: "Cycle Count", value: "\(state.cycleCount)", icon: "arrow.triangle.2.circlepath", iconColor: tint,
+                help: "Completed charge cycles over the battery's life")
+            StatCard(title: "System Load", value: formatWatts(state.electronicsWatts), icon: "desktopcomputer", iconColor: tint,
+                help: "Power the Mac's electronics are drawing right now")
+            StatCard(title: "Adapter Load", value: formatWatts(state.adapterWatts), icon: "bolt.horizontal.fill", iconColor: adapterTint,
+                help: "Power the adapter is delivering right now")
+            StatCard(title: "Battery Load", value: formatWatts(state.batteryWatts), icon: "bolt.horizontal.fill", iconColor: tint,
+                help: "Power flowing into the battery (charging) or out of it (draining)")
 
             // Row 1
             StatCard(title: "Battery Served",
@@ -787,17 +791,19 @@ struct ContentView: View {
                     : (state.batteryAgeDays.isEmpty ? "—" : state.batteryAgeDays),
                 icon: "calendar.badge.clock", iconColor: tint, onTap: {
                     ageShowYears.toggle()
-                })
+                }, help: "Battery age since manufacture — click to show in \(ageShowYears ? "days" : "years")")
             StatCard(title: "Temperature", value: tempValue, icon: "thermometer.medium", iconColor: tint, onTap: {
                 useFahrenheit.toggle()
-            })
-            StatCard(title: "Adapter Voltage", value: voltageValue(state.adapterVoltage), icon: "bolt.fill", iconColor: adapterTint)
-            StatCard(title: "Battery Voltage", value: voltageValue(state.voltage), icon: "bolt.fill", iconColor: tint)
+            }, help: "Battery temperature — click to show in °\(useFahrenheit ? "C" : "F")")
+            StatCard(title: "Adapter Voltage", value: voltageValue(state.adapterVoltage), icon: "bolt.fill", iconColor: adapterTint,
+                help: "Voltage at the power adapter")
+            StatCard(title: "Battery Voltage", value: voltageValue(state.voltage), icon: "bolt.fill", iconColor: tint,
+                help: "Voltage across the battery")
 
             // Row 2
             StatCard(title: "Health", value: healthValue, icon: "stethoscope", iconColor: tint, onTap: {
                 healthShowPercent.toggle()
-            })
+            }, help: "Full-charge capacity vs design capacity — click to show \(healthShowPercent ? "mAh" : "percent")")
             StatCard(title: "Raw Charge",
                 value: rawChargeShowMAh
                     ? "\(state.currentCapacity)/\(state.maxCapacity) mAh"
@@ -806,13 +812,13 @@ struct ContentView: View {
                         : "\(state.percentage)%"),
                 icon: "percent", iconColor: tint, onTap: {
                     rawChargeShowMAh.toggle()
-                })
+                }, help: "Current charge vs full-charge capacity — click to show \(rawChargeShowMAh ? "percent" : "mAh")")
             StatCard(title: "Adapter Current", value: amperageValue(state.adapterAmperage), icon: "directcurrent", iconColor: adapterTint, onTap: {
                 amperageShowMA.toggle()
-            })
+            }, help: "Current from the power adapter — click to show \(amperageShowMA ? "amps" : "milliamps")")
             StatCard(title: "Battery Current", value: amperageValue(state.amperage), icon: "directcurrent", iconColor: tint, onTap: {
                 amperageShowMA.toggle()
-            })
+            }, help: "Current into or out of the battery — click to show \(amperageShowMA ? "amps" : "milliamps")")
         }
         .padding(.horizontal, 16)
     }
@@ -863,10 +869,25 @@ struct ContentView: View {
                     .foregroundColor(.secondary)
                     .rotationEffect(.degrees(settingsExpanded ? 90 : 0))
             }
+            // Inner 8 + outer 8 keeps the content aligned with the 16pt
+            // padding of the rows below while giving the hover highlight
+            // a small inset from the panel edges.
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(Color.primary.opacity(settingsHeaderHovering ? 0.06 : 0))
+            )
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .padding(.horizontal, 16)
+        .padding(.horizontal, 8)
+        .onHover { hovering in
+            settingsHeaderHovering = hovering
+            if hovering { NSCursor.pointingHand.set() } else { NSCursor.arrow.set() }
+        }
+        .animation(.easeOut(duration: 0.12), value: settingsHeaderHovering)
+        .animation(.easeOut(duration: 0.15), value: settingsExpanded)
         .help(settingsExpanded ? "Collapse settings" : "Expand settings")
     }
 
@@ -1088,9 +1109,7 @@ struct ContentView: View {
                         Text("Update to \(update.version)")
                     }
                 }
-                .font(.system(size: 12))
-                .foregroundColor(.orange)
-                .buttonStyle(.plain)
+                .buttonStyle(FooterButtonStyle(tint: .orange, hoverTint: .orange))
                 .help("Download v\(update.version), verify, install, and relaunch. Currently on \(AppVersion.current).")
             }
         }
@@ -1477,7 +1496,7 @@ private struct PowerFlowDiagram: View {
                                      x2: rightRX, y2a: battY - battH / 2, y2b: battY + battH / 2)
 
         flowRibbon(elecRibbon, color: acColor)
-        flowRibbon(battRibbon, color: chargeColor)
+        flowRibbon(battRibbon, color: acColor, endColor: chargeColor)
         node(icon: "powerplug.fill", watts: adapterWatts, tint: acColor, at: CGPoint(x: leftX, y: midY))
         node(icon: "laptopcomputer", watts: electronicsWatts, tint: acColor, at: CGPoint(x: rightX, y: elecY))
         batteryNode(watts: batteryWatts, tint: chargeColor, at: CGPoint(x: rightX, y: battY))
@@ -1538,12 +1557,18 @@ private struct PowerFlowDiagram: View {
 
     /// Filled ribbon with an optional animated highlight gliding from source
     /// (left) to sink (right). The highlight uses TimelineView, the same
-    /// approach the prior battery shimmer used.
-    @ViewBuilder
-    private func flowRibbon(_ shape: RibbonShape, color: Color) -> some View {
-        ZStack {
-            shape.fill(color.opacity(0.55))
-            shape.stroke(color.opacity(0.85), lineWidth: 0.6)
+    /// approach the prior battery shimmer used. `endColor` blends the ribbon
+    /// from the source node's color into the sink node's color (e.g. cyan AC
+    /// power turning into green stored charge); omitted = solid `color`.
+    private func flowRibbon(_ shape: RibbonShape, color: Color, endColor: Color? = nil) -> some View {
+        let end = endColor ?? color
+        return ZStack {
+            shape.fill(LinearGradient(
+                colors: [color.opacity(0.55), end.opacity(0.55)],
+                startPoint: .leading, endPoint: .trailing))
+            shape.stroke(LinearGradient(
+                colors: [color.opacity(0.85), end.opacity(0.85)],
+                startPoint: .leading, endPoint: .trailing), lineWidth: 0.6)
             if animate {
                 TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: false)) { timeline in
                     GeometryReader { geo in
@@ -1759,6 +1784,9 @@ struct BatteryRangeSlider: View {
                     .contentShape(Rectangle())
                     .position(x: inset + lowerX, y: midY)
                     .help("Lower bound: charging starts when battery drops below this level")
+                    .onHover { hovering in
+                        if hovering { NSCursor.resizeLeftRight.set() } else { NSCursor.arrow.set() }
+                    }
                     .gesture(
                         DragGesture()
                             .onChanged { drag in
@@ -1798,6 +1826,9 @@ struct BatteryRangeSlider: View {
                     .contentShape(Rectangle())
                     .position(x: inset + upperX, y: midY)
                     .help("Upper bound: charging stops when battery reaches this level")
+                    .onHover { hovering in
+                        if hovering { NSCursor.resizeLeftRight.set() } else { NSCursor.arrow.set() }
+                    }
                     .gesture(
                         DragGesture()
                             .onChanged { drag in
@@ -2006,16 +2037,71 @@ struct ChargeButtonStyle: ButtonStyle {
     let color: Color
 
     func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .font(.system(size: 13, weight: .semibold))
-            .frame(maxWidth: .infinity)
-            .frame(height: 36)
-            .foregroundColor(.white)
-            .background(
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(color)
-                    .opacity(configuration.isPressed ? 0.8 : 1.0)
-            )
+        ChargeButtonBody(configuration: configuration, color: color)
+    }
+
+    // ButtonStyle itself can't hold @State (makeBody is re-invoked with a
+    // fresh struct), so hover tracking lives in this nested view.
+    private struct ChargeButtonBody: View {
+        let configuration: ButtonStyleConfiguration
+        let color: Color
+        @State private var isHovering = false
+
+        var body: some View {
+            configuration.label
+                .font(.system(size: 13, weight: .semibold))
+                .frame(maxWidth: .infinity)
+                .frame(height: 36)
+                .foregroundColor(.white)
+                .background(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(LinearGradient(
+                            colors: [color.opacity(0.95), color.opacity(0.8)],
+                            startPoint: .top, endPoint: .bottom))
+                        .brightness(isHovering && !configuration.isPressed ? 0.06 : 0)
+                        .opacity(configuration.isPressed ? 0.85 : 1.0)
+                )
+                .scaleEffect(configuration.isPressed ? 0.985 : 1)
+                .shadow(color: color.opacity(0.25), radius: isHovering ? 5 : 3, y: 1)
+                .onHover { isHovering = $0 }
+                .animation(.easeOut(duration: 0.12), value: isHovering)
+                .animation(.easeOut(duration: 0.1), value: configuration.isPressed)
+        }
+    }
+}
+
+// MARK: - Footer Button Style
+
+/// Plain 12pt text button for the footer row: secondary at rest, brightens
+/// to `hoverTint` on hover, dims while pressed, and shows the pointer
+/// cursor. Pass a `tint` to keep a colored button (e.g. the orange update
+/// action) colored in every state.
+struct FooterButtonStyle: ButtonStyle {
+    var tint: Color = .secondary
+    var hoverTint: Color = .primary
+
+    func makeBody(configuration: Configuration) -> some View {
+        FooterButtonBody(configuration: configuration, tint: tint, hoverTint: hoverTint)
+    }
+
+    private struct FooterButtonBody: View {
+        let configuration: ButtonStyleConfiguration
+        let tint: Color
+        let hoverTint: Color
+        @State private var isHovering = false
+
+        var body: some View {
+            configuration.label
+                .font(.system(size: 12))
+                .foregroundColor(configuration.isPressed
+                    ? hoverTint.opacity(0.7)
+                    : (isHovering ? hoverTint : tint))
+                .onHover { hovering in
+                    isHovering = hovering
+                    if hovering { NSCursor.pointingHand.set() } else { NSCursor.arrow.set() }
+                }
+                .animation(.easeOut(duration: 0.12), value: isHovering)
+        }
     }
 }
 
@@ -2027,6 +2113,12 @@ struct StatCard: View {
     let icon: String
     var iconColor: Color = .secondary
     var onTap: (() -> Void)? = nil
+    /// Tooltip text; cards with an `onTap` should say what clicking switches to.
+    var help: String = ""
+
+    @State private var isHovering = false
+
+    private var isInteractive: Bool { onTap != nil }
 
     var body: some View {
         VStack(spacing: 5) {
@@ -2037,6 +2129,7 @@ struct StatCard: View {
 
             Text(value)
                 .font(.system(size: 15, weight: .semibold, design: .rounded))
+                .monospacedDigit()
                 .lineLimit(1)
                 .frame(height: 18)
 
@@ -2050,11 +2143,37 @@ struct StatCard: View {
         .frame(height: 76)
         .padding(.vertical, 8)
         .padding(.horizontal, 4)
-        .background(Color.primary.opacity(0.04))
-        .cornerRadius(8)
-        .contentShape(Rectangle())
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color.primary.opacity(isInteractive && isHovering ? 0.09 : 0.04))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.06), lineWidth: 1)
+        )
+        // Clickable cards toggle their unit; surface that hidden affordance
+        // with a swap glyph while hovered (plus the pointer cursor below).
+        .overlay(alignment: .topTrailing) {
+            if isInteractive && isHovering {
+                Image(systemName: "arrow.left.arrow.right")
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundColor(.secondary)
+                    .padding(6)
+                    .transition(.opacity)
+            }
+        }
+        .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         .onTapGesture {
             onTap?()
         }
+        .onHover { hovering in
+            guard isInteractive else { return }
+            isHovering = hovering
+            // .set() (not push/pop) so a missed exit event — e.g. the popover
+            // closing under the cursor — can't leave an unbalanced stack.
+            if hovering { NSCursor.pointingHand.set() } else { NSCursor.arrow.set() }
+        }
+        .animation(.easeOut(duration: 0.12), value: isHovering)
+        .help(help)
     }
 }
