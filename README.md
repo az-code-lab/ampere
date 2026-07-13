@@ -13,6 +13,7 @@ A lightweight macOS menu bar app for monitoring battery status and controlling c
 - **Auto charge management** - configurable upper/lower bounds to keep your battery in an optimal charge range
 - **Micro-charge prevention** - inhibits charging between bounds after restart; only charges from below the lower bound or on explicit user request
 - **Charge to upper bound** - explicitly allow charging from the current level to the upper bound
+- **Charge to full** - one-shot full charge without touching the configured bounds; normal management resumes when full
 - **Discharge to upper bound** - optionally drain the battery to the target level while on AC power
 - **Health check** - periodically verifies SMC state matches expected values
 - **In-app updates** - checks the Homebrew cask for new versions about once a day; click **Update to X** in the panel to download, verify, install, and relaunch
@@ -81,6 +82,21 @@ When a discharge stops, the app explicitly re-writes the charging-inhibit key: o
 
 When the battery is between the lower and upper bounds and charging is inhibited, this toggle appears. When enabled, the app allows charging until the upper bound is reached, then automatically resets the toggle and re-inhibits charging. Toggling it off mid-charge stops charging immediately and re-inhibits.
 
+#### Charge to Full
+
+A one-shot full charge for days when you need maximum battery (e.g. heading out without a charger). The toggle appears in auto mode whenever a power adapter is connected and the battery is not already full. While active, the effective charge ceiling is 100%; the configured bounds are never modified, and the upper-bound dragger is hidden from the slider (the range highlight extends to 100% instead) since it has no effect until the charge completes. When the battery is full, the toggle clears itself, the dragger returns, and normal auto management resumes with your original bounds.
+
+"Full" means the displayed percentage reaching 100% **or** the battery's own fully-charged signal, whichever comes first. Worn batteries can terminate their charge below a displayed 100%; the BMS signal completes the one-shot there instead of holding the charge state open forever.
+
+The one-shot is tied to the current AC session:
+
+- **Reaching full** clears it; charging is inhibited and the battery holds at full while plugged in (no top-up micro-charges).
+- **Unplugging** cancels it. At or above the lower bound, a later reconnect parks at the current level as usual. Below the lower bound, the intent downgrades to **Charge to Upper Bound**, so a reconnect behaves exactly like the normal below-lower recovery.
+- **Toggling it off** mid-charge re-inhibits immediately; the next cycle restores the default behavior for the current level.
+- **Activating it turns Discharge to Upper Bound off** (the setting itself, not just temporarily): draining the battery right after an explicitly requested full charge is never desirable. Re-enable discharge manually if you still want it afterwards.
+
+Like Charge to Upper Bound, the toggle is persisted: an in-progress full charge resumes across an app restart or crash.
+
 ### Manual Charge Control
 
 When auto charge management is off and a power adapter is connected, a manual **Pause Charging** / **Resume Charging** button is available.
@@ -90,6 +106,7 @@ When auto charge management is off and a power adapter is connected, a manual **
 | Scenario | Sleep → Wake | Quit → Restart |
 |---|---|---|
 | **Charge to Upper Bound** is ON (charging in progress between bounds) | Charging continues. The SMC is already in "allow" state; the wake handler confirms this and takes no further action. Toggle stays ON until the upper bound is reached. | **Charging resumes automatically.** The "Charge to Upper Bound" toggle is persisted across restart so an in-progress charge resumes rather than parking at the current level. On launch the app sees `chargeToUpperBound = true` and leaves CHTE in the "allow" state; charging continues until the upper bound is reached, at which point the toggle clears itself. |
+| **Charge to Full** is ON (one-shot full charge in progress) | Charging continues, same as above: the wake handler re-runs the state machine, which keeps CHTE in "allow" until the battery is full. Toggle stays ON until full. | **Charging resumes automatically.** The toggle is persisted; on launch the app skips the between-bounds inhibit and leaves CHTE in "allow", so the full charge continues (even past the configured upper bound) until full, where the toggle clears itself. A launch that finds the flag set but the Mac on battery clears it, because the one-shot is tied to the AC session it was started in. |
 | **Discharge to Upper Bound** is ON (discharging above upper bound) | Discharging continues. System sleep is prevented during discharge, so normal sleep should not occur. If forced (e.g. lid close), the wake handler re-asserts the discharge SMC state. Toggle stays ON. | **Discharging resumes automatically.** The "Discharge to Upper Bound" toggle is persisted. On restart, the app clears stale SMC state, then the first refresh cycle detects the battery is still above the upper bound and restarts discharge. Toggle stays ON. |
 
 ### Settings and Safety
@@ -207,6 +224,8 @@ This section documents the implementation details of SMC-based charge control an
 | >= upper bound | `0x01 00 00 00` | `0x00` |
 | >= lower bound and < upper bound | `0x00 00 00 00` or `0x01 00 00 00` | `0x00` |
 | < lower bound | `0x00 00 00 00` | `0x00` |
+
+While **Charge to Full** is active, this table applies with the upper bound read as 100 and CHTE expected to be `0x00 00 00 00` (allow) everywhere below it. (Discharge is always off in that state — activating the one-shot disables it.) For any 100% target, the battery's `FullyCharged` flag counts as "at the bound", covering worn batteries that terminate below a displayed 100%.
 
 #### Auto Mode — Discharge to Upper Bound ON
 

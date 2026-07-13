@@ -174,7 +174,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 let curPct = self.monitor.state?.percentage ?? 0
                 let target: Int
                 if self.effectivelyCharging() {
-                    target = self.monitor.autoManageEnabled ? self.monitor.chargeUpperBound : 100
+                    target = self.monitor.autoManageEnabled ? self.monitor.effectiveUpperBound : 100
                     self.animationPct += 5
                     if self.animationPct > target { self.animationPct = curPct }
                 } else {
@@ -695,7 +695,9 @@ struct ContentView: View {
             amperage: state.amperage,
             autoManageEnabled: monitor.autoManageEnabled,
             activeDischarging: monitor.activeDischarging,
-            upperBound: monitor.chargeUpperBound
+            // Effective bound: while charge-to-full is active the charging
+            // target is 100, which also selects the "to full" suffix.
+            upperBound: monitor.effectiveUpperBound
         )
         return eta.isEmpty ? state.timeRemaining : eta
     }
@@ -713,6 +715,13 @@ struct ContentView: View {
             }
             return "Discharging to \(monitor.chargeUpperBound)% — sleep is temporarily disabled"
         }
+        // Charge-to-full: announce the target even while the allow write is
+        // still in flight (amperage ≤ 0 for a beat after toggling) — without
+        // this, the paused branch below would flash "not charging" copy the
+        // instant after the user asked for a full charge.
+        if monitor.autoManageEnabled && monitor.chargeToFull && state.adapterConnected {
+            return "Auto: charging to full"
+        }
         if monitor.autoManageEnabled && monitor.chargingPaused {
             // "drains to X% under load" implies passive drain via the adapter
             // rail — only accurate on AC. On battery, the battery drains
@@ -727,7 +736,7 @@ struct ContentView: View {
         // transient-consistency reason as `BatteryModeRouter` — IOKit's
         // `isCharging` can lag the actual current direction.
         if monitor.autoManageEnabled, (state.amperage ?? 0) > 0 {
-            return "Auto: charging to \(monitor.chargeUpperBound)%"
+            return "Auto: charging to \(monitor.effectiveUpperBound)%"
         }
         // chargingPaused can briefly persist after a manual-mode unplug
         // (until the next refresh tick clears it), so require adapterConnected
@@ -966,6 +975,7 @@ struct ContentView: View {
                     } else {
                         monitor.autoManageEnabled = false
                         monitor.chargeToUpperBound = false
+                        monitor.chargeToFull = false
                         // Any pending error in auto-manage mode (most commonly
                         // "Admin access required for auto charge management"
                         // from a failed prior enable) is no longer relevant
@@ -1002,56 +1012,95 @@ struct ContentView: View {
                 ),
                 currentLevel: Double(state.percentage),
                 step: 5,
-                minGap: Double(BatteryMonitor.chargeBoundMinGap)
+                minGap: Double(BatteryMonitor.chargeBoundMinGap),
+                upperOverridden: monitor.chargeToFull
             )
             .frame(height: 68)
             .padding(.top, 2)
             .background(WindowDragBlocker())
 
-            if state.percentage > monitor.chargeUpperBound {
-                HStack {
-                    Image(systemName: "arrow.down.to.line")
-                        .font(.system(size: 14))
-                        .foregroundColor(monitor.autoDischargeEnabled ? .accentColor : .secondary)
-                    Text("Discharge to Upper Bound")
-                        .font(.system(size: 13, weight: .semibold))
-                    Spacer()
-                    Toggle("", isOn: Binding(
-                        get: { monitor.autoDischargeEnabled },
-                        set: { newValue in
-                            monitor.autoDischargeEnabled = newValue
-                            // Start/stop the discharge now — refresh()'s
-                            // auto-discharge branches handle both directions.
-                            monitor.refresh()
-                        }
-                    ))
-                    .toggleStyle(.switch)
-                    .controlSize(.small)
-                }
-            } else if state.percentage >= monitor.chargeLowerBound && state.percentage < monitor.chargeUpperBound {
-                HStack {
-                    Image(systemName: "arrow.up.to.line")
-                        .font(.system(size: 14))
-                        .foregroundColor(monitor.chargeToUpperBound ? .accentColor : .secondary)
-                    Text("Charge to Upper Bound")
-                        .font(.system(size: 13, weight: .semibold))
-                    Spacer()
-                    Toggle("", isOn: Binding(
-                        get: { monitor.chargeToUpperBound },
-                        set: { newValue in
-                            monitor.chargeToUpperBound = newValue
-                            if newValue {
-                                // Kick the state machine so charging starts
-                                // now, not on the next poll tick.
+            // Both bound-relative rows are subsumed while charge-to-full is
+            // active: charge-to-upper by the higher target, and discharge
+            // because activating charge-to-full turned the preference off —
+            // showing the row would invite re-enabling it against the
+            // in-progress full charge.
+            if !monitor.chargeToFull {
+                if state.percentage > monitor.chargeUpperBound {
+                    HStack {
+                        Image(systemName: "arrow.down.to.line")
+                            .font(.system(size: 14))
+                            .foregroundColor(monitor.autoDischargeEnabled ? .accentColor : .secondary)
+                            .frame(width: 26)
+                        Text("Discharge to Upper Bound")
+                            .font(.system(size: 13, weight: .semibold))
+                        Spacer()
+                        Toggle("", isOn: Binding(
+                            get: { monitor.autoDischargeEnabled },
+                            set: { newValue in
+                                monitor.autoDischargeEnabled = newValue
+                                // Start/stop the discharge now — refresh()'s
+                                // auto-discharge branches handle both directions.
                                 monitor.refresh()
-                            } else {
-                                monitor.inhibitCharging()
                             }
-                        }
+                        ))
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                    }
+                } else if state.percentage >= monitor.chargeLowerBound && state.percentage < monitor.chargeUpperBound {
+                    HStack {
+                        Image(systemName: "arrow.up.to.line")
+                            .font(.system(size: 14))
+                            .foregroundColor(monitor.chargeToUpperBound ? .accentColor : .secondary)
+                            .frame(width: 26)
+                        Text("Charge to Upper Bound")
+                            .font(.system(size: 13, weight: .semibold))
+                        Spacer()
+                        Toggle("", isOn: Binding(
+                            get: { monitor.chargeToUpperBound },
+                            set: { newValue in
+                                monitor.chargeToUpperBound = newValue
+                                if newValue {
+                                    // Kick the state machine so charging starts
+                                    // now, not on the next poll tick.
+                                    monitor.refresh()
+                                } else {
+                                    monitor.inhibitCharging()
+                                }
+                            }
+                        ))
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                    }
+                }
+            }
+
+            // One-shot full charge — the ticket-requested quick way to reach
+            // full without touching the bounds. Needs AC to do anything, and
+            // hides when the battery already reports full (fullyCharged
+            // covers worn batteries whose BMS terminates below a displayed
+            // 100%) — unless still active, so the user can see it complete.
+            if state.adapterConnected
+                && ((state.percentage < 100 && !state.fullyCharged) || monitor.chargeToFull) {
+                HStack {
+                    // Fixed icon frame (also on the two rows above): this
+                    // battery glyph is much wider than the arrow glyphs, and
+                    // these rows can stack — without a shared width the text
+                    // edges would misalign.
+                    Image(systemName: "battery.100percent.bolt")
+                        .font(.system(size: 14))
+                        .foregroundColor(monitor.chargeToFull ? .accentColor : .secondary)
+                        .frame(width: 26)
+                    Text("Charge to Full")
+                        .font(.system(size: 13, weight: .semibold))
+                    Spacer()
+                    Toggle("", isOn: Binding(
+                        get: { monitor.chargeToFull },
+                        set: { monitor.setChargeToFull($0) }
                     ))
                     .toggleStyle(.switch)
                     .controlSize(.small)
                 }
+                .help("One-time charge to full without changing the bounds. Turns Discharge to Upper Bound off; clears when full, when the adapter is unplugged, or when toggled off.")
             }
 
         }
@@ -1709,6 +1758,12 @@ struct BatteryRangeSlider: View {
     let currentLevel: Double
     var step: Double = 5
     var minGap: Double = 5
+    /// True while "Charge to Full" temporarily overrides the ceiling to
+    /// 100%: the upper dragger (thumb, label, marker, drag area) is hidden —
+    /// it has no effect and dragging it mid-override would be misleading —
+    /// and the target-range highlight extends to 100% to show the actual
+    /// charge target. The stored bound is untouched throughout.
+    var upperOverridden: Bool = false
 
     private let batteryHeight: CGFloat = 28
     private let cornerRadius: CGFloat = 6
@@ -1746,8 +1801,10 @@ struct BatteryRangeSlider: View {
                     .frame(width: fillW, height: batteryHeight - inset * 2)
                     .position(x: inset + fillW / 2, y: midY)
 
-                // Target range highlight
-                let rangeW = max(0, upperX - lowerX)
+                // Target range highlight — extends to 100% while the upper
+                // bound is overridden by Charge to Full.
+                let rangeEndX = upperOverridden ? innerW : upperX
+                let rangeW = max(0, rangeEndX - lowerX)
                 RoundedRectangle(cornerRadius: 2)
                     .fill(Color.green.opacity(0.15))
                     .frame(width: rangeW, height: batteryHeight - inset * 2)
@@ -1795,47 +1852,49 @@ struct BatteryRangeSlider: View {
                             }
                     )
 
-                // Upper bound marker — green line + triangle below
-                Path { path in
-                    let x = inset + upperX
-                    path.move(to: CGPoint(x: x, y: midY - batteryHeight / 2 + 1))
-                    path.addLine(to: CGPoint(x: x, y: midY + batteryHeight / 2 - 1))
-                }
-                .stroke(Color.green, style: StrokeStyle(lineWidth: 1.5, dash: [3, 2]))
-
-                // Upper thumb: triangle below battery
-                Path { path in
-                    let x = inset + upperX
-                    let bot = midY + batteryHeight / 2 + 10
-                    path.move(to: CGPoint(x: x - 5, y: bot))
-                    path.addLine(to: CGPoint(x: x + 5, y: bot))
-                    path.addLine(to: CGPoint(x: x, y: bot - 7))
-                    path.closeSubpath()
-                }
-                .fill(Color.green)
-
-                // Upper label
-                Text("\(Int(upper))%")
-                    .font(.system(size: 13, weight: .bold, design: .rounded))
-                    .foregroundColor(.green)
-                    .position(x: inset + upperX, y: midY + batteryHeight / 2 + 20)
-
-                // Upper drag area
-                Color.clear
-                    .frame(width: markerWidth, height: geo.size.height)
-                    .contentShape(Rectangle())
-                    .position(x: inset + upperX, y: midY)
-                    .help("Upper bound: charging stops when battery reaches this level")
-                    .onHover { hovering in
-                        if hovering { NSCursor.resizeLeftRight.set() } else { NSCursor.arrow.set() }
+                if !upperOverridden {
+                    // Upper bound marker — green line + triangle below
+                    Path { path in
+                        let x = inset + upperX
+                        path.move(to: CGPoint(x: x, y: midY - batteryHeight / 2 + 1))
+                        path.addLine(to: CGPoint(x: x, y: midY + batteryHeight / 2 - 1))
                     }
-                    .gesture(
-                        DragGesture()
-                            .onChanged { drag in
-                                let raw = Double(drag.location.x - inset) / Double(innerW) * 100
-                                upper = snap(min(100, max(raw, lower + minGap)))
-                            }
-                    )
+                    .stroke(Color.green, style: StrokeStyle(lineWidth: 1.5, dash: [3, 2]))
+
+                    // Upper thumb: triangle below battery
+                    Path { path in
+                        let x = inset + upperX
+                        let bot = midY + batteryHeight / 2 + 10
+                        path.move(to: CGPoint(x: x - 5, y: bot))
+                        path.addLine(to: CGPoint(x: x + 5, y: bot))
+                        path.addLine(to: CGPoint(x: x, y: bot - 7))
+                        path.closeSubpath()
+                    }
+                    .fill(Color.green)
+
+                    // Upper label
+                    Text("\(Int(upper))%")
+                        .font(.system(size: 13, weight: .bold, design: .rounded))
+                        .foregroundColor(.green)
+                        .position(x: inset + upperX, y: midY + batteryHeight / 2 + 20)
+
+                    // Upper drag area
+                    Color.clear
+                        .frame(width: markerWidth, height: geo.size.height)
+                        .contentShape(Rectangle())
+                        .position(x: inset + upperX, y: midY)
+                        .help("Upper bound: charging stops when battery reaches this level")
+                        .onHover { hovering in
+                            if hovering { NSCursor.resizeLeftRight.set() } else { NSCursor.arrow.set() }
+                        }
+                        .gesture(
+                            DragGesture()
+                                .onChanged { drag in
+                                    let raw = Double(drag.location.x - inset) / Double(innerW) * 100
+                                    upper = snap(min(100, max(raw, lower + minGap)))
+                                }
+                        )
+                }
             }
         }
     }

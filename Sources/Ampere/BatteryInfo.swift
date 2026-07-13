@@ -32,6 +32,11 @@ struct BatteryState: Equatable {
     let batteryWatts: Double?
     let batteryAgeYears: String   // e.g. "4y 6m"
     let batteryAgeDays: String    // e.g. "1643d"
+    /// BMS "charge terminated at full" flag. Worn batteries can terminate
+    /// below a displayed 100%, so any 100%-targeting logic (Charge to Full,
+    /// an upper bound of 100) must treat this as "target reached" or it
+    /// would hold CHTE=allow forever, trickle-charging at the top.
+    let fullyCharged: Bool
 }
 
 final class BatteryMonitor: ObservableObject {
@@ -44,6 +49,20 @@ final class BatteryMonitor: ObservableObject {
     @Published var chargeToUpperBound: Bool {
         didSet { UserDefaults.standard.set(chargeToUpperBound, forKey: "chargeToUpperBound") }
     }
+    /// One-shot "Charge to Full" override. While set, the effective upper
+    /// bound is 100 — the configured bounds are untouched. Cleared by the
+    /// state machine when the battery is full (100% or the BMS says so) or
+    /// the adapter disconnects, and by the UI when toggled off or
+    /// auto-manage is disabled. Persisted so an in-progress full charge
+    /// resumes across restart/crash.
+    @Published var chargeToFull: Bool {
+        didSet { UserDefaults.standard.set(chargeToFull, forKey: "chargeToFull") }
+    }
+    /// The charge ceiling currently in force: 100 while "Charge to Full" is
+    /// active, otherwise the configured upper bound. UI labels and ETA/
+    /// animation targets read this so they can never disagree with the
+    /// state machine about where charging will stop.
+    var effectiveUpperBound: Int { chargeToFull ? 100 : chargeUpperBound }
     /// Show the "77%" text beside the menu bar battery icon; off = icon
     /// only, halving the menu bar footprint. Lives here rather than in
     /// @AppStorage because AppDelegate (not the SwiftUI tree) renders the
@@ -181,11 +200,30 @@ final class BatteryMonitor: ObservableObject {
         // Clear it if auto-manage is disabled (it has no effect outside auto mode).
         let persistedCtu = defaults.bool(forKey: "chargeToUpperBound")
         self.chargeToUpperBound = autoManage && persistedCtu
-        // Persist the negation (autoManage=false but persisted ctu=true would
+        // Charge-to-full follows the same persist/restore contract as
+        // charge-to-upper: survive a restart mid-charge, but drop it when
+        // auto-manage is off (the state machine that acts on it only runs
+        // in auto mode). Assigned before the reads below — self can't be
+        // touched until every stored property is initialized.
+        let persistedCtf = defaults.bool(forKey: "chargeToFull")
+        self.chargeToFull = autoManage && persistedCtf
+        // Persist the negations (autoManage=false but a persisted true would
         // otherwise stay diverged from in-memory state forever, since didSet
         // doesn't fire during init).
         if !self.chargeToUpperBound && persistedCtu {
             defaults.set(false, forKey: "chargeToUpperBound")
+        }
+        if !self.chargeToFull && persistedCtf {
+            defaults.set(false, forKey: "chargeToFull")
+        }
+        // Invariant: chargeToFull implies auto-discharge is off (activating
+        // it turns the preference off — see setChargeToFull). Both entry
+        // points enforce this, so a violation here means corrupted defaults;
+        // repair in favor of the full charge, since draining right after an
+        // explicit "charge me to 100%" is never what the user meant.
+        if self.chargeToFull && self.autoDischargeEnabled {
+            self.autoDischargeEnabled = false
+            defaults.set(false, forKey: "autoDischargeEnabled")
         }
         // Restore the last-known adapter state so rule 2 (connected→disconnected
         // → clear chargeToUpperBound) can fire on the first refresh after a
@@ -233,12 +271,24 @@ final class BatteryMonitor: ObservableObject {
                 chargeToUpperBound = false
                 defaults.set(false, forKey: "chargeToUpperBound")
             }
-            // Respect persisted charge-to-upper intent: if true, skip the inhibit
-            // so an in-progress charge-to-upper survives a restart.
+            // Same crash-window repair for charge-to-full against its own
+            // target: a crash between the at-full inhibit write and the
+            // in-memory clear must not resurrect the override. The BMS
+            // fully-charged flag counts as "at 100" — worn batteries can
+            // terminate below a displayed 100% (see evaluateAutoManageStep).
+            if chargeToFull, let lb = launchBattery,
+               lb.percentage >= 100 || lb.fullyCharged {
+                chargeToFull = false
+                defaults.set(false, forKey: "chargeToFull")
+            }
+            // Respect persisted charge-to-upper/-full intent: if either is
+            // set, skip the inhibit so the in-progress charge survives a
+            // restart.
             let shouldInhibit = autoManageEnabled
                 && launchBattery != nil
                 && launchPercentage >= chargeLowerBound
                 && !chargeToUpperBound
+                && !chargeToFull
             if shouldInhibit {
                 chargingPaused = true
             } else if autoManageEnabled, launchBattery != nil,
@@ -335,6 +385,7 @@ final class BatteryMonitor: ObservableObject {
             let priorState = AutoManageState(
                 chargingPaused: chargingPausedSnapshot,
                 chargeToUpperBound: self.chargeToUpperBound,
+                chargeToFull: self.chargeToFull,
                 lastAdapterConnected: self.lastAdapterConnected
             )
             let autoManageEnabledSnapshot = self.autoManageEnabled
@@ -375,7 +426,8 @@ final class BatteryMonitor: ObservableObject {
                     adapterConnected: battery.adapterConnected,
                     percentage: battery.percentage,
                     lowerBound: lower,
-                    upperBound: upper
+                    upperBound: upper,
+                    fullyCharged: battery.fullyCharged
                 )
                 let decision = BatteryMonitor.evaluateAutoManageStep(
                     state: priorState, inputs: inputs
@@ -404,6 +456,7 @@ final class BatteryMonitor: ObservableObject {
                         if ok, decision.action != .none {
                             self.chargingPaused = decision.newState.chargingPaused
                             self.chargeToUpperBound = decision.newState.chargeToUpperBound
+                            self.chargeToFull = decision.newState.chargeToFull
                             NSLog("Ampere: Wake — auto-manage %@ at %d%%",
                                   op == .allow ? "allow" : "inhibit", battery.percentage)
                         }
@@ -602,6 +655,7 @@ final class BatteryMonitor: ObservableObject {
                     self.autoManageEnabled = false
                     self.autoDischargeEnabled = false
                     self.chargeToUpperBound = false
+                    self.chargeToFull = false
                     self.chargingPaused = false
                     self.activeDischarging = false
                     // Clear any stale error — the user just acted on the
@@ -866,9 +920,12 @@ final class BatteryMonitor: ObservableObject {
     // MARK: - Auto-manage decision (pure, testable)
 
     /// Pure state carried across refresh() cycles for the auto-manage state machine.
+    /// `chargeToFull` defaults to false so existing construction sites (and
+    /// tests) that predate the field remain valid.
     struct AutoManageState: Equatable {
         var chargingPaused: Bool
         var chargeToUpperBound: Bool
+        var chargeToFull: Bool = false
         var lastAdapterConnected: Bool?
     }
 
@@ -879,6 +936,9 @@ final class BatteryMonitor: ObservableObject {
         let percentage: Int
         let lowerBound: Int
         let upperBound: Int
+        /// BMS charge-termination flag; substitutes for "percentage >= 100"
+        /// on worn batteries that top out below a displayed 100%.
+        let fullyCharged: Bool
     }
 
     /// SMC command the refresh() cycle should issue.
@@ -899,6 +959,10 @@ final class BatteryMonitor: ObservableObject {
     ///   Rule 1 — below lower bound on AC → allow + set chargeToUpperBound
     ///   Rule 2 — AC disconnect at or above lower bound → clear chargeToUpperBound
     ///   Rule 3 — between bounds without chargeToUpperBound → inhibit
+    ///   Charge to Full — while chargeToFull is set the effective upper bound
+    ///   is 100; reaching it (by percentage or the BMS fully-charged flag) or
+    ///   disconnecting from AC clears the flag and normal management resumes
+    ///   with the configured bounds.
     static func evaluateAutoManageStep(
         state: AutoManageState,
         inputs: AutoManageInputs
@@ -912,11 +976,37 @@ final class BatteryMonitor: ObservableObject {
            state.chargeToUpperBound, inputs.percentage >= inputs.lowerBound {
             next.chargeToUpperBound = false
         }
+        // Charge-to-full is a one-shot tied to the current AC session: unlike
+        // rule 2 it clears on ANY battery tick, not just the unplug edge, so
+        // a stale flag (persisted by a crash inside the unplug window) can
+        // never resurrect a "100%" target hours later on reconnect. There is
+        // also no at-or-above-lower carve-out; below the lower bound the
+        // fresh unplug instead downgrades it to charge-to-upper — exactly
+        // what rule 1 would decide there. Leaving no intent at all would let
+        // the still-allowed SMC charge to the lower bound on reconnect and
+        // then park there (rule 3), a level the user never picked as a stop
+        // point. The downgrade needs the unplug-time percentage, so it only
+        // applies on the transition.
+        if state.chargeToFull, !inputs.adapterConnected {
+            next.chargeToFull = false
+            if state.lastAdapterConnected == true, inputs.percentage < inputs.lowerBound {
+                next.chargeToUpperBound = true
+            }
+        }
         next.lastAdapterConnected = inputs.adapterConnected
 
         // Auto-manage SMC decisions only apply on AC with auto-manage enabled.
         guard inputs.autoManageEnabled, inputs.adapterConnected else {
             return AutoManageDecision(action: .none, newState: next)
+        }
+
+        // "Reached the bound" for charge decisions. For a 100% bound the
+        // BMS's charge-termination flag also counts: worn batteries can
+        // terminate below a displayed 100%, and comparing the percentage
+        // alone would keep CHTE=allow forever, trickle-charging at the top.
+        // Bounds below 100 are unaffected — the BMS never terminates there.
+        let reached: (Int) -> Bool = { bound in
+            inputs.percentage >= bound || (bound == 100 && inputs.fullyCharged)
         }
 
         // chargeToUpperBound is only meaningful below the upper bound (init
@@ -925,24 +1015,35 @@ final class BatteryMonitor: ObservableObject {
         // reading, just as the battery crossed the bound — would otherwise
         // make the paused branch below issue a spurious allow at/above the
         // bound, immediately reverted by an inhibit on the next cycle.
-        if next.chargeToUpperBound, inputs.percentage >= inputs.upperBound {
+        if next.chargeToUpperBound, reached(inputs.upperBound) {
             next.chargeToUpperBound = false
         }
+        // Same staleness rule for charge-to-full against its own target.
+        if next.chargeToFull, reached(100) {
+            next.chargeToFull = false
+        }
 
-        if !next.chargingPaused && inputs.percentage >= inputs.upperBound {
-            // At or above upper bound → inhibit and reset charge-to-upper.
+        // While charge-to-full is active the configured upper bound stops
+        // being a charge terminator; 100% is the only ceiling. Cleared above
+        // when full, so an active flag always means "keep charging".
+        let effectiveUpper = next.chargeToFull ? 100 : inputs.upperBound
+
+        if !next.chargingPaused && reached(effectiveUpper) {
+            // At or above the effective upper bound → inhibit and reset
+            // charge-to-upper.
             next.chargingPaused = true
             next.chargeToUpperBound = false
             return AutoManageDecision(action: .inhibit, newState: next)
-        } else if !next.chargingPaused && !next.chargeToUpperBound
+        } else if !next.chargingPaused && !next.chargeToUpperBound && !next.chargeToFull
                     && inputs.percentage >= inputs.lowerBound
-                    && inputs.percentage < inputs.upperBound {
-            // Between bounds without charge-to-upper → inhibit (rule 3).
+                    && inputs.percentage < effectiveUpper {
+            // Between bounds without charge-to-upper/-full → inhibit (rule 3).
             next.chargingPaused = true
             return AutoManageDecision(action: .inhibit, newState: next)
         } else if next.chargingPaused
-                    && (inputs.percentage < inputs.lowerBound || next.chargeToUpperBound) {
-            // Below lower bound (rule 1) or explicit charge-to-upper → allow.
+                    && (inputs.percentage < inputs.lowerBound
+                        || next.chargeToUpperBound || next.chargeToFull) {
+            // Below lower bound (rule 1) or explicit charge-to-upper/-full → allow.
             let belowLower = inputs.percentage < inputs.lowerBound
             next.chargingPaused = false
             if belowLower {
@@ -1231,6 +1332,7 @@ final class BatteryMonitor: ObservableObject {
             let priorState = AutoManageState(
                 chargingPaused: chargingPaused,
                 chargeToUpperBound: chargeToUpperBound,
+                chargeToFull: chargeToFull,
                 lastAdapterConnected: lastAdapterConnected
             )
             let stepInputs = AutoManageInputs(
@@ -1238,19 +1340,29 @@ final class BatteryMonitor: ObservableObject {
                 adapterConnected: b.adapterConnected,
                 percentage: b.percentage,
                 lowerBound: chargeLowerBound,
-                upperBound: chargeUpperBound
+                upperBound: chargeUpperBound,
+                fullyCharged: b.fullyCharged
             )
             let decision = BatteryMonitor.evaluateAutoManageStep(
                 state: priorState, inputs: stepInputs
             )
 
-            // Pure state updates always apply (adapter tracking, rule-2 clear).
+            // Pure state updates always apply (adapter tracking, rule-2 clear,
+            // charge-to-full session clear / below-lower downgrade).
             lastAdapterConnected = decision.newState.lastAdapterConnected
             if chargeToUpperBound != decision.newState.chargeToUpperBound, decision.action == .none {
                 chargeToUpperBound = decision.newState.chargeToUpperBound
-                // Two pure-clear paths: rule 2 (AC disconnect above lower) and
-                // the at/above-upper staleness repair.
-                NSLog("Ampere: Cleared chargeToUpperBound at %d%%", b.percentage)
+                // Pure paths in both directions: rule 2 (AC disconnect above
+                // lower) and the at/above-upper staleness repair clear it; the
+                // charge-to-full disconnect downgrade below lower sets it.
+                NSLog("Ampere: %@ chargeToUpperBound at %d%%",
+                      decision.newState.chargeToUpperBound ? "Set" : "Cleared", b.percentage)
+            }
+            if chargeToFull != decision.newState.chargeToFull, decision.action == .none {
+                chargeToFull = decision.newState.chargeToFull
+                // Pure-clear only (the machine never sets it): AC disconnect
+                // or the at-100% staleness repair while already paused.
+                NSLog("Ampere: Cleared chargeToFull at %d%%", b.percentage)
             }
 
             if autoManageEnabled, b.adapterConnected, lastError != nil { lastError = nil }
@@ -1267,7 +1379,9 @@ final class BatteryMonitor: ObservableObject {
             if decision.action != .none, !autoManageInFlight {
                 autoManageInFlight = true
                 let pct = b.percentage
-                let upper = chargeUpperBound
+                // Log the target the machine actually decided on — 100 while
+                // charge-to-full survives this step, else the configured bound.
+                let upper = decision.newState.chargeToFull ? 100 : chargeUpperBound
                 let op: SMCWriteOp = decision.action == .allow ? .allow : .inhibit
                 let next = decision.newState
                 smcQueue.async { [weak self] in
@@ -1278,6 +1392,7 @@ final class BatteryMonitor: ObservableObject {
                         if ok {
                             self.chargingPaused = next.chargingPaused
                             self.chargeToUpperBound = next.chargeToUpperBound
+                            self.chargeToFull = next.chargeToFull
                             switch decision.action {
                             case .inhibit:
                                 NSLog("Ampere: Inhibited charging at %d%%", pct)
@@ -1314,7 +1429,8 @@ final class BatteryMonitor: ObservableObject {
                         adapterVoltage: b.adapterVoltage,
                         electronicsWatts: b.electronicsWatts,
                         batteryWatts: b.batteryWatts,
-                        batteryAgeYears: b.batteryAgeYears, batteryAgeDays: b.batteryAgeDays
+                        batteryAgeYears: b.batteryAgeYears, batteryAgeDays: b.batteryAgeDays,
+                        fullyCharged: b.fullyCharged
                     )
                 }
             } else if !autoManageEnabled, !autoManageInFlight {
@@ -1329,6 +1445,7 @@ final class BatteryMonitor: ObservableObject {
                 // site so it can't interleave with the wake handler's
                 // re-assert; if one is in flight, the next tick retries.
                 chargeToUpperBound = false  // in-memory only; safe to clear unconditionally
+                chargeToFull = false
                 autoManageInFlight = true
                 smcQueue.async { [weak self] in
                     guard let self = self else { return }
@@ -1376,13 +1493,17 @@ final class BatteryMonitor: ObservableObject {
 
         let healthy: Bool
         if autoManageEnabled {
+            // While charge-to-full is active the expected-state rules are the
+            // charge-to-upper rules evaluated against a ceiling of 100 — the
+            // same equivalence the state machine uses — so the pure checkers
+            // don't need a separate flag.
             healthy = Self.healthCheckAutoMode(
                 chargeLevel: battery.percentage,
                 lowerBound: chargeLowerBound,
-                upperBound: chargeUpperBound,
+                upperBound: effectiveUpperBound,
                 dischargeEnabled: autoDischargeEnabled,
                 activeDischarging: activeDischarging,
-                chargeToUpperBound: chargeToUpperBound,
+                chargeToUpperBound: chargeToUpperBound || chargeToFull,
                 chie: chie, chte: chte
             )
         } else {
@@ -1410,10 +1531,10 @@ final class BatteryMonitor: ObservableObject {
                 pauseButtonPaused: chargingPaused,
                 chargeLevel: battery.percentage,
                 lowerBound: chargeLowerBound,
-                upperBound: chargeUpperBound,
+                upperBound: effectiveUpperBound,
                 dischargeEnabled: autoDischargeEnabled,
                 activeDischarging: activeDischarging,
-                chargeToUpperBound: chargeToUpperBound
+                chargeToUpperBound: chargeToUpperBound || chargeToFull
             )
             newExpected = "\(SMC.keyChargeTerminate)=\(expected.chte)\n\(SMC.keyChargeInhibit)=\(expected.chie)"
             newCHTEMatch = chteHex == expected.chte
@@ -1466,6 +1587,11 @@ final class BatteryMonitor: ObservableObject {
         let isCharging = (desc[kIOPSIsChargingKey] as? Bool) ?? false
         let powerSource = desc[kIOPSPowerSourceStateKey] as? String ?? ""
         let isPluggedIn = powerSource == kIOPSACPowerValue
+        // IOPS "Is Charged" as the baseline; the registry's raw BMS flag
+        // (read below, where the battery service is available) overrides it
+        // when present. Default false — a missing key must never fake a
+        // completed charge.
+        var fullyCharged = desc[kIOPSIsChargedKey] as? Bool ?? false
 
         let timeToEmpty = desc[kIOPSTimeToEmptyKey] as? Int
         let timeToFull = desc[kIOPSTimeToFullChargeKey] as? Int
@@ -1516,6 +1642,9 @@ final class BatteryMonitor: ObservableObject {
             }
             if let val = IORegistryEntryCreateCFProperty(service, "Temperature" as CFString, nil, 0)?.takeRetainedValue() as? Int {
                 temperature = Double(val) / 100.0
+            }
+            if let val = IORegistryEntryCreateCFProperty(service, "FullyCharged" as CFString, nil, 0)?.takeRetainedValue() as? Bool {
+                fullyCharged = val
             }
             if let telemetry = IORegistryEntryCreateCFProperty(service, "PowerTelemetryData" as CFString, nil, 0)?.takeRetainedValue() as? [String: Any] {
                 adapterWatts = Self.milliwattsToWatts(telemetry["SystemPowerIn"])
@@ -1621,7 +1750,8 @@ final class BatteryMonitor: ObservableObject {
             electronicsWatts: electronicsWatts,
             batteryWatts: batteryWatts,
             batteryAgeYears: batteryAgeYears,
-            batteryAgeDays: batteryAgeDays
+            batteryAgeDays: batteryAgeDays,
+            fullyCharged: fullyCharged
         )
     }
 
@@ -1642,6 +1772,31 @@ final class BatteryMonitor: ObservableObject {
     }
 
     // MARK: - Toggle
+
+    /// Turn the one-shot "Charge to Full" override on or off.
+    ///
+    /// Activating turns the Discharge to Upper Bound preference OFF (not
+    /// merely suspended): actively draining the battery right after an
+    /// explicit full charge is never what the user meant, and a hidden
+    /// "re-arms later" state would be worse than asking them to re-enable
+    /// the preference when they actually want it again. The refresh() kicked
+    /// below then stops any in-flight discharge (via its !autoDischargeEnabled
+    /// branch) before the state machine issues the allow.
+    ///
+    /// Deactivating mid-charge mirrors the charge-to-upper toggle: inhibit
+    /// immediately; the next state-machine cycle restores the rule-1/3
+    /// default for the current level (including charge-to-upper if below
+    /// the lower bound).
+    func setChargeToFull(_ on: Bool) {
+        if on {
+            if autoDischargeEnabled { autoDischargeEnabled = false }
+            chargeToFull = true
+            refresh()
+        } else {
+            chargeToFull = false
+            inhibitCharging()
+        }
+    }
 
     /// Re-inhibit charging (e.g. when user toggles off "Charge to Upper Bound" mid-charge).
     func inhibitCharging() {

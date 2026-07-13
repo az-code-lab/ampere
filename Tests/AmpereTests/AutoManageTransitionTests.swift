@@ -31,6 +31,7 @@ final class AutoManageTransitionTests: XCTestCase {
         init(
             chargingPaused: Bool,
             chargeToUpperBound: Bool = false,
+            chargeToFull: Bool = false,
             lastAdapterConnected: Bool? = nil,
             lowerBound: Int = 40,
             upperBound: Int = 60
@@ -38,6 +39,7 @@ final class AutoManageTransitionTests: XCTestCase {
             self.state = BatteryMonitor.AutoManageState(
                 chargingPaused: chargingPaused,
                 chargeToUpperBound: chargeToUpperBound,
+                chargeToFull: chargeToFull,
                 lastAdapterConnected: lastAdapterConnected
             )
             self.lowerBound = lowerBound
@@ -49,14 +51,16 @@ final class AutoManageTransitionTests: XCTestCase {
         func step(
             percentage: Int,
             adapterConnected: Bool,
-            autoManageEnabled: Bool = true
+            autoManageEnabled: Bool = true,
+            fullyCharged: Bool = false
         ) -> BatteryMonitor.AutoManageAction {
             let inputs = BatteryMonitor.AutoManageInputs(
                 autoManageEnabled: autoManageEnabled,
                 adapterConnected: adapterConnected,
                 percentage: percentage,
                 lowerBound: lowerBound,
-                upperBound: upperBound
+                upperBound: upperBound,
+                fullyCharged: fullyCharged
             )
             let decision = BatteryMonitor.evaluateAutoManageStep(state: state, inputs: inputs)
             state = decision.newState
@@ -446,5 +450,230 @@ final class AutoManageTransitionTests: XCTestCase {
         sim.step(percentage: 40, adapterConnected: false)
         XCTAssertFalse(sim.state.chargeToUpperBound,
                        "Rule 2 fires at exactly the lower bound (pct >= lowerBound)")
+    }
+
+    // MARK: - Charge to 100% (one-shot full charge)
+
+    func testChargeToFull_BetweenBounds_ChargesTo100AndClears() {
+        // Parked between bounds; user toggles "Charge to 100%". Must allow,
+        // sail past the configured upper bound WITHOUT inhibiting, then
+        // inhibit and self-clear at 100. Exactly two SMC writes total.
+        let sim = Simulator(chargingPaused: true, lastAdapterConnected: true)
+        sim.stepUntilSettled(percentage: 50, adapterConnected: true)
+
+        sim.state.chargeToFull = true  // UI toggle
+
+        let action = sim.step(percentage: 50, adapterConnected: true)
+        XCTAssertEqual(action, .allow)
+        XCTAssertFalse(sim.state.chargingPaused)
+
+        // Crossing the configured upper bound (60) must not stop the charge.
+        sim.chargeFrom(51, to: 99)
+        XCTAssertFalse(sim.state.chargingPaused,
+                       "Charge-to-full must not inhibit at the configured upper bound")
+        XCTAssertTrue(sim.state.chargeToFull)
+
+        sim.step(percentage: 100, adapterConnected: true)
+        XCTAssertTrue(sim.state.chargingPaused)
+        XCTAssertFalse(sim.state.chargeToFull, "Reaching 100% clears the override")
+        XCTAssertFalse(sim.state.chargeToUpperBound)
+        sim.stepUntilSettled(percentage: 100, adapterConnected: true)
+        XCTAssertEqual(sim.issued, [.allow, .inhibit],
+                       "The whole journey is one allow and one inhibit")
+    }
+
+    func testChargeToFull_ActivatedAboveUpperBound_Allows() {
+        // Inhibited above the configured upper bound (85% with upper 60).
+        // Charge-to-full is the only toggle offered there once discharge is
+        // off, and it must un-pause charging.
+        let sim = Simulator(chargingPaused: true, lastAdapterConnected: true)
+        sim.stepUntilSettled(percentage: 85, adapterConnected: true)
+        XCTAssertEqual(sim.issued.count, 0)
+
+        sim.state.chargeToFull = true  // UI toggle
+
+        let action = sim.step(percentage: 85, adapterConnected: true)
+        XCTAssertEqual(action, .allow)
+        sim.chargeFrom(86, to: 99)
+        sim.step(percentage: 100, adapterConnected: true)
+        XCTAssertTrue(sim.state.chargingPaused)
+        XCTAssertFalse(sim.state.chargeToFull)
+        XCTAssertEqual(sim.issued, [.allow, .inhibit])
+    }
+
+    func testChargeToFull_UnplugAboveLower_ClearsWithoutDowngrade() {
+        // Unplug mid-full-charge above the lower bound: the one-shot dies
+        // with the AC session and nothing replaces it — reconnect parks at
+        // the current level (rule 3), same as an interrupted charge-to-upper.
+        let sim = Simulator(chargingPaused: true, lastAdapterConnected: true)
+        sim.stepUntilSettled(percentage: 50, adapterConnected: true)
+        sim.state.chargeToFull = true
+        sim.step(percentage: 50, adapterConnected: true)  // allow
+
+        sim.step(percentage: 55, adapterConnected: false)
+        XCTAssertFalse(sim.state.chargeToFull, "Unplug cancels charge-to-full")
+        XCTAssertFalse(sim.state.chargeToUpperBound, "No downgrade at/above lower")
+
+        let reconnect = sim.step(percentage: 55, adapterConnected: true)
+        XCTAssertEqual(reconnect, .inhibit, "Reconnect parks at the interruption level")
+    }
+
+    func testChargeToFull_UnplugBelowLower_DowngradesToChargeToUpper() {
+        // Unplug mid-full-charge below the lower bound: downgrade to
+        // charge-to-upper so reconnect behaves exactly like rule 1 (charge
+        // to the configured upper), instead of charging to the lower bound
+        // and parking there.
+        let sim = Simulator(
+            chargingPaused: false,
+            chargeToUpperBound: false,
+            chargeToFull: true,
+            lastAdapterConnected: true
+        )
+        sim.step(percentage: 35, adapterConnected: false)
+        XCTAssertFalse(sim.state.chargeToFull)
+        XCTAssertTrue(sim.state.chargeToUpperBound,
+                      "Below lower the session one-shot downgrades to the rule-1 intent")
+
+        // Reconnect: continues to the configured upper bound and stops there.
+        sim.step(percentage: 37, adapterConnected: true)
+        sim.chargeFrom(38, to: 59)
+        XCTAssertFalse(sim.state.chargingPaused)
+        sim.step(percentage: 60, adapterConnected: true)
+        XCTAssertTrue(sim.state.chargingPaused)
+        XCTAssertFalse(sim.state.chargeToUpperBound)
+    }
+
+    func testChargeToFull_StaleOnBattery_ClearsWithoutDowngrade() {
+        // A persisted chargeToFull that wakes up already on battery (crash
+        // inside the unplug window) is session-stale: it must clear on the
+        // first battery tick and must NOT plant a charge-to-upper intent —
+        // the downgrade only applies at the fresh unplug edge.
+        let sim = Simulator(
+            chargingPaused: false,
+            chargeToUpperBound: false,
+            chargeToFull: true,
+            lastAdapterConnected: false
+        )
+        sim.step(percentage: 35, adapterConnected: false)
+        XCTAssertFalse(sim.state.chargeToFull, "Session-stale flag clears on battery")
+        XCTAssertFalse(sim.state.chargeToUpperBound, "No downgrade without the unplug edge")
+        XCTAssertEqual(sim.issued.count, 0)
+    }
+
+    func testChargeToFull_At100WhilePaused_PureClearNoAction() {
+        // Crash-window analog of the ctu staleness repair: paused with
+        // chargeToFull=true at 100% must clear the flag with no SMC action —
+        // CHTE is already in the correct inhibit state.
+        let sim = Simulator(
+            chargingPaused: true,
+            chargeToUpperBound: false,
+            chargeToFull: true,
+            lastAdapterConnected: true
+        )
+        let action = sim.step(percentage: 100, adapterConnected: true)
+        XCTAssertEqual(action, .none)
+        XCTAssertFalse(sim.state.chargeToFull)
+        XCTAssertTrue(sim.state.chargingPaused)
+        XCTAssertEqual(sim.issued.count, 0)
+    }
+
+    func testChargeToFull_RestartOnACMidCharge_ContinuesWithoutAction() {
+        // Quit/crash + relaunch mid-full-charge, already past the configured
+        // upper bound (70% with upper 60). Launch restores chargeToFull with
+        // chargingPaused=false and CHTE=allow. The first refresh must issue
+        // NOTHING — in particular not the at/above-upper inhibit — so the
+        // in-progress full charge resumes seamlessly.
+        let sim = Simulator(
+            chargingPaused: false,
+            chargeToUpperBound: false,
+            chargeToFull: true,
+            lastAdapterConnected: true
+        )
+        sim.stepUntilSettled(percentage: 70, adapterConnected: true)
+        XCTAssertEqual(sim.issued.count, 0,
+                       "Resumed full charge must not be interrupted at the configured bound")
+        XCTAssertTrue(sim.state.chargeToFull)
+        XCTAssertFalse(sim.state.chargingPaused)
+    }
+
+    func testChargeToFull_WornBattery_CompletesOnBMSFullSignal() {
+        // A worn battery can terminate its charge below a displayed 100%.
+        // The BMS fully-charged flag must complete the one-shot exactly like
+        // reaching 100 — otherwise CHTE stays allow forever and the battery
+        // micro-charges at the top for as long as it stays plugged in.
+        let sim = Simulator(chargingPaused: true, lastAdapterConnected: true)
+        sim.stepUntilSettled(percentage: 50, adapterConnected: true)
+        sim.state.chargeToFull = true
+        sim.step(percentage: 50, adapterConnected: true)  // allow
+        sim.chargeFrom(51, to: 97)
+
+        // BMS says done at 97% displayed.
+        let action = sim.step(percentage: 97, adapterConnected: true, fullyCharged: true)
+        XCTAssertEqual(action, .inhibit)
+        XCTAssertFalse(sim.state.chargeToFull, "BMS full completes the one-shot")
+        XCTAssertTrue(sim.state.chargingPaused)
+        XCTAssertEqual(sim.issued, [.allow, .inhibit])
+    }
+
+    func testChargeToUpper_UpperBoundAt100_WornBattery_InhibitsOnBMSFullSignal() {
+        // Same worn-battery defect existed for a configured upper bound of
+        // 100: the percentage never reaches it, so without the BMS signal the
+        // allow state would never terminate.
+        let sim = Simulator(chargingPaused: true, lastAdapterConnected: true, upperBound: 100)
+        let recovery = sim.step(percentage: 35, adapterConnected: true)
+        XCTAssertEqual(recovery, .allow)
+        XCTAssertTrue(sim.state.chargeToUpperBound)
+
+        sim.chargeFrom(36, to: 99)
+        XCTAssertFalse(sim.state.chargingPaused)
+
+        let action = sim.step(percentage: 99, adapterConnected: true, fullyCharged: true)
+        XCTAssertEqual(action, .inhibit)
+        XCTAssertFalse(sim.state.chargeToUpperBound)
+        XCTAssertTrue(sim.state.chargingPaused)
+    }
+
+    func testChargeToFull_SpuriousFullSignalMidRange_FailsSafe() {
+        // A glitched fully-charged reading far from the top must fail SAFE:
+        // the one-shot clears and charging inhibits (rule 3 for the current
+        // level). Stopping early is recoverable by re-toggling; the opposite
+        // failure (charging forever) is not self-limiting.
+        let sim = Simulator(chargingPaused: true, lastAdapterConnected: true)
+        sim.stepUntilSettled(percentage: 50, adapterConnected: true)
+        sim.state.chargeToFull = true
+        sim.step(percentage: 50, adapterConnected: true)  // allow
+
+        let action = sim.step(percentage: 55, adapterConnected: true, fullyCharged: true)
+        XCTAssertEqual(action, .inhibit)
+        XCTAssertFalse(sim.state.chargeToFull)
+        XCTAssertTrue(sim.state.chargingPaused)
+    }
+
+    func testChargeToFull_WithChargeToUpperAlsoSet_UpperCrossingClearsOnlyCtu() {
+        // Below lower, rule 1 has already armed charge-to-upper; the user
+        // then asks for a full charge. Crossing the configured upper bound
+        // retires the (now stale) charge-to-upper flag but the full charge
+        // continues to 100 with no extra SMC writes.
+        let sim = Simulator(chargingPaused: true, lastAdapterConnected: true)
+        let recovery = sim.step(percentage: 35, adapterConnected: true)
+        XCTAssertEqual(recovery, .allow)
+        XCTAssertTrue(sim.state.chargeToUpperBound, "Rule 1 arms charge-to-upper")
+
+        sim.state.chargeToFull = true  // UI toggle mid-charge
+
+        sim.chargeFrom(36, to: 59)
+        XCTAssertTrue(sim.state.chargeToUpperBound)
+        sim.step(percentage: 60, adapterConnected: true)
+        XCTAssertFalse(sim.state.chargeToUpperBound,
+                       "Configured-upper crossing retires the charge-to-upper flag")
+        XCTAssertTrue(sim.state.chargeToFull)
+        XCTAssertFalse(sim.state.chargingPaused, "The full charge keeps going")
+
+        sim.chargeFrom(61, to: 99)
+        sim.step(percentage: 100, adapterConnected: true)
+        XCTAssertTrue(sim.state.chargingPaused)
+        XCTAssertFalse(sim.state.chargeToFull)
+        XCTAssertEqual(sim.issued, [.allow, .inhibit],
+                       "35% → 100% is still exactly one allow and one inhibit")
     }
 }
