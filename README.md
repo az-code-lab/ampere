@@ -16,7 +16,7 @@ A lightweight macOS menu bar app for monitoring battery status and controlling c
 - **Charge to full** - one-shot full charge without touching the configured bounds; normal management resumes when full
 - **Discharge to upper bound** - optionally drain the battery to the target level while on AC power
 - **Health check** - periodically verifies SMC state matches expected values
-- **In-app updates** - checks the Homebrew cask for new versions about once a day; click **Update to X** in the panel to download, verify, install, and relaunch
+- **In-app updates** - checks the Homebrew cask for new versions about once a day; a small blue badge dot on the menu bar icon signals a pending update, and clicking **Update to X** in the panel downloads, verifies, installs, and relaunches
 - **Menu bar icon** - battery shape with live charge level and animated fill when charging or discharging; the percent readout beside it can be hidden (Settings → Percent in Menu Bar) for a narrower menu bar footprint
 - **Pinnable popover** - pin the panel to keep it open while you work
 - **Launch at login** - start automatically when you log in
@@ -137,7 +137,7 @@ Health checks also run immediately after revoking admin access, and after re-gra
 
 ### Updates
 
-The app checks the Homebrew cask for a newer version 5 minutes after launch and about once a day after that. When one is found, the footer shows an **Update to X** button. Clicking it:
+The app checks the Homebrew cask for a newer version 5 minutes after launch and about once a day after that. When one is found, the menu bar battery icon gains a small blue badge dot (hover for the version; the dot renders alongside the orange health-warning tint when both apply) and the panel footer shows an **Update to X** button. Clicking it:
 
 1. Downloads the release DMG from GitHub Releases (progress shown in the footer).
 2. Verifies the download: SHA-256 must match the cask, the code signature must be intact, and the Team ID must match the running app.

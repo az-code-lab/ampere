@@ -33,6 +33,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var stateObserver: AnyCancellable?
     private var mouseMonitor: Any?
     private var globalMouseMonitor: Any?
+    /// Re-renders the icon when the menu bar flips light/dark. Needed
+    /// because the update badge forces non-template rendering (a colored
+    /// dot cannot survive template recoloring), so the battery color must
+    /// track the appearance manually instead of letting the system tint it.
+    private var appearanceObservation: NSKeyValueObservation?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Activation policy is set in main.swift before SwiftUI launches,
@@ -95,6 +100,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             }
         }
 
+        // Track menu bar light/dark so the non-template badge rendering
+        // recolors immediately (e.g. auto appearance switch at sunset)
+        // instead of waiting for the next poll-driven redraw.
+        appearanceObservation = NSApp.observe(\.effectiveAppearance) { [weak self] _, _ in
+            DispatchQueue.main.async {
+                self?.updateMenuBarIcon()
+            }
+        }
+
         // Reactivate app on any mouse click in our windows — fixes focus loss
         // for .accessory apps where clicking the popover doesn't auto-activate.
         mouseMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { event in
@@ -115,6 +129,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var lastIconPct: Int = -1
     private var lastIconCharging: Bool = false
     private var lastIconWarning: Bool = false
+    private var lastIconUpdate: Bool = false
+    private var lastIconDark: Bool = false
     private var lastIconShowPct: Bool = true
     private var lastIconPanelAnchored: Bool = false
     /// Whether the last rendered title occupied its full width (visible or
@@ -146,6 +162,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let pct = monitor.state?.percentage ?? 0
         let isCharging = effectivelyCharging()
         let hasWarning = monitor.healthWarning != nil
+        let hasUpdate = monitor.updateAvailable != nil
+        let dark = menuBarIsDark
         let showPct = monitor.showMenuBarPercent
 
         let isAnimatingDown = monitor.activeDischarging
@@ -157,6 +175,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // already matches the desired state — the timer redraws animated
         // frames on its own.
         if pct == lastIconPct, isCharging == lastIconCharging, hasWarning == lastIconWarning,
+           hasUpdate == lastIconUpdate, dark == lastIconDark,
            showPct == lastIconShowPct, panelAnchored == lastIconPanelAnchored,
            needsAnimation == (animationTimer != nil) {
             return
@@ -185,7 +204,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 let warn = self.monitor.healthWarning != nil
                 button.image = self.buildMenuBarIcon(
                     percentage: CGFloat(self.animationPct),
-                    hasWarning: warn
+                    hasWarning: warn,
+                    hasUpdate: self.monitor.updateAvailable != nil
                 )
             }
         }
@@ -193,14 +213,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         lastIconPct = pct
         lastIconCharging = isCharging
         lastIconWarning = hasWarning
+        lastIconUpdate = hasUpdate
+        lastIconDark = dark
         lastIconShowPct = showPct
         lastIconPanelAnchored = panelAnchored
 
         let displayPct = needsAnimation ? animationPct : pct
         button.image = buildMenuBarIcon(
             percentage: CGFloat(displayPct),
-            hasWarning: hasWarning
+            hasWarning: hasWarning,
+            hasUpdate: hasUpdate
         )
+        // The badge is deliberately wordless; the tooltip says what it means.
+        button.toolTip = monitor.updateAvailable.map {
+            "Ampere \($0.version) is available. Click to open the panel and update."
+        }
         // Menu bar items resize from the LEFT edge, so narrowing this item
         // drags the icon — and the panel anchored to it — sideways. While
         // the panel is anchored the width may therefore grow (percent
@@ -328,7 +355,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     deinit {
         // pinnedObserver / stateObserver are AnyCancellable — they cancel
         // automatically when this AppDelegate's stored properties go out of
-        // scope, so no explicit .cancel() needed here.
+        // scope, so no explicit .cancel() needed here. NSKeyValueObservation
+        // also self-invalidates on deinit; the explicit call just makes the
+        // teardown order obvious.
+        appearanceObservation?.invalidate()
         animationTimer?.invalidate()
         if let registrationShowObserver {
             NotificationCenter.default.removeObserver(registrationShowObserver)
@@ -341,7 +371,29 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
     }
 
-    private func buildMenuBarIcon(percentage: CGFloat, hasWarning: Bool = false) -> NSImage {
+    /// True when the menu bar around the status item renders dark. Read from
+    /// the button (not NSApp) so wallpaper-tinted menu bars resolve correctly.
+    /// False when the status item doesn't exist yet.
+    private var menuBarIsDark: Bool {
+        statusItem?.button?.effectiveAppearance
+            .bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+    }
+
+    private func buildMenuBarIcon(percentage: CGFloat, hasWarning: Bool = false,
+                                  hasUpdate: Bool = false) -> NSImage {
+        Self.renderMenuBarIcon(percentage: percentage, hasWarning: hasWarning,
+                               hasUpdate: hasUpdate, darkMenuBar: menuBarIsDark)
+    }
+
+    /// Pure icon renderer. Internal (not private) so headless snapshot tests
+    /// can exercise every variant without instantiating the app.
+    ///
+    /// Template rendering only survives while the icon is monochrome: the
+    /// system recolors template images from their alpha alone, which would
+    /// erase the badge's blue and the warning's orange. Those variants render
+    /// non-template, picking the battery color from `darkMenuBar` manually.
+    static func renderMenuBarIcon(percentage: CGFloat, hasWarning: Bool,
+                                  hasUpdate: Bool, darkMenuBar: Bool) -> NSImage {
         let battW: CGFloat = 24
         let battH: CGFloat = 11
         let capW: CGFloat = 2.8
@@ -351,7 +403,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let image = NSImage(size: NSSize(width: totalW, height: totalH))
         image.lockFocus()
 
-        let color: NSColor = hasWarning ? .systemOrange : .black
+        let color: NSColor = hasWarning ? .systemOrange
+            : (hasUpdate ? (darkMenuBar ? .white : .black) : .black)
         let battY = (totalH - battH) / 2
 
         // Battery outline
@@ -378,8 +431,27 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         color.setFill()
         NSBezierPath(roundedRect: fillRect, xRadius: 1, yRadius: 1).fill()
 
+        // Update-available badge: a small blue dot over the top-right corner,
+        // separated from the battery by a knocked-out ring so it reads
+        // crisply over the outline, the fill, and any menu bar background.
+        if hasUpdate {
+            let center = NSPoint(x: battW - 1, y: battY + battH - 1)
+            let ringR: CGFloat = 4.6
+            let dotR: CGFloat = 3.2
+            if let ctx = NSGraphicsContext.current {
+                ctx.compositingOperation = .destinationOut
+                NSColor.black.setFill()  // only the alpha matters for the punch-out
+                NSBezierPath(ovalIn: NSRect(x: center.x - ringR, y: center.y - ringR,
+                                            width: ringR * 2, height: ringR * 2)).fill()
+                ctx.compositingOperation = .sourceOver
+            }
+            NSColor.systemBlue.setFill()
+            NSBezierPath(ovalIn: NSRect(x: center.x - dotR, y: center.y - dotR,
+                                        width: dotR * 2, height: dotR * 2)).fill()
+        }
+
         image.unlockFocus()
-        image.isTemplate = !hasWarning
+        image.isTemplate = !hasWarning && !hasUpdate
         return image
     }
 }
@@ -1158,7 +1230,11 @@ struct ContentView: View {
                         Text("Update to \(update.version)")
                     }
                 }
-                .buttonStyle(FooterButtonStyle(tint: .orange, hoverTint: .orange))
+                // Blue pairs with the menu bar badge dot: one color for
+                // "update" everywhere, keeping orange exclusive to warnings
+                // (the failed-state triangle above stays orange for that
+                // reason).
+                .buttonStyle(FooterButtonStyle(tint: .blue, hoverTint: .blue))
                 .help("Download v\(update.version), verify, install, and relaunch. Currently on \(AppVersion.current).")
             }
         }
