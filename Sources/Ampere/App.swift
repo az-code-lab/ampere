@@ -166,6 +166,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let dark = menuBarIsDark
         let showPct = monitor.showMenuBarPercent
 
+        // Refresh the hover tooltip before the render-skip guard below: the
+        // status line's ETA ticks along even when nothing the icon renders
+        // has changed.
+        button.toolTip = menuBarToolTip()
+
         let isAnimatingDown = monitor.activeDischarging
         let needsAnimation = isCharging || isAnimatingDown
 
@@ -224,10 +229,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             hasWarning: hasWarning,
             hasUpdate: hasUpdate
         )
-        // The badge is deliberately wordless; the tooltip says what it means.
-        button.toolTip = monitor.updateAvailable.map {
-            "Ampere \($0.version) is available. Click to open the panel and update."
-        }
         // Menu bar items resize from the LEFT edge, so narrowing this item
         // drags the icon — and the panel anchored to it — sideways. While
         // the panel is anchored the width may therefore grow (percent
@@ -250,6 +251,25 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             // Icon-only mode: a health warning still shows via the orange icon.
             button.attributedTitle = NSAttributedString(string: "")
         }
+    }
+
+    /// Hover text for the menu bar icon: the same status line the panel
+    /// header shows, prefixed with the charge percent (which may be hidden
+    /// from the menu bar itself), plus the health warning and the pending
+    /// update when present — the two states the icon can only signal with
+    /// the orange tint and the wordless badge dot.
+    private func menuBarToolTip() -> String? {
+        var lines: [String] = []
+        if let state = monitor.state {
+            lines.append("\(state.percentage)% — \(monitor.statusLine(for: state))")
+        }
+        if let warning = monitor.healthWarning {
+            lines.append(warning)
+        }
+        if let update = monitor.updateAvailable {
+            lines.append("Ampere \(update.version) is available. Click to open the panel and update.")
+        }
+        return lines.isEmpty ? nil : lines.joined(separator: "\n")
     }
 
     private func showRegistrationWindow() {
@@ -332,10 +352,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
     }
 
-    @objc private func detachedWindowDidClose(_ notification: Notification) {
-        NotificationCenter.default.removeObserver(self, name: NSWindow.willCloseNotification, object: notification.object)
+    /// Shared teardown for both panel close paths (attached popover closing,
+    /// detached window closing): unpin, drop back to slow polling, and fold
+    /// the settings section so the next open starts collapsed.
+    private func panelDidClose() {
         monitor.pinned = false
         monitor.setFastPolling(false)
+        monitor.settingsExpanded = false
+    }
+
+    @objc private func detachedWindowDidClose(_ notification: Notification) {
+        NotificationCenter.default.removeObserver(self, name: NSWindow.willCloseNotification, object: notification.object)
+        panelDidClose()
     }
 
     func popoverDidClose(_ notification: Notification) {
@@ -343,8 +371,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // but NOT when the detached window is closed. The detached window
         // close is handled by detachedWindowDidClose above.
         guard !popover.isDetached else { return }
-        monitor.pinned = false
-        monitor.setFastPolling(false)
+        panelDidClose()
         // Nothing is anchored to the item anymore — release the deferred
         // width shrink (this is where the item narrows when the percent
         // was hidden while the panel was open).
@@ -471,11 +498,6 @@ struct ContentView: View {
     @AppStorage("ui.rawChargeShowMAh") private var rawChargeShowMAh = false
     @State private var showAbout = false
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
-    // Deliberately @State, not persisted: the settings section starts folded
-    // on every launch, but keeps its state while the app runs (the popover
-    // closing does not recreate this view).
-    @State private var settingsExpanded = false
-    @State private var settingsHeaderHovering = false
     @State private var pinHovering = false
 
     private var healthCheckTimeString: String {
@@ -548,33 +570,42 @@ struct ContentView: View {
             if monitor.autoManageEnabled {
                 Divider().padding(.horizontal)
 
-                // Auto charge management content (slider + discharge toggle)
+                // Auto charge content (slider + discharge toggle)
                 autoManageContent(state)
-            }
-
-            Divider().padding(.horizontal).padding(.top, 8)
-
-            // Settings disclosure: auto charge management, launch at login,
-            // and registration. Always collapsed on a fresh launch.
-            settingsHeader()
-
-            if settingsExpanded {
-                autoManageToggle()
-                launchAtLoginRow()
-                menuBarPercentRow()
-                registrationRow()
             }
 
             Divider().padding(.horizontal).padding(.top, 8)
 
             // Footer actions
             HStack(spacing: 12) {
-                if monitor.isSudoRuleInstalled {
-                    Button("Revoke Admin Access") {
-                        monitor.removeSudoRule()
+                Button {
+                    monitor.settingsExpanded.toggle()
+                } label: {
+                    HStack(spacing: 6) {
+                        Text("Settings")
+                        // Unregistered is the one settings state worth
+                        // surfacing while the section is folded — the
+                        // Registration row inside is the only entry point
+                        // to the registration window. Wording and orange
+                        // match that row; the explicit color keeps the
+                        // button style's tint from recoloring it. Gone
+                        // entirely once registered.
+                        if !registration.isRegistered {
+                            Text("Unregistered")
+                                .foregroundColor(.orange)
+                        }
                     }
-                    .buttonStyle(FooterButtonStyle())
                 }
+                // Accent while expanded marks the link as the active toggle
+                // for the rows below it.
+                .buttonStyle(FooterButtonStyle(
+                    tint: monitor.settingsExpanded ? .accentColor : .secondary,
+                    hoverTint: monitor.settingsExpanded ? .accentColor : .primary))
+                .help(monitor.settingsExpanded
+                    ? "Hide settings"
+                    : registration.isRegistered
+                        ? "Show settings"
+                        : "Show settings — unregistered, register from the Registration row")
                 Spacer()
                 if let update = monitor.updateAvailable {
                     updateControl(update)
@@ -617,6 +648,22 @@ struct ContentView: View {
                     Text("Battery status monitor and charge controller for Apple Silicon Macs.")
                         .font(.system(size: 12))
                         .foregroundColor(.secondary)
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 4) {
+                            Text("Website:")
+                                .font(.system(size: 12))
+                                .foregroundColor(.secondary)
+                            Link("amperebattery.app", destination: URL(string: "https://amperebattery.app/")!)
+                                .font(.system(size: 12))
+                        }
+                        HStack(spacing: 4) {
+                            Text("Support:")
+                                .font(.system(size: 12))
+                                .foregroundColor(.secondary)
+                            Link("azcode.dev", destination: URL(string: "https://azcode.dev/")!)
+                                .font(.system(size: 12))
+                        }
+                    }
                     Divider()
                     HStack(spacing: 4) {
                         Text("Health check:")
@@ -691,6 +738,20 @@ struct ContentView: View {
                 .padding(20)
                 .frame(width: 300)
             }
+
+            // Settings rows: toggled by the footer link above, so they
+            // expand below it and the panel grows downward. AppDelegate
+            // collapses the section whenever the panel closes.
+            if monitor.settingsExpanded {
+                Divider().padding(.horizontal)
+                autoManageToggle()
+                launchAtLoginRow()
+                menuBarPercentRow()
+                registrationRow()
+                if monitor.isSudoRuleInstalled {
+                    revokeAdminRow()
+                }
+            }
         }
         .padding(.vertical, 20)
     }
@@ -731,7 +792,7 @@ struct ContentView: View {
                     .fill(statusColor(state))
                     .frame(width: 8, height: 8)
 
-                Text(statusLine(state))
+                Text(monitor.statusLine(for: state))
                     .font(.system(size: 13, weight: .medium))
                     .foregroundColor(.secondary)
             }
@@ -743,35 +804,6 @@ struct ContentView: View {
                 .textSelection(.enabled)
                 .frame(height: 14)
         }
-    }
-
-    /// "Charging — Xh Ym to NN%" / "Discharging — Xm remaining" / etc.
-    /// Combines `statusText` with `displayedTimeRemaining` and computes
-    /// the ETA once per render (the prior inline form called the helper
-    /// twice — once for the empty check and again in the interpolation).
-    private func statusLine(_ state: BatteryState) -> String {
-        let trailing = displayedTimeRemaining(state)
-        return trailing.isEmpty ? statusText(state) : "\(statusText(state)) — \(trailing)"
-    }
-
-    /// Compute our own ETA from the live amperage so the label is consistent
-    /// across charging/discharging modes and doesn't go silent in scenarios
-    /// IOKit doesn't track (active SMC discharge, weak adapter making the
-    /// battery supplement). Falls back to `state.timeRemaining` only when
-    /// the computation can't run — that path still serves the on-battery
-    /// "Xh Ym remaining" case via IOKit's smart `TimeToEmpty` estimator.
-    private func displayedTimeRemaining(_ state: BatteryState) -> String {
-        let eta = TimeRemainingRouter.label(
-            percentage: state.percentage,
-            maxCapacity: state.maxCapacity,
-            amperage: state.amperage,
-            autoManageEnabled: monitor.autoManageEnabled,
-            activeDischarging: monitor.activeDischarging,
-            // Effective bound: while charge-to-full is active the charging
-            // target is 100, which also selects the "to full" suffix.
-            upperBound: monitor.effectiveUpperBound
-        )
-        return eta.isEmpty ? state.timeRemaining : eta
     }
 
     private func statusMessage(_ state: BatteryState) -> String {
@@ -917,61 +949,6 @@ struct ContentView: View {
         return String(format: "%.2f V", volts)
     }
 
-    /// Disclosure header for the settings rows. While collapsed it shows
-    /// compact status icons so auto-manage / launch-at-login / registration
-    /// state stays visible at a glance — the registration row is the only
-    /// entry point to the registration window, so its status must not
-    /// disappear entirely when folded.
-    private func settingsHeader() -> some View {
-        Button(action: { settingsExpanded.toggle() }) {
-            HStack {
-                Image(systemName: "gearshape.fill")
-                    .font(.system(size: 14))
-                    .foregroundColor(.secondary)
-                Text("Settings")
-                    .font(.system(size: 13, weight: .semibold))
-                Spacer()
-                if !settingsExpanded {
-                    Image(systemName: "arrow.up.arrow.down.circle.fill")
-                        .font(.system(size: 12))
-                        .foregroundColor(monitor.autoManageEnabled ? .accentColor : .secondary)
-                    Image(systemName: "arrow.right.circle.fill")
-                        .font(.system(size: 12))
-                        .foregroundColor(launchAtLogin ? .accentColor : .secondary)
-                    Image(systemName: "percent")
-                        .font(.system(size: 12))
-                        .foregroundColor(monitor.showMenuBarPercent ? .accentColor : .secondary)
-                    Image(systemName: registration.isRegistered ? "checkmark.seal.fill" : "xmark.seal.fill")
-                        .font(.system(size: 12))
-                        .foregroundColor(registration.isRegistered ? .accentColor : .orange)
-                }
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundColor(.secondary)
-                    .rotationEffect(.degrees(settingsExpanded ? 90 : 0))
-            }
-            // Inner 8 + outer 8 keeps the content aligned with the 16pt
-            // padding of the rows below while giving the hover highlight
-            // a small inset from the panel edges.
-            .padding(.horizontal, 8)
-            .padding(.vertical, 5)
-            .background(
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(Color.primary.opacity(settingsHeaderHovering ? 0.06 : 0))
-            )
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .padding(.horizontal, 8)
-        .onHover { hovering in
-            settingsHeaderHovering = hovering
-            if hovering { NSCursor.pointingHand.set() } else { NSCursor.arrow.set() }
-        }
-        .animation(.easeOut(duration: 0.12), value: settingsHeaderHovering)
-        .animation(.easeOut(duration: 0.15), value: settingsExpanded)
-        .help(settingsExpanded ? "Collapse settings" : "Expand settings")
-    }
-
     private func launchAtLoginRow() -> some View {
         HStack {
             Image(systemName: "arrow.right.circle.fill")
@@ -992,7 +969,11 @@ struct ContentView: View {
 
     private func menuBarPercentRow() -> some View {
         HStack {
-            Image(systemName: "percent")
+            // number.circle.fill, not `percent`: SF Symbols has no filled-
+            // circle percent glyph, and the settings rows keep to one
+            // *.circle.fill family so the icons match in size and weight
+            // (bare glyphs read smaller at the same point size).
+            Image(systemName: "number.circle.fill")
                 .font(.system(size: 14))
                 .foregroundColor(monitor.showMenuBarPercent ? .accentColor : .secondary)
             Text("Percent in Menu Bar")
@@ -1014,7 +995,7 @@ struct ContentView: View {
             Image(systemName: "arrow.up.arrow.down.circle.fill")
                 .font(.system(size: 14))
                 .foregroundColor(monitor.autoManageEnabled ? .accentColor : .secondary)
-            Text("Auto Charge Management")
+            Text("Auto Charge")
                 .font(.system(size: 13, weight: .semibold))
             Spacer()
             Toggle("", isOn: Binding(
@@ -1041,7 +1022,7 @@ struct ContentView: View {
                                 monitor.refresh()
                             } else {
                                 monitor.autoManageEnabled = false
-                                monitor.lastError = "Admin access required for auto charge management"
+                                monitor.lastError = "Admin access required for auto charge"
                             }
                         }
                     } else {
@@ -1049,7 +1030,7 @@ struct ContentView: View {
                         monitor.chargeToUpperBound = false
                         monitor.chargeToFull = false
                         // Any pending error in auto-manage mode (most commonly
-                        // "Admin access required for auto charge management"
+                        // "Admin access required for auto charge"
                         // from a failed prior enable) is no longer relevant
                         // once the user has disabled auto-manage.
                         monitor.lastError = nil
@@ -1154,11 +1135,11 @@ struct ContentView: View {
             if state.adapterConnected
                 && ((state.percentage < 100 && !state.fullyCharged) || monitor.chargeToFull) {
                 HStack {
-                    // Fixed icon frame (also on the two rows above): this
-                    // battery glyph is much wider than the arrow glyphs, and
-                    // these rows can stack — without a shared width the text
-                    // edges would misalign.
-                    Image(systemName: "battery.100percent.bolt")
+                    // Same arrow family as the two rows above, which this can
+                    // stack with: to-line arrows stop at the bound, the bare
+                    // up arrow runs to full. The shared fixed frame (also on
+                    // those rows) keeps the stacked text edges aligned.
+                    Image(systemName: "arrow.up")
                         .font(.system(size: 14))
                         .foregroundColor(monitor.chargeToFull ? .accentColor : .secondary)
                         .frame(width: 26)
@@ -1242,10 +1223,16 @@ struct ContentView: View {
 
     private func registrationRow() -> some View {
         HStack {
-            Image(systemName: registration.isRegistered ? "checkmark.seal.fill" : "xmark.seal.fill")
+            // Circle variants (not the seals): seals render 18x18 where the
+            // sibling circles are 16x16, visibly oversizing this row's icon
+            // and indenting its label.
+            Image(systemName: registration.isRegistered ? "checkmark.circle.fill" : "xmark.circle.fill")
                 .font(.system(size: 14))
                 .foregroundColor(registration.isRegistered ? .accentColor : .orange)
-            Text("Registration")
+            // "Registered to <name>" once registered; the unregistered row
+            // keeps the neutral label — "Registered to … Unregistered"
+            // would contradict itself.
+            Text(registration.isRegistered ? "Registered to" : "Registration")
                 .font(.system(size: 13, weight: .semibold))
             Spacer()
             Button(action: {
@@ -1263,6 +1250,27 @@ struct ContentView: View {
             .help(registration.isRegistered
                 ? "Registered to \(registration.email) — click to manage"
                 : "Unregistered — click to enter your registration key")
+        }
+        .padding(.horizontal, 16)
+    }
+
+    /// Settings-row home of the old footer "Revoke Admin Access" button.
+    /// Visible only while the sudoers rule is installed, same as the button
+    /// was: revocation publishes state changes when it completes, so the
+    /// row disappears on success and stays if cancelled.
+    private func revokeAdminRow() -> some View {
+        HStack {
+            Image(systemName: "lock.circle.fill")
+                .font(.system(size: 14))
+                .foregroundColor(.accentColor)
+            Text("Admin Access")
+                .font(.system(size: 13, weight: .semibold))
+            Spacer()
+            Button("Revoke") {
+                monitor.removeSudoRule()
+            }
+            .buttonStyle(FooterButtonStyle())
+            .help("Remove the helper binary and passwordless sudo rule (prompts for your admin password). Charge control stops working until access is granted again.")
         }
         .padding(.horizontal, 16)
     }
@@ -1334,13 +1342,48 @@ struct ContentView: View {
         return .secondary
     }
 
-    private func statusText(_ state: BatteryState) -> String {
+}
+
+// MARK: - Status line (panel header + menu bar tooltip)
+
+extension BatteryMonitor {
+    /// "Charging — Xh Ym to NN%" / "Discharging — Xm remaining" / etc.
+    /// Combines `statusText` with `displayedTimeRemaining` and computes the
+    /// ETA once per call. Lives on the monitor (not ContentView) because the
+    /// menu bar icon's hover tooltip shows the same line as the panel
+    /// header — one source so the two can never disagree.
+    func statusLine(for state: BatteryState) -> String {
+        let trailing = displayedTimeRemaining(for: state)
+        return trailing.isEmpty ? statusText(for: state) : "\(statusText(for: state)) — \(trailing)"
+    }
+
+    private func statusText(for state: BatteryState) -> String {
         if (state.amperage ?? 0) > 0 { return "Charging" }
-        if monitor.activeDischarging { return "Discharging" }
-        if monitor.chargingPaused && state.adapterConnected { return "On AC Power (Not Charging)" }
+        if activeDischarging { return "Discharging" }
+        if chargingPaused && state.adapterConnected { return "On AC Power (Not Charging)" }
         if state.isCharging { return "Charging" }
         if state.adapterConnected { return "On AC Power" }
         return "On Battery"
+    }
+
+    /// Compute our own ETA from the live amperage so the label is consistent
+    /// across charging/discharging modes and doesn't go silent in scenarios
+    /// IOKit doesn't track (active SMC discharge, weak adapter making the
+    /// battery supplement). Falls back to `state.timeRemaining` only when
+    /// the computation can't run — that path still serves the on-battery
+    /// "Xh Ym remaining" case via IOKit's smart `TimeToEmpty` estimator.
+    private func displayedTimeRemaining(for state: BatteryState) -> String {
+        let eta = TimeRemainingRouter.label(
+            percentage: state.percentage,
+            maxCapacity: state.maxCapacity,
+            amperage: state.amperage,
+            autoManageEnabled: autoManageEnabled,
+            activeDischarging: activeDischarging,
+            // Effective bound: while charge-to-full is active the charging
+            // target is 100, which also selects the "to full" suffix.
+            upperBound: effectiveUpperBound
+        )
+        return eta.isEmpty ? state.timeRemaining : eta
     }
 }
 

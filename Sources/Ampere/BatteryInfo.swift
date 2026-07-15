@@ -99,6 +99,13 @@ final class BatteryMonitor: ObservableObject {
     /// attached SwiftUI sheet strands the sheet's presentation state, and
     /// the reopened panel sits behind an invisible modal, dead to clicks.
     @Published var sheetVisible: Bool = false
+    /// True while the settings rows are shown below the panel footer.
+    /// Pure UI state like `isPopoverVisible` — not persisted, and lives here
+    /// rather than as ContentView @State because AppDelegate must fold the
+    /// section whenever the panel closes (popover or detached window): the
+    /// hidden view isn't recreated on reopen, and offscreen SwiftUI onChange
+    /// delivery is not guaranteed.
+    @Published var settingsExpanded: Bool = false
 
     @Published var autoManageEnabled: Bool {
         didSet {

@@ -10,14 +10,14 @@ A lightweight macOS menu bar app for monitoring battery status and controlling c
 
 - **Real-time battery stats** - percentage, cycle count, health, temperature, raw charge, and battery age, plus wattage (adapter / battery / system), voltage (adapter / battery), and current (adapter / battery)
 - **Charge control** - pause and resume charging via SMC
-- **Auto charge management** - configurable upper/lower bounds to keep your battery in an optimal charge range
+- **Auto charge** - configurable upper/lower bounds to keep your battery in an optimal charge range
 - **Micro-charge prevention** - inhibits charging between bounds after restart; only charges from below the lower bound or on explicit user request
 - **Charge to upper bound** - explicitly allow charging from the current level to the upper bound
 - **Charge to full** - one-shot full charge without touching the configured bounds; normal management resumes when full
 - **Discharge to upper bound** - optionally drain the battery to the target level while on AC power
 - **Health check** - periodically verifies SMC state matches expected values
 - **In-app updates** - checks the Homebrew cask for new versions about once a day; a small blue badge dot on the menu bar icon signals a pending update, and clicking **Update to X** in the panel downloads, verifies, installs, and relaunches
-- **Menu bar icon** - battery shape with live charge level and animated fill when charging or discharging; the percent readout beside it can be hidden (Settings → Percent in Menu Bar) for a narrower menu bar footprint
+- **Menu bar icon** - battery shape with live charge level and animated fill when charging or discharging; hovering it shows the current charge and status (e.g. "85% — Charging — 32m to 80%"); the percent readout beside it can be hidden (Settings → Percent in Menu Bar) for a narrower menu bar footprint
 - **Pinnable popover** - pin the panel to keep it open while you work
 - **Launch at login** - start automatically when you log in
 - **Registration** - register with an email and registration key, bound to this Mac; the panel shows "Unregistered" until then. The registration is re-verified against the license server about once a day — network failures never clear it — and can be deregistered from the panel to move the key to another Mac.
@@ -53,7 +53,7 @@ Pausing/resuming charging requires root access to write to the SMC. Ampere handl
 
 > **Note:** Admin access is granted per macOS user account — the sudoers rule names the account that installed it. If another account on the same Mac grants access, the rule is rewritten for that account, and the first account will be prompted for its password again on its next launch.
 
-### Auto Charge Management
+### Auto Charge
 
 When enabled, the app automatically manages charging between configurable bounds:
 
@@ -99,7 +99,7 @@ Like Charge to Upper Bound, the toggle is persisted: an in-progress full charge 
 
 ### Manual Charge Control
 
-When auto charge management is off and a power adapter is connected, a manual **Pause Charging** / **Resume Charging** button is available.
+When auto charge is off and a power adapter is connected, a manual **Pause Charging** / **Resume Charging** button is available.
 
 ### Behavior on Sleep/Wake and Quit/Restart
 
@@ -111,7 +111,7 @@ When auto charge management is off and a power adapter is connected, a manual **
 
 ### Settings and Safety
 
-- **Settings persist across restarts** - auto charge management, discharge toggle, and charge bounds are saved and restored when the app relaunches.
+- **Settings persist across restarts** - auto charge, discharge toggle, and charge bounds are saved and restored when the app relaunches.
 - **Quitting the app restores system defaults** - all SMC overrides (charging inhibit, discharge) and power management changes (sleep settings) are cleared when the app exits. Your Mac returns to its normal charging and sleep behavior. If the app crashes or is force-killed, a watchdog daemon cleans up automatically within a few seconds.
 
 ### Health Check
@@ -143,7 +143,7 @@ The app checks the Homebrew cask for a newer version 5 minutes after launch and 
 2. Verifies the download: SHA-256 must match the cask, the code signature must be intact, and the Team ID must match the running app.
 3. Swaps the new bundle into place (two atomic renames) and relaunches.
 
-The relaunch takes the normal quit → restart path: SMC overrides are restored on the way down, and persisted state (auto charge management, bounds, an in-progress charge/discharge to upper bound) resumes in the new copy. If the bundled SMCWriter changed, the next launch asks for your admin password once to install the new helper — same as after a Homebrew upgrade.
+The relaunch takes the normal quit → restart path: SMC overrides are restored on the way down, and persisted state (auto charge, bounds, an in-progress charge/discharge to upper bound) resumes in the new copy. If the bundled SMCWriter changed, the next launch asks for your admin password once to install the new helper — same as after a Homebrew upgrade.
 
 If any step fails (e.g. the install location isn't writable), the error is shown next to the button and nothing is changed; `brew upgrade --cask ampere` always works as a fallback. Updating in-app leaves Homebrew's recorded version behind until the next `brew upgrade`, which harmlessly reinstalls the current release.
 
@@ -178,7 +178,7 @@ Charge control installs privileged files that persist after the app is deleted:
 - `/etc/sudoers.d/az-ampere` - the sudoers rule that allows passwordless execution of the helper
 - `/Library/Application Support/az-ampere/` - state directory for the saved-sleep markers (only exists if discharge was ever used)
 
-**From the UI:** Click **Revoke Admin Access** in the app's popover panel. This removes all of them (prompts for your admin password).
+**From the UI:** Click **Settings** in the panel footer, then **Revoke** on the Admin Access row. This removes all of them (prompts for your admin password).
 
 **From the command line:**
 
@@ -194,7 +194,7 @@ sudo rm -rf '/Library/Application Support/az-ampere'
 
 The helper binary may be corrupted. Fix by revoking and re-granting access:
 
-1. Click **Revoke Admin Access**
+1. Click **Settings** in the panel footer, then **Revoke** on the Admin Access row
 2. Relaunch the app - it will prompt for your password and install a fresh helper
 
 ---
@@ -282,7 +282,7 @@ A **watchdog daemon** is always running while the app is active. It is spawned v
 
 The watchdog must be spawned with `posix_spawn` (not `fork`) because the Swift/ObjC runtime is not fork-safe — forked children crash when using Foundation, IOKit, or Objective-C APIs. Similarly, signal handlers (`SIGTERM`/`SIGHUP`) cannot be used for cleanup because they can only call async-signal-safe C functions, not Swift/Foundation/IOKit APIs. It is spawned with `POSIX_SPAWN_SETSID` so it runs in its own session: without that it would share the app's foreground process group, and a terminal Ctrl+C (dev runs via `run.sh`) would SIGINT the watchdog at the same instant as the app it exists to clean up after.
 
-On app launch, any orphaned watchdog processes from a previous crash are killed via `pkill`, and CHIE/sleep settings are cleared. CHTE is set to inhibit only when auto charge management is enabled, the battery is at or above the lower bound, AND no in-progress charge-to-upper-bound is being resumed (i.e. `chargeToUpperBound` is not persisted as `true`); otherwise CHTE is cleared. A fresh watchdog is then spawned.
+On app launch, any orphaned watchdog processes from a previous crash are killed via `pkill`, and CHIE/sleep settings are cleared. CHTE is set to inhibit only when auto charge is enabled, the battery is at or above the lower bound, AND no in-progress charge-to-upper-bound is being resumed (i.e. `chargeToUpperBound` is not persisted as `true`); otherwise CHTE is cleared. A fresh watchdog is then spawned.
 
 ### Process Architecture
 
