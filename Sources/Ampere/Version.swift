@@ -24,8 +24,8 @@ enum AppVersion {
             task.waitUntilExit()
             if let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
                 .trimmingCharacters(in: .whitespacesAndNewlines), !output.isEmpty {
-                return "0.0.1" // test upgrade
-                // return output
+                // return "0.0.1" // test upgrade
+                return output
             }
         } catch {
             // git unavailable or failed to launch — fall through to "dev"
