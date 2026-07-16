@@ -319,7 +319,28 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             updateMenuBarIcon()
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             NSApp.activate(ignoringOtherApps: true)
+            // Force the popover's panel key so SwiftUI drag gestures (the
+            // charge-bound slider thumbs) track. An accessory app's popover
+            // is a non-activating panel that can come up non-key, most
+            // visibly right after an in-app update relaunch, where the
+            // updater's `open` and the one-time helper admin prompt disturb
+            // the app's activation state. Clicks still work (the global
+            // click monitor reactivates the app), but a drag needs the
+            // window to stay key across the whole down/move/up sequence.
+            // Re-assert once after AppKit's own post-show focus juggling
+            // settles, mirroring SheetKeyActivator's 0.05s bounce.
+            makePopoverWindowKey()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                guard let self, self.popover.isShown else { return }
+                self.makePopoverWindowKey()
+            }
         }
+    }
+
+    /// Make the popover's hosting panel the key window. See the call site in
+    /// togglePopover for why an accessory app's popover needs this nudge.
+    private func makePopoverWindowKey() {
+        popover.contentViewController?.view.window?.makeKey()
     }
 
     func popoverShouldDetach(_ popover: NSPopover) -> Bool {
@@ -665,6 +686,17 @@ struct ContentView: View {
                                 .font(.system(size: 12))
                                 .foregroundColor(.secondary)
                             Link("amperebattery.app", destination: URL(string: "https://amperebattery.app/")!)
+                                .font(.system(size: 12))
+                        }
+                        HStack(spacing: 4) {
+                            Text("Changelog:")
+                                .font(.system(size: 12))
+                                .foregroundColor(.secondary)
+                            // Display text drops the ".html" so the row fits
+                            // the 300pt sheet on one line (the full URL
+                            // wraps); the destination needs the extension —
+                            // the extensionless path 404s on the server.
+                            Link("amperebattery.app/changelog", destination: URL(string: "https://amperebattery.app/changelog.html")!)
                                 .font(.system(size: 12))
                         }
                         HStack(spacing: 4) {
