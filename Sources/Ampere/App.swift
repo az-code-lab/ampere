@@ -168,8 +168,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         // Refresh the hover tooltip before the render-skip guard below: the
         // status line's ETA ticks along even when nothing the icon renders
-        // has changed.
-        button.toolTip = menuBarToolTip()
+        // has changed. Assign only on a real change: every assignment
+        // re-installs the tooltip, which restarts the hover delay (and hides
+        // an already-visible tooltip) whenever the cursor is on the icon.
+        let toolTip = menuBarToolTip()
+        if button.toolTip != toolTip {
+            button.toolTip = toolTip
+        }
 
         let isAnimatingDown = monitor.activeDischarging
         let needsAnimation = isCharging || isAnimatingDown
@@ -616,28 +621,34 @@ struct ContentView: View {
                             monitor.checkForUpdateNow()
                         }
                         .buttonStyle(FooterButtonStyle())
+                        .help("Check for a newer version now; Ampere also checks automatically once a day")
                     case .checking:
                         Text("Checking…")
                             .font(.system(size: 12))
                             .foregroundColor(.secondary)
+                            .help("Checking the Homebrew tap for a newer version")
                     case .upToDate:
                         Text("Up to Date")
                             .font(.system(size: 12))
                             .foregroundColor(.secondary)
+                            .help("Ampere \(AppVersion.current) is the latest version")
                     case .failed:
                         Text("Check Failed")
                             .font(.system(size: 12))
                             .foregroundColor(.orange)
+                            .help("Could not reach the update feed. Check your connection and try again, or run: brew upgrade --cask ampere")
                     }
                 }
                 Button("About") {
                     showAbout = true
                 }
                 .buttonStyle(FooterButtonStyle())
+                .help("Version, website, health check result, and admin access status")
                 Button("Quit") {
                     NSApp.terminate(nil)
                 }
                 .buttonStyle(FooterButtonStyle())
+                .help("Quit Ampere and return the battery to standard macOS charging")
             }
             .padding(.horizontal, 16)
             .padding(.top, 4)
@@ -965,6 +976,7 @@ struct ContentView: View {
                 }
         }
         .padding(.horizontal, 16)
+        .help("Start Ampere automatically when you log in")
     }
 
     private func menuBarPercentRow() -> some View {
@@ -1050,6 +1062,11 @@ struct ContentView: View {
             .controlSize(.small)
         }
         .padding(.horizontal, 16)
+        // State-dependent like the pin/settings tooltips: each side says what
+        // is active now and what flipping the toggle switches to.
+        .help(monitor.autoManageEnabled
+            ? "On: Ampere keeps the battery between the bounds; charging starts below the lower bound and stops at the upper bound. Turn off for standard macOS charging with manual Pause/Resume."
+            : "Off: standard macOS charging to full, with manual Pause/Resume while on AC. Turn on to keep the battery between the lower and upper bounds automatically. Requires admin access.")
     }
 
     private func autoManageContent(_ state: BatteryState) -> some View {
@@ -1099,6 +1116,7 @@ struct ContentView: View {
                         .toggleStyle(.switch)
                         .controlSize(.small)
                     }
+                    .help("Actively drain the battery to the upper bound; sleep is disabled while discharging")
                 } else if state.percentage >= monitor.chargeLowerBound && state.percentage < monitor.chargeUpperBound {
                     HStack {
                         Image(systemName: "arrow.up.to.line")
@@ -1124,6 +1142,7 @@ struct ContentView: View {
                         .toggleStyle(.switch)
                         .controlSize(.small)
                     }
+                    .help("Charge to the upper bound now; otherwise charging waits until the battery falls below the lower bound")
                 }
             }
 
@@ -1167,11 +1186,13 @@ struct ContentView: View {
                     Label("Resume Charging", systemImage: "play.fill")
                 }
                 .buttonStyle(ChargeButtonStyle(color: .green))
+                .help("Allow the battery to charge normally again")
             } else {
                 Button(action: { monitor.toggleCharging() }) {
                     Label("Pause Charging", systemImage: "pause.fill")
                 }
                 .buttonStyle(ChargeButtonStyle(color: .orange))
+                .help("Stop charging and hold the current level; the Mac keeps running on AC power")
             }
         }
         .padding(.horizontal, 16)
@@ -1247,11 +1268,11 @@ struct ContentView: View {
                     .foregroundColor(registration.isRegistered ? .secondary : .orange)
             }
             .buttonStyle(.plain)
-            .help(registration.isRegistered
-                ? "Registered to \(registration.email) — click to manage"
-                : "Unregistered — click to enter your registration key")
         }
         .padding(.horizontal, 16)
+        .help(registration.isRegistered
+            ? "Registered to \(registration.email); click the name to manage or deregister"
+            : "Unregistered; click to enter the registration key from your purchase email")
     }
 
     /// Settings-row home of the old footer "Revoke Admin Access" button.
@@ -1273,6 +1294,7 @@ struct ContentView: View {
             .help("Remove the helper binary and passwordless sudo rule (prompts for your admin password). Charge control stops working until access is granted again.")
         }
         .padding(.horizontal, 16)
+        .help("Ampere has passwordless admin access for charge control; Revoke removes it")
     }
 
     /// Shows expected (green) vs actual (red) for a mismatched SMC key,
