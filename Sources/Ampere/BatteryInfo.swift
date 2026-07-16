@@ -43,6 +43,12 @@ final class BatteryMonitor: ObservableObject {
     @Published var state: BatteryState?
     @Published var chargingPaused: Bool = false
     @Published var activeDischarging: Bool = false
+    /// True while the helper's sleep hold (pmset override) is actually
+    /// applied — the status line warns while the Mac is being kept awake.
+    /// Distinct from the persisted intent (`sleepHoldIntent`): intent is
+    /// what the state machine wants, this is what the helper has done;
+    /// refresh() reconciles the two, retrying failed ops every tick.
+    @Published var sleepHoldActive: Bool = false
     @Published var autoDischargeEnabled: Bool {
         didSet { UserDefaults.standard.set(autoDischargeEnabled, forKey: "autoDischargeEnabled") }
     }
@@ -143,7 +149,18 @@ final class BatteryMonitor: ObservableObject {
     var updateProgressObservation: NSKeyValueObservation?
     private var terminationObserver: NSObjectProtocol?
     private var wakeObserver: NSObjectProtocol?
+    private var sleepObserver: NSObjectProtocol?
     private var autoManageInFlight = false
+    /// Sleep-hold intent from the state machine, persisted so a crash or
+    /// in-app upgrade mid-hold re-arms after relaunch (launch cleanup always
+    /// restores pmset via nodischarge, so without the persisted intent a
+    /// lid-closed Mac would fall asleep mid-band with the charge unfinished).
+    private var sleepHoldIntent: Bool = false {
+        didSet {
+            guard oldValue != sleepHoldIntent else { return }
+            UserDefaults.standard.set(sleepHoldIntent, forKey: "sleepHoldIntent")
+        }
+    }
     private var refreshCount = 0
     /// Persisted so rule-2 (connected→disconnected → clear chargeToUpperBound)
     /// fires correctly across an app restart. Without this, a launch on
@@ -222,6 +239,19 @@ final class BatteryMonitor: ObservableObject {
         }
         if !self.chargeToFull && persistedCtf {
             defaults.set(false, forKey: "chargeToFull")
+        }
+        // Sleep-hold intent rides on charge-to-upper: it only means anything
+        // while that intent is armed. The pmset side always starts released
+        // (launch cleanup runs nodischarge, which restores any crash-left
+        // markers); the first refresh re-applies the hold when the intent
+        // survived. If the ctu crash repair below clears the intent's
+        // carrier, the first refresh releases this flag too — didSet doesn't
+        // fire during init, so persist the negation explicitly like the two
+        // flags above.
+        let persistedHold = defaults.bool(forKey: "sleepHoldIntent")
+        self.sleepHoldIntent = self.chargeToUpperBound && persistedHold
+        if !self.sleepHoldIntent && persistedHold {
+            defaults.set(false, forKey: "sleepHoldIntent")
         }
         // Invariant: chargeToFull implies auto-discharge is off (activating
         // it turns the preference off — see setChargeToFull). Both entry
@@ -341,10 +371,11 @@ final class BatteryMonitor: ObservableObject {
             object: nil, queue: .main
         ) { [weak self] _ in
             guard let self = self else { return }
-            guard self.chargingPaused || self.activeDischarging else { return }
+            guard self.chargingPaused || self.activeDischarging || self.sleepHoldActive else { return }
 
             // Capture on the main thread; the block below runs on smcQueue.
             let wasDischarging = self.activeDischarging
+            let wasHolding = self.sleepHoldActive
             let done = DispatchSemaphore(value: 0)
             self.smcQueue.async {
                 // Always restore system defaults on quit.
@@ -352,6 +383,12 @@ final class BatteryMonitor: ObservableObject {
                 // spawning a redundant watchdog during shutdown.
                 if wasDischarging {
                     _ = self.runSMCWriteViaSudo("nodischarge")
+                } else if wasHolding {
+                    // Mutually exclusive with discharge (and nodischarge
+                    // restores the same markers), but a plain quit mid-hold
+                    // takes this branch: put the user's sleep settings back
+                    // before exiting.
+                    _ = self.runSMCWriteViaSudo("release-sleep-hold")
                 }
                 // CHTE=allow unconditionally (not just when chargingPaused):
                 // a discharge can be active before the state machine has
@@ -364,6 +401,43 @@ final class BatteryMonitor: ObservableObject {
                 done.signal()
             }
             _ = done.wait(timeout: .now() + 6.0)
+        }
+
+        // Pause an in-progress charge just before the system sleeps. The app
+        // is suspended during sleep, so a charge left in "allow" sails past
+        // the upper bound (the SMC keeps charging while the Mac sleeps); the
+        // wake handler below re-asserts "allow" for unpaused states, which
+        // resumes the charge where it left off. Deliberately SMC-only — the
+        // in-memory state is untouched, so a poll completion that lands
+        // after this handler can't diverge from it, and the wake re-assert
+        // reconciles CHTE from the unchanged state.
+        //
+        // Below the lower bound the sleep hold normally absorbs the sleep
+        // before this can fire; if it fires there anyway (hold arming raced
+        // the lid close, or arming failed), CHTE is left alone: charging
+        // through sleep and correcting on wake beats stranding the battery
+        // below the lower bound all night. Charge-to-full also charges
+        // through sleep — its ceiling is 100%, so there is no overshoot.
+        sleepObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.willSleepNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self = self, self.isSudoRuleInstalled else { return }
+            guard self.autoManageEnabled, !self.chargingPaused,
+                  !self.chargeToFull, !self.activeDischarging else { return }
+            guard let battery = Self.readBattery(), battery.adapterConnected,
+                  battery.percentage >= self.chargeLowerBound else { return }
+            // Synchronous on the main thread on purpose: the system holds
+            // sleep until notification handlers return, and the write takes
+            // well under a second. smcQueue.sync serializes behind any
+            // in-flight SMC dispatch so the pause is the last write to land
+            // before sleep.
+            let ok = self.smcQueue.sync { self.runSMCWrite(.inhibit) }
+            if ok {
+                NSLog("Ampere: Pre-sleep pause at %d%% — charge resumes on wake", battery.percentage)
+            } else {
+                NSLog("Ampere: Pre-sleep pause failed — charge may overshoot during sleep")
+            }
         }
 
         // Re-assert SMC state on wake — firmware or PD renegotiation can reset
@@ -393,7 +467,8 @@ final class BatteryMonitor: ObservableObject {
                 chargingPaused: chargingPausedSnapshot,
                 chargeToUpperBound: self.chargeToUpperBound,
                 chargeToFull: self.chargeToFull,
-                lastAdapterConnected: self.lastAdapterConnected
+                lastAdapterConnected: self.lastAdapterConnected,
+                sleepHold: self.sleepHoldIntent
             )
             let autoManageEnabledSnapshot = self.autoManageEnabled
             let lower = self.chargeLowerBound
@@ -434,21 +509,27 @@ final class BatteryMonitor: ObservableObject {
                     percentage: battery.percentage,
                     lowerBound: lower,
                     upperBound: upper,
-                    fullyCharged: battery.fullyCharged
+                    fullyCharged: battery.fullyCharged,
+                    lidClosed: Self.readClamshellClosed()
                 )
                 let decision = BatteryMonitor.evaluateAutoManageStep(
                     state: priorState, inputs: inputs
                 )
 
-                // Determine the SMC op to write. An explicit transition from the
-                // pure function wins. Otherwise re-assert inhibit if we were
-                // already paused, so a firmware-induced CHTE reset during sleep
-                // gets corrected before the next refresh cycle.
+                // Determine the SMC op to write. An explicit transition from
+                // the pure function wins. Otherwise re-assert the CHTE value
+                // the current state expects: inhibit when paused (a firmware-
+                // induced reset during sleep must not bypass micro-charge
+                // prevention), allow when unpaused (the pre-sleep pause wrote
+                // inhibit without touching state, and this is what resumes
+                // the charge; also corrects a firmware flip the other way).
+                // Sleep-hold pmset reconciliation stays refresh()'s job — the
+                // refresh scheduled below runs it.
                 let op: SMCWriteOp?
                 switch decision.action {
                 case .allow:   op = .allow
                 case .inhibit: op = .inhibit
-                case .none:    op = chargingPausedSnapshot ? .inhibit : nil
+                case .none:    op = chargingPausedSnapshot ? .inhibit : .allow
                 }
 
                 if let op = op {
@@ -487,6 +568,9 @@ final class BatteryMonitor: ObservableObject {
             NotificationCenter.default.removeObserver(observer)
         }
         if let observer = wakeObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
+        }
+        if let observer = sleepObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(observer)
         }
     }
@@ -665,6 +749,11 @@ final class BatteryMonitor: ObservableObject {
                     self.chargeToFull = false
                     self.chargingPaused = false
                     self.activeDischarging = false
+                    // The nodischarge above restored sleep from the markers
+                    // (hold and discharge share them), and the state dir is
+                    // gone — nothing is held anymore.
+                    self.sleepHoldActive = false
+                    self.sleepHoldIntent = false
                     // Clear any stale error — the user just acted on the
                     // common "revoke and re-grant admin access" guidance.
                     self.lastError = nil
@@ -676,6 +765,11 @@ final class BatteryMonitor: ObservableObject {
                     // app has no crash safety net for the rest of the session.
                     // startDischarge spawns its own watchdog; the !wasDischarging
                     // branch must respawn manually.
+                    //
+                    // The nodischarge also consumed the sleep markers, so any
+                    // engaged sleep hold is factually released — record that,
+                    // and the next refresh re-arms it from the intact intent.
+                    self.sleepHoldActive = false
                     self.smcQueue.async {
                         if wasPaused { self.runSMCWrite(.inhibit) }
                         if wasDischarging {
@@ -934,6 +1028,11 @@ final class BatteryMonitor: ObservableObject {
         var chargeToUpperBound: Bool
         var chargeToFull: Bool = false
         var lastAdapterConnected: Bool?
+        /// Sleep-hold intent: keep the Mac awake (pmset override via the
+        /// helper) while a below-lower charge runs, because the app cannot
+        /// stop a charge at the upper bound while the system sleeps.
+        /// Defaults false so existing construction sites remain valid.
+        var sleepHold: Bool = false
     }
 
     /// Inputs observed by a single refresh() cycle.
@@ -946,6 +1045,12 @@ final class BatteryMonitor: ObservableObject {
         /// BMS charge-termination flag; substitutes for "percentage >= 100"
         /// on worn batteries that top out below a displayed 100%.
         let fullyCharged: Bool
+        /// Lid state at poll time. Consulted only by the sleep-hold release
+        /// rule: a closed lid during a hold means a sleep attempt was
+        /// absorbed, so the hold persists to the upper bound. Desktops (no
+        /// lid) and failed reads report open. Defaults false so existing
+        /// construction sites remain valid.
+        var lidClosed: Bool = false
     }
 
     /// SMC command the refresh() cycle should issue.
@@ -1004,6 +1109,9 @@ final class BatteryMonitor: ObservableObject {
 
         // Auto-manage SMC decisions only apply on AC with auto-manage enabled.
         guard inputs.autoManageEnabled, inputs.adapterConnected else {
+            // The sleep hold has no basis off AC or outside auto mode —
+            // never keep a Mac awake on battery power.
+            next.sleepHold = false
             return AutoManageDecision(action: .none, newState: next)
         }
 
@@ -1049,18 +1157,19 @@ final class BatteryMonitor: ObservableObject {
         // when full, so an active flag always means "keep charging".
         let effectiveUpper = next.chargeToFull ? 100 : inputs.upperBound
 
+        let action: AutoManageAction
         if !next.chargingPaused && reached(effectiveUpper) {
             // At or above the effective upper bound → inhibit and reset
             // charge-to-upper.
             next.chargingPaused = true
             next.chargeToUpperBound = false
-            return AutoManageDecision(action: .inhibit, newState: next)
+            action = .inhibit
         } else if !next.chargingPaused && !next.chargeToUpperBound && !next.chargeToFull
                     && inputs.percentage >= inputs.lowerBound
                     && inputs.percentage < effectiveUpper {
             // Between bounds without charge-to-upper/-full → inhibit (rule 3).
             next.chargingPaused = true
-            return AutoManageDecision(action: .inhibit, newState: next)
+            action = .inhibit
         } else if next.chargingPaused
                     && (inputs.percentage < inputs.lowerBound
                         || next.chargeToUpperBound || next.chargeToFull) {
@@ -1070,10 +1179,31 @@ final class BatteryMonitor: ObservableObject {
             if belowLower {
                 next.chargeToUpperBound = true
             }
-            return AutoManageDecision(action: .allow, newState: next)
+            action = .allow
+        } else {
+            action = .none
         }
 
-        return AutoManageDecision(action: .none, newState: next)
+        // Sleep hold — a below-lower charge must keep the Mac awake, because
+        // sleep cannot be refused at announcement time: the hold has to be
+        // armed while the condition exists, and a lid close during it is
+        // then absorbed before it can suspend the app (see README). Once the
+        // battery climbs into the band, the hold persists to the upper bound
+        // only while the lid stays closed — a closed lid is the evidence
+        // that a sleep was absorbed. Lid open means nobody tried to sleep;
+        // release, and the pre-sleep pause covers any later attempt.
+        // Charge-to-full is exempt: its ceiling is 100%, so sleep-charging
+        // cannot overshoot, and an overnight full charge should sleep.
+        if next.chargeToUpperBound, !next.chargeToFull,
+           inputs.percentage < inputs.lowerBound {
+            next.sleepHold = true
+        } else if next.sleepHold,
+                  !next.chargeToUpperBound || next.chargeToFull
+                    || (inputs.percentage >= inputs.lowerBound && !inputs.lidClosed) {
+            next.sleepHold = false
+        }
+
+        return AutoManageDecision(action: action, newState: next)
     }
 
     // MARK: - Health Check
@@ -1354,7 +1484,8 @@ final class BatteryMonitor: ObservableObject {
                 chargingPaused: chargingPaused,
                 chargeToUpperBound: chargeToUpperBound,
                 chargeToFull: chargeToFull,
-                lastAdapterConnected: lastAdapterConnected
+                lastAdapterConnected: lastAdapterConnected,
+                sleepHold: sleepHoldIntent
             )
             let stepInputs = AutoManageInputs(
                 autoManageEnabled: autoManageEnabled,
@@ -1362,7 +1493,8 @@ final class BatteryMonitor: ObservableObject {
                 percentage: b.percentage,
                 lowerBound: chargeLowerBound,
                 upperBound: chargeUpperBound,
-                fullyCharged: b.fullyCharged
+                fullyCharged: b.fullyCharged,
+                lidClosed: Self.readClamshellClosed()
             )
             let decision = BatteryMonitor.evaluateAutoManageStep(
                 state: priorState, inputs: stepInputs
@@ -1386,6 +1518,16 @@ final class BatteryMonitor: ObservableObject {
                 // or the at-100% staleness repair while already paused.
                 NSLog("Ampere: Cleared chargeToFull at %d%%", b.percentage)
             }
+            if sleepHoldIntent != decision.newState.sleepHold, decision.action == .none {
+                // Pure intent transitions: the below-lower arm rides an
+                // action-free tick (CHTE already allow), and the releases for
+                // unplug / auto-off / lid-open-at-band are equally pure. The
+                // pmset side is reconciled by the dispatch below against
+                // sleepHoldActive.
+                sleepHoldIntent = decision.newState.sleepHold
+                NSLog("Ampere: Sleep-hold intent %@ at %d%%",
+                      decision.newState.sleepHold ? "armed" : "cleared", b.percentage)
+            }
 
             if autoManageEnabled, b.adapterConnected, lastError != nil { lastError = nil }
             // Manual mode: the specific "no adapter" error becomes irrelevant
@@ -1397,24 +1539,52 @@ final class BatteryMonitor: ObservableObject {
                 lastError = nil
             }
 
-            // SMC action dispatch.
-            if decision.action != .none, !autoManageInFlight {
+            // SMC action dispatch, plus pmset reconciliation for the sleep
+            // hold (engaged state vs the machine's intent — retried every
+            // tick until they match). Hold ops never run while a discharge
+            // is active: nodischarge owns the markers then, and a release
+            // here would re-enable sleep mid-CHIE (the clamshell blackout).
+            // The mismatch resolves right after the discharge stops — its
+            // stop path restores sleep and removes the markers, so a later
+            // release is a clean no-op.
+            let holdOpNeeded = !activeDischarging
+                && decision.newState.sleepHold != sleepHoldActive
+            if (decision.action != .none || holdOpNeeded), !autoManageInFlight {
                 autoManageInFlight = true
                 let pct = b.percentage
                 // Log the target the machine actually decided on — 100 while
                 // charge-to-full survives this step, else the configured bound.
                 let upper = decision.newState.chargeToFull ? 100 : chargeUpperBound
-                let op: SMCWriteOp = decision.action == .allow ? .allow : .inhibit
+                let op: SMCWriteOp?
+                switch decision.action {
+                case .allow:   op = .allow
+                case .inhibit: op = .inhibit
+                case .none:    op = nil
+                }
                 let next = decision.newState
                 smcQueue.async { [weak self] in
                     guard let self = self else { return }
-                    let ok = self.runSMCWrite(op)
+                    // CHTE first: at the upper bound the inhibit must land
+                    // before the hold release re-enables sleep, or a closed
+                    // lid could sleep the Mac while charging is still allowed.
+                    let ok = op.map { self.runSMCWrite($0) } ?? true
+                    var holdApplied = false
+                    if ok, holdOpNeeded {
+                        holdApplied = self.runSMCWriteViaSudo(
+                            next.sleepHold ? "hold-sleep" : "release-sleep-hold")
+                    }
                     DispatchQueue.main.async {
                         self.autoManageInFlight = false
+                        if holdApplied {
+                            self.sleepHoldActive = next.sleepHold
+                            NSLog("Ampere: Sleep hold %@ at %d%%",
+                                  next.sleepHold ? "engaged" : "released", pct)
+                        }
                         if ok {
                             self.chargingPaused = next.chargingPaused
                             self.chargeToUpperBound = next.chargeToUpperBound
                             self.chargeToFull = next.chargeToFull
+                            self.sleepHoldIntent = next.sleepHold
                             switch decision.action {
                             case .inhibit:
                                 NSLog("Ampere: Inhibited charging at %d%%", pct)
@@ -1423,11 +1593,15 @@ final class BatteryMonitor: ObservableObject {
                             case .none:
                                 break
                             }
+                        }
+                        // Re-refresh only when everything attempted landed.
+                        // A failed write (CHTE or pmset) must wait for the
+                        // next timer tick — the decision inputs are
+                        // unchanged, so an immediate refresh would re-issue
+                        // the same op and tight-loop.
+                        if ok, !holdOpNeeded || holdApplied {
                             self.refresh()
                         }
-                        // On failure: don't re-refresh. The decision inputs
-                        // are unchanged, so refresh would re-issue the same
-                        // action and tight-loop. Wait for the next timer tick.
                     }
                 }
             }
@@ -1596,6 +1770,21 @@ final class BatteryMonitor: ObservableObject {
     private func recheckHealth() {
         guard let battery = Self.readBattery() else { return }
         performHealthCheck(battery: battery)
+    }
+
+    /// Lid state (clamshell), read from IOPMrootDomain. Consulted only by
+    /// the sleep-hold release rule: a closed lid during a hold means a sleep
+    /// attempt was absorbed, so the hold persists to the upper bound. The
+    /// key is absent on desktops (no lid) and on a failed read — both report
+    /// open, which is safe: those machines only sleep via announcements,
+    /// and the pre-sleep pause covers that path.
+    static func readClamshellClosed() -> Bool {
+        let entry = IOServiceGetMatchingService(kIOMainPortDefault,
+            IOServiceMatching("IOPMrootDomain"))
+        guard entry != MACH_PORT_NULL else { return false }
+        defer { IOObjectRelease(entry) }
+        return (IORegistryEntryCreateCFProperty(entry, "AppleClamshellState" as CFString, kCFAllocatorDefault, 0)?
+            .takeRetainedValue() as? Bool) ?? false
     }
 
     static func readBattery() -> BatteryState? {

@@ -181,6 +181,37 @@ func restoredPmsetValues(_ paths: [String]) -> PmsetProfileValues {
     return PmsetProfileValues(battery: 10, ac: 10)
 }
 
+/// Save the pre-override pmset originals for BOTH keys into their markers,
+/// skipping markers that already exist (re-entry must not overwrite the
+/// genuine originals with already-overridden values). Returns false when a
+/// needed marker can't be captured: overriding without one would strand the
+/// user — the restore paths (nodischarge, watchdog, release-sleep-hold) skip
+/// pmset when no marker exists, and the next save would then capture the
+/// *overridden* values as "original", making sleep=0 permanent.
+///
+/// Both keys are always saved together, even by the sleep-hold path that
+/// never touches displaysleep: the shared restore puts back BOTH keys,
+/// falling back to 10/10 for a missing marker — a fabricated displaysleep=10
+/// stamped over the user's real setting is the bug the extra save prevents
+/// (the unchanged value just round-trips).
+func saveSleepMarkers() -> Bool {
+    let needSleep = !markerExists(savedSleepPaths)
+    let needDisplay = !markerExists(savedDisplaySleepPaths)
+    guard needSleep || needDisplay else { return true }
+    let customOutput = readPmsetCustomOutput()
+    if needSleep, !savePmsetMarker(key: "sleep", paths: savedSleepPaths,
+                                   customOutput: customOutput) {
+        fputs("ERROR: cannot save original sleep values — refusing to override sleep\n", stderr)
+        return false
+    }
+    if needDisplay, !savePmsetMarker(key: "displaysleep", paths: savedDisplaySleepPaths,
+                                     customOutput: customOutput) {
+        fputs("ERROR: cannot save original displaysleep values — refusing to override sleep\n", stderr)
+        return false
+    }
+    return true
+}
+
 /// Prevent or restore system/clamshell sleep using pmset. Requires root.
 ///
 /// The override still uses `-a` (sleep must be prevented, period), but the
@@ -188,29 +219,13 @@ func restoredPmsetValues(_ paths: [String]) -> PmsetProfileValues {
 /// always runs on AC, so the previous single-value save captured the AC
 /// profile and its `-a` restore stamped that value over the user's Battery
 /// profile too.
+///
+/// The restore side (`enabled: false`) is generic — it undoes whichever
+/// override wrote the markers, discharge or the charge sleep-hold.
 @discardableResult
 func setDischargeSleepPrevention(enabled: Bool) -> Bool {
     if enabled {
-        // Save originals before overriding — only markers that don't already
-        // exist (re-entry must not overwrite the genuine originals with
-        // already-overridden values). Refuse to proceed if a needed marker
-        // can't be captured: overriding without one would strand the user —
-        // the restore paths (nodischarge, watchdog) skip pmset when no
-        // marker exists, and the next save would then capture the
-        // *overridden* values as "original", making sleep=0 permanent.
-        let needSleep = !markerExists(savedSleepPaths)
-        let needDisplay = !markerExists(savedDisplaySleepPaths)
-        let customOutput = (needSleep || needDisplay) ? readPmsetCustomOutput() : nil
-        if needSleep, !savePmsetMarker(key: "sleep", paths: savedSleepPaths,
-                                       customOutput: customOutput) {
-            fputs("ERROR: cannot save original sleep values — refusing to override sleep\n", stderr)
-            return false
-        }
-        if needDisplay, !savePmsetMarker(key: "displaysleep", paths: savedDisplaySleepPaths,
-                                         customOutput: customOutput) {
-            fputs("ERROR: cannot save original displaysleep values — refusing to override sleep\n", stderr)
-            return false
-        }
+        guard saveSleepMarkers() else { return false }
         // Disable both system sleep and display sleep to prevent clamshell issues
         return runPmset(["-a", "sleep", "0", "disablesleep", "1", "displaysleep", "0"])
     }
@@ -234,7 +249,7 @@ func setDischargeSleepPrevention(enabled: Bool) -> Bool {
 // MARK: - Main
 
 guard CommandLine.arguments.count == 2 else {
-    fputs("Usage: smc-writer inhibit|allow|discharge:pid|nodischarge|spawn-watchdog:pid|watchdog:pid\n", stderr)
+    fputs("Usage: smc-writer inhibit|allow|discharge:pid|nodischarge|hold-sleep|release-sleep-hold|spawn-watchdog:pid|watchdog:pid\n", stderr)
     exit(1)
 }
 
@@ -286,6 +301,41 @@ if action.hasPrefix("spawn-watchdog:") {
         exit(2)
     }
     print("OK: watchdog spawned")
+    exit(0)
+}
+
+// "hold-sleep" — disable system sleep while a below-lower charge runs, so a
+// closed lid can't suspend the app mid-charge (the SMC would then charge
+// straight past the upper bound with nobody awake to stop it). Unlike the
+// discharge override, displaysleep is left alone: there is no CHIE write and
+// no PD renegotiation in this path, so the screen may sleep normally while
+// the machine stays awake charging. Uses the same markers as discharge, so
+// every existing restore path (release-sleep-hold, nodischarge, watchdog)
+// can undo it — including after a crash.
+if action == "hold-sleep" {
+    guard saveSleepMarkers() else {
+        exit(4)
+    }
+    guard runPmset(["-a", "sleep", "0", "disablesleep", "1"]) else {
+        fputs("ERROR: pmset failed — sleep hold not applied\n", stderr)
+        exit(2)
+    }
+    print("OK: sleep hold enabled")
+    exit(0)
+}
+
+// "release-sleep-hold" — restore the saved sleep settings after a charge
+// sleep-hold. No PD settling delay (this path never touched CHIE), and a
+// missing marker means there is nothing to release (already restored by
+// nodischarge or the watchdog) — succeed silently.
+if action == "release-sleep-hold" {
+    if markerExists(savedSleepPaths) {
+        guard setDischargeSleepPrevention(enabled: false) else {
+            fputs("ERROR: failed to restore sleep settings\n", stderr)
+            exit(2)
+        }
+    }
+    print("OK: sleep hold released")
     exit(0)
 }
 
@@ -385,7 +435,7 @@ if action.hasPrefix("watchdog:") {
 // One-shot commands
 let validActions: Set<String> = ["inhibit", "allow", "nodischarge"]
 guard validActions.contains(action) else {
-    fputs("Usage: smc-writer inhibit|allow|discharge:pid|nodischarge|spawn-watchdog:pid|watchdog:pid\n", stderr)
+    fputs("Usage: smc-writer inhibit|allow|discharge:pid|nodischarge|hold-sleep|release-sleep-hold|spawn-watchdog:pid|watchdog:pid\n", stderr)
     exit(1)
 }
 

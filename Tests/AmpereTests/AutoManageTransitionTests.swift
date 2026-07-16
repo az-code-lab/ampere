@@ -33,6 +33,7 @@ final class AutoManageTransitionTests: XCTestCase {
             chargeToUpperBound: Bool = false,
             chargeToFull: Bool = false,
             lastAdapterConnected: Bool? = nil,
+            sleepHold: Bool = false,
             lowerBound: Int = 40,
             upperBound: Int = 60
         ) {
@@ -40,7 +41,8 @@ final class AutoManageTransitionTests: XCTestCase {
                 chargingPaused: chargingPaused,
                 chargeToUpperBound: chargeToUpperBound,
                 chargeToFull: chargeToFull,
-                lastAdapterConnected: lastAdapterConnected
+                lastAdapterConnected: lastAdapterConnected,
+                sleepHold: sleepHold
             )
             self.lowerBound = lowerBound
             self.upperBound = upperBound
@@ -52,7 +54,8 @@ final class AutoManageTransitionTests: XCTestCase {
             percentage: Int,
             adapterConnected: Bool,
             autoManageEnabled: Bool = true,
-            fullyCharged: Bool = false
+            fullyCharged: Bool = false,
+            lidClosed: Bool = false
         ) -> BatteryMonitor.AutoManageAction {
             let inputs = BatteryMonitor.AutoManageInputs(
                 autoManageEnabled: autoManageEnabled,
@@ -60,7 +63,8 @@ final class AutoManageTransitionTests: XCTestCase {
                 percentage: percentage,
                 lowerBound: lowerBound,
                 upperBound: upperBound,
-                fullyCharged: fullyCharged
+                fullyCharged: fullyCharged,
+                lidClosed: lidClosed
             )
             let decision = BatteryMonitor.evaluateAutoManageStep(state: state, inputs: inputs)
             state = decision.newState
@@ -76,13 +80,15 @@ final class AutoManageTransitionTests: XCTestCase {
             percentage: Int,
             adapterConnected: Bool,
             autoManageEnabled: Bool = true,
+            lidClosed: Bool = false,
             maxIterations: Int = 10
         ) {
             var previous = state
             for _ in 0..<maxIterations {
                 _ = step(percentage: percentage,
                          adapterConnected: adapterConnected,
-                         autoManageEnabled: autoManageEnabled)
+                         autoManageEnabled: autoManageEnabled,
+                         lidClosed: lidClosed)
                 if state == previous { return }
                 previous = state
             }
@@ -91,13 +97,13 @@ final class AutoManageTransitionTests: XCTestCase {
 
         /// Simulate battery charging from current → target, one percent at a
         /// time, running a refresh cycle at each level with AC connected.
-        func chargeFrom(_ start: Int, to target: Int) {
+        func chargeFrom(_ start: Int, to target: Int, lidClosed: Bool = false) {
             var pct = start
             while pct <= target {
-                _ = step(percentage: pct, adapterConnected: true)
+                _ = step(percentage: pct, adapterConnected: true, lidClosed: lidClosed)
                 // Apply settling in case the action triggered further state
                 // transitions that would re-fire on the next refresh tick.
-                stepUntilSettled(percentage: pct, adapterConnected: true)
+                stepUntilSettled(percentage: pct, adapterConnected: true, lidClosed: lidClosed)
                 pct += 1
             }
         }
@@ -741,5 +747,172 @@ final class AutoManageTransitionTests: XCTestCase {
         XCTAssertFalse(sim.state.chargeToFull)
         XCTAssertEqual(sim.issued, [.allow, .inhibit],
                        "35% → 100% is still exactly one allow and one inhibit")
+    }
+
+    // MARK: - Sleep hold: a below-lower charge keeps the Mac awake
+
+    func testSleepHold_ArmsBelowLower_HoldsThroughBandLidClosed_ReleasesAtUpper() {
+        // The reported overshoot scenario, fixed: lid closed during a rule-1
+        // charge. The hold arms below the lower bound and, because the lid is
+        // closed (a sleep attempt was absorbed), persists through the band
+        // all the way to the upper bound, where the inhibit and the release
+        // land on the same tick.
+        let sim = Simulator(chargingPaused: true, lastAdapterConnected: true)
+        let recovery = sim.step(percentage: 38, adapterConnected: true)
+        XCTAssertEqual(recovery, .allow)
+        XCTAssertTrue(sim.state.sleepHold, "Below-lower charge must arm the sleep hold")
+
+        sim.chargeFrom(39, to: 59, lidClosed: true)
+        XCTAssertTrue(sim.state.sleepHold,
+                      "Lid closed: the hold persists through the between-bounds stretch")
+        XCTAssertTrue(sim.state.chargeToUpperBound)
+
+        let final = sim.step(percentage: 60, adapterConnected: true, lidClosed: true)
+        XCTAssertEqual(final, .inhibit)
+        XCTAssertFalse(sim.state.sleepHold, "Reaching upper releases the hold")
+        XCTAssertTrue(sim.state.chargingPaused)
+        XCTAssertFalse(sim.state.chargeToUpperBound)
+    }
+
+    func testSleepHold_ReleasesAtBandCrossingWhenLidOpen_NoRearmMidBand() {
+        // Lid open the whole way: nobody tried to sleep, so the hold ends as
+        // soon as the battery is back in the safe range. A lid close later
+        // (mid-band) is the pre-sleep pause's job, NOT a hold re-arm — the
+        // arm condition requires below-lower.
+        let sim = Simulator(chargingPaused: true, lastAdapterConnected: true)
+        sim.step(percentage: 38, adapterConnected: true)
+        XCTAssertTrue(sim.state.sleepHold)
+
+        sim.step(percentage: 40, adapterConnected: true, lidClosed: false)
+        XCTAssertFalse(sim.state.sleepHold,
+                       "Lid open at the lower-bound crossing must release the hold")
+        XCTAssertTrue(sim.state.chargeToUpperBound, "The charge itself continues")
+
+        // Lid closes mid-band: no re-arm (statement-1 territory).
+        sim.step(percentage: 45, adapterConnected: true, lidClosed: true)
+        XCTAssertFalse(sim.state.sleepHold,
+                       "A between-bounds charge never re-arms the hold")
+
+        sim.chargeFrom(46, to: 59, lidClosed: true)
+        sim.step(percentage: 60, adapterConnected: true, lidClosed: true)
+        XCTAssertTrue(sim.state.chargingPaused)
+    }
+
+    func testSleepHold_LidOpensMidHold_Releases() {
+        // Lid closed below lower (hold armed and absorbing the sleep), then
+        // the user opens the lid mid-band: the Mac is awake and in use, the
+        // hold has nothing left to absorb — release it and let the band
+        // rules govern any later sleep.
+        let sim = Simulator(chargingPaused: true, lastAdapterConnected: true)
+        sim.step(percentage: 38, adapterConnected: true)
+        sim.chargeFrom(39, to: 47, lidClosed: true)
+        XCTAssertTrue(sim.state.sleepHold)
+
+        sim.step(percentage: 48, adapterConnected: true, lidClosed: false)
+        XCTAssertFalse(sim.state.sleepHold, "Open lid mid-band releases the hold")
+        XCTAssertTrue(sim.state.chargeToUpperBound, "The charge continues to upper")
+    }
+
+    func testSleepHold_ReleasesOnUnplug_BelowLower_RearmsOnReplug() {
+        // Unplug below lower: rule 2 deliberately leaves chargeToUpperBound
+        // armed there, but the hold must release — never keep a Mac awake on
+        // battery power. Replug re-arms it.
+        let sim = Simulator(chargingPaused: true, lastAdapterConnected: true)
+        sim.step(percentage: 38, adapterConnected: true)
+        XCTAssertTrue(sim.state.sleepHold)
+
+        sim.step(percentage: 38, adapterConnected: false, lidClosed: true)
+        XCTAssertFalse(sim.state.sleepHold, "No hold on battery, even with the lid closed")
+        XCTAssertTrue(sim.state.chargeToUpperBound, "Rule 2 keeps the intent below lower")
+
+        sim.step(percentage: 37, adapterConnected: true, lidClosed: true)
+        XCTAssertTrue(sim.state.sleepHold, "Replug below lower re-arms the hold")
+    }
+
+    func testSleepHold_ReleasesOnUnplug_BetweenBounds() {
+        // Unplug mid-band during a held charge: rule 2 clears the intent and
+        // the hold must go with it.
+        let sim = Simulator(chargingPaused: true, lastAdapterConnected: true)
+        sim.step(percentage: 38, adapterConnected: true)
+        sim.chargeFrom(39, to: 45, lidClosed: true)
+        XCTAssertTrue(sim.state.sleepHold)
+
+        sim.step(percentage: 45, adapterConnected: false, lidClosed: true)
+        XCTAssertFalse(sim.state.sleepHold)
+        XCTAssertFalse(sim.state.chargeToUpperBound, "Rule 2 clears the intent above lower")
+    }
+
+    func testSleepHold_NeverArmsForExplicitBetweenBoundsToggle() {
+        // The explicit "Charge to Upper Bound" toggle starts between bounds
+        // and must never keep the Mac awake — the pre-sleep pause handles a
+        // lid close during it.
+        let sim = Simulator(chargingPaused: true, lastAdapterConnected: true)
+        sim.stepUntilSettled(percentage: 50, adapterConnected: true)
+
+        sim.state.chargeToUpperBound = true  // UI toggle
+        let action = sim.step(percentage: 50, adapterConnected: true, lidClosed: true)
+        XCTAssertEqual(action, .allow)
+        XCTAssertFalse(sim.state.sleepHold, "Between-bounds toggle must not arm the hold")
+
+        sim.chargeFrom(51, to: 59, lidClosed: true)
+        XCTAssertFalse(sim.state.sleepHold)
+        sim.step(percentage: 60, adapterConnected: true, lidClosed: true)
+        XCTAssertTrue(sim.state.chargingPaused)
+    }
+
+    func testSleepHold_ChargeToFullSuppressesAndReleases() {
+        // Charge-to-full sleeps and charges to 100 by design (no overshoot
+        // possible), so activating it mid-hold must release the hold, and a
+        // below-lower full charge must never arm one.
+        let sim = Simulator(chargingPaused: true, lastAdapterConnected: true)
+        sim.step(percentage: 35, adapterConnected: true)
+        XCTAssertTrue(sim.state.sleepHold)
+
+        sim.state.chargeToFull = true  // UI toggle mid-charge
+        sim.step(percentage: 36, adapterConnected: true, lidClosed: true)
+        XCTAssertFalse(sim.state.sleepHold, "Charge-to-full releases the hold")
+
+        sim.chargeFrom(37, to: 99, lidClosed: true)
+        XCTAssertFalse(sim.state.sleepHold, "No re-arm anywhere under charge-to-full")
+        sim.step(percentage: 100, adapterConnected: true, lidClosed: true)
+        XCTAssertTrue(sim.state.chargingPaused)
+    }
+
+    func testSleepHold_AutoManageOff_Releases() {
+        let sim = Simulator(chargingPaused: true, lastAdapterConnected: true)
+        sim.step(percentage: 38, adapterConnected: true)
+        XCTAssertTrue(sim.state.sleepHold)
+
+        sim.step(percentage: 38, adapterConnected: true,
+                 autoManageEnabled: false, lidClosed: true)
+        XCTAssertFalse(sim.state.sleepHold, "Auto-manage off releases the hold")
+    }
+
+    func testSleepHold_PersistedIntentMidBandAfterRelaunch() {
+        // Crash or in-app upgrade mid-hold, relaunching between the bounds
+        // with the persisted intent: lid still closed → the hold survives to
+        // the upper bound; lid open by then → it releases on the first tick.
+        let closed = Simulator(
+            chargingPaused: false,
+            chargeToUpperBound: true,
+            lastAdapterConnected: true,
+            sleepHold: true
+        )
+        closed.step(percentage: 45, adapterConnected: true, lidClosed: true)
+        XCTAssertTrue(closed.state.sleepHold, "Lid closed: relaunched hold persists")
+        closed.chargeFrom(46, to: 59, lidClosed: true)
+        closed.step(percentage: 60, adapterConnected: true, lidClosed: true)
+        XCTAssertFalse(closed.state.sleepHold)
+        XCTAssertTrue(closed.state.chargingPaused)
+
+        let open = Simulator(
+            chargingPaused: false,
+            chargeToUpperBound: true,
+            lastAdapterConnected: true,
+            sleepHold: true
+        )
+        open.step(percentage: 45, adapterConnected: true, lidClosed: false)
+        XCTAssertFalse(open.state.sleepHold, "Lid open: relaunched hold releases immediately")
+        XCTAssertTrue(open.state.chargeToUpperBound, "The charge itself still resumes")
     }
 }

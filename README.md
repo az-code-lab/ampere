@@ -12,6 +12,7 @@ A lightweight macOS menu bar app for monitoring battery status and controlling c
 - **Charge control** - pause and resume charging via SMC
 - **Auto charge** - configurable upper/lower bounds to keep your battery in an optimal charge range
 - **Micro-charge prevention** - inhibits charging between bounds after restart; only charges from below the lower bound or on explicit user request
+- **Sleep-safe charging** - an in-progress charge never overshoots the upper bound while the Mac sleeps: between the bounds it pauses just before sleep and resumes on wake; below the lower bound the Mac is kept awake until the charge completes
 - **Charge to upper bound** - explicitly allow charging from the current level to the upper bound
 - **Charge to full** - one-shot full charge without touching the configured bounds; normal management resumes when full
 - **Discharge to upper bound** - optionally drain the battery to the target level while on AC power
@@ -97,6 +98,18 @@ The one-shot is tied to the current AC session:
 
 Like Charge to Upper Bound, the toggle is persisted: an in-progress full charge resumes across an app restart or crash.
 
+#### Sleep and Mid-Charge Protection
+
+The upper bound is enforced in software: a poll must observe the crossing and write the charging-inhibit key. While the Mac sleeps no polls run, but the SMC keeps charging whenever CHTE allows it — so a charge left running at sleep time would sail past the upper bound (seen in the field as "closed the lid charging to 50%, came back to 65%"). Two mechanisms close the gap:
+
+- **Pre-sleep pause (at or above the lower bound).** macOS announces sleep to apps a few seconds before it happens. If a charge is running there, Ampere writes the inhibit inside that grace window and lets the Mac sleep; in-memory state is deliberately untouched, and the wake handler re-asserts "allow" for unpaused states, so the charge resumes on wake and finishes at the upper bound. The announcement cannot be refused, only reacted to — which is why the below-lower case needs the second mechanism.
+
+- **Sleep hold (below the lower bound).** A charge that starts below the lower bound keeps the Mac awake until the upper bound is reached (`pmset -a sleep 0 disablesleep 1` via the helper — the same override discharge uses, minus the display-sleep part, so the screen still sleeps). Pausing such a charge at sleep would strand the battery below the range all night; charging through sleep would overshoot; holding the Mac awake is the only outcome that ends inside the range. A lid close during the hold is simply absorbed — the sleep never initiates. Once the battery climbs past the lower bound, the hold persists only while the lid stays closed (the evidence that a sleep was absorbed); with the lid open it releases, and the pre-sleep pause covers any later sleep attempt. While active it shows the same orange "sleep is disabled" warning as discharge. It is released by reaching the upper bound, unplugging, disabling auto charge, quitting — or, after a crash, by the watchdog through the persistent pmset markers. The hold intent is persisted, so a restart mid-charge (including an in-app upgrade with the lid closed) re-arms it.
+
+- **Charge to Full is exempt.** Its ceiling is 100%, so a sleeping Mac cannot overshoot it, and charging through the night is the point of the feature.
+
+Residual gaps, by design: plugging in a Mac that is *already asleep* charges it with no app awake to manage the bounds, and a crash mid-hold restores system defaults (charging allowed, sleep restored). Both are corrected the next time the app runs a poll — at wake or relaunch — where the standard above-upper handling (inhibit, plus discharge-to-upper if enabled) takes over.
+
 ### Manual Charge Control
 
 When auto charge is off and a power adapter is connected, a manual **Pause Charging** / **Resume Charging** button is available.
@@ -105,8 +118,8 @@ When auto charge is off and a power adapter is connected, a manual **Pause Charg
 
 | Scenario | Sleep → Wake | Quit → Restart |
 |---|---|---|
-| **Charge to Upper Bound** is ON (charging in progress between bounds) | Charging continues. The SMC is already in "allow" state; the wake handler confirms this and takes no further action. Toggle stays ON until the upper bound is reached. | **Charging resumes automatically.** The "Charge to Upper Bound" toggle is persisted across restart so an in-progress charge resumes rather than parking at the current level. On launch the app sees `chargeToUpperBound = true` and leaves CHTE in the "allow" state; charging continues until the upper bound is reached, at which point the toggle clears itself. |
-| **Charge to Full** is ON (one-shot full charge in progress) | Charging continues, same as above: the wake handler re-runs the state machine, which keeps CHTE in "allow" until the battery is full. Toggle stays ON until full. | **Charging resumes automatically.** The toggle is persisted; on launch the app skips the between-bounds inhibit and leaves CHTE in "allow", so the full charge continues (even past the configured upper bound) until full, where the toggle clears itself. A launch that finds the flag set but the Mac on battery clears it, because the one-shot is tied to the AC session it was started in. |
+| **Charge to Upper Bound** is ON (charging in progress between bounds) | **The charge pauses just before sleep and resumes on wake.** The sleep announcement handler writes CHTE=inhibit (in-memory state untouched); on wake the handler re-asserts CHTE per the current state — "allow" here, since the state still says an unpaused charge is running — and the charge finishes at the upper bound. A charge that began *below the lower bound* doesn't sleep at all: the sleep hold keeps the Mac awake until the upper bound (see Sleep and Mid-Charge Protection). Toggle stays ON until the upper bound is reached. | **Charging resumes automatically.** The "Charge to Upper Bound" toggle is persisted across restart so an in-progress charge resumes rather than parking at the current level. On launch the app sees `chargeToUpperBound = true` and leaves CHTE in the "allow" state; charging continues until the upper bound is reached, at which point the toggle clears itself. |
+| **Charge to Full** is ON (one-shot full charge in progress) | Charging continues through sleep — the ceiling is 100%, so there is nothing to overshoot, and the pre-sleep pause deliberately skips this state. The wake handler re-runs the state machine, which keeps CHTE in "allow" until the battery is full. Toggle stays ON until full. | **Charging resumes automatically.** The toggle is persisted; on launch the app skips the between-bounds inhibit and leaves CHTE in "allow", so the full charge continues (even past the configured upper bound) until full, where the toggle clears itself. A launch that finds the flag set but the Mac on battery clears it, because the one-shot is tied to the AC session it was started in. |
 | **Discharge to Upper Bound** is ON (discharging above upper bound) | Discharging continues. System sleep is prevented during discharge, so normal sleep should not occur. If forced (e.g. lid close), the wake handler re-asserts the discharge SMC state. Toggle stays ON. | **Discharging resumes automatically.** The "Discharge to Upper Bound" toggle is persisted. On restart, the app clears stale SMC state, then the first refresh cycle detects the battery is still above the upper bound and restarts discharge. Toggle stays ON. |
 
 ### Settings and Safety
@@ -268,6 +281,8 @@ Because the `-a` override stamps **all** power profiles, the original `sleep` an
 
 The saved values live in `/Library/Application Support/az-ampere/saved-sleep` (and `saved-sleep-display`). The markers deliberately live outside `/tmp`: macOS wipes `/tmp` at boot while `pmset -a` overrides persist across reboots, so a crash + reboot during discharge would otherwise lose the saved values and leave sleep permanently disabled. With the persistent markers, the next launch's cleanup finds them and restores the original settings. (Single-value markers written by older builds — including to the legacy `/tmp` location — are still honored; their one value is applied to both profiles, matching what those builds' `-a` restore did.)
 
+The mid-charge **sleep hold** (see Sleep and Mid-Charge Protection) saves and restores through the same markers via the `hold-sleep` / `release-sleep-hold` helper commands, so every existing restore path — `nodischarge`, the watchdog, launch cleanup — undoes it too. The hold's override is `sleep 0 disablesleep 1` only (no `displaysleep 0`: there is no CHIE write and no PD renegotiation to protect against, so the display may sleep while the machine charges). Both keys' markers are still saved, because the shared restore always puts back both.
+
 ### Watchdog Daemon
 
 A **watchdog daemon** is always running while the app is active. It is spawned via `posix_spawn` on launch, re-spawned after discharge stops, and also spawned by the discharge command. The daemon:
@@ -277,7 +292,7 @@ A **watchdog daemon** is always running while the app is active. It is spawned v
 3. If the app dies (crash, `kill -9`, Ctrl+C, etc.), the watchdog cleans up within seconds:
    - Clears `CHTE = 0x00` (allows charging)
    - Clears `CHIE = 0x00` (stops discharge)
-   - Restores sleep settings via `pmset` — only if the save-sleep marker file exists (i.e. discharge had been active and overrode pmset); otherwise leaves the user's sleep settings untouched
+   - Restores sleep settings via `pmset` — only if the save-sleep marker file exists (i.e. discharge or the mid-charge sleep hold had overridden pmset); otherwise leaves the user's sleep settings untouched
    - Exits cleanly (no orphaned processes, no leftover files)
 
 The watchdog must be spawned with `posix_spawn` (not `fork`) because the Swift/ObjC runtime is not fork-safe — forked children crash when using Foundation, IOKit, or Objective-C APIs. Similarly, signal handlers (`SIGTERM`/`SIGHUP`) cannot be used for cleanup because they can only call async-signal-safe C functions, not Swift/Foundation/IOKit APIs. It is spawned with `POSIX_SPAWN_SETSID` so it runs in its own session: without that it would share the app's foreground process group, and a terminal Ctrl+C (dev runs via `run.sh`) would SIGINT the watchdog at the same instant as the app it exists to clean up after.
@@ -308,6 +323,15 @@ Ampere (GUI, user)
   |-- sudo SMCWriter nodischarge             (one-shot, root)
   |     |-- pkill watchdog                   kill existing watchdog
   |     |-- SMC write CHIE = 0x00            disable active discharge
+  |     |-- pmset restore sleep settings     only if save-sleep file exists
+  |     \-- exit(0)
+  |
+  |-- sudo SMCWriter hold-sleep              (one-shot, root)
+  |     |-- save pmset markers               same markers as discharge
+  |     |-- pmset -a sleep 0 disablesleep 1  keep Mac awake mid-charge
+  |     \-- exit(0)                          (displaysleep untouched)
+  |
+  |-- sudo SMCWriter release-sleep-hold      (one-shot, root)
   |     |-- pmset restore sleep settings     only if save-sleep file exists
   |     \-- exit(0)
   |

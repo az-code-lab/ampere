@@ -862,6 +862,13 @@ struct ContentView: View {
             }
             return "Discharging to \(monitor.chargeUpperBound)% — sleep is temporarily disabled"
         }
+        // Sleep hold: a below-lower charge is keeping the Mac awake so a
+        // closed lid can't strand it mid-charge. Announced like the
+        // discharge override above — the user should know why their Mac
+        // isn't sleeping.
+        if monitor.autoManageEnabled && monitor.sleepHoldActive && state.adapterConnected {
+            return "Auto: charging to \(monitor.chargeUpperBound)% — sleep is disabled until then"
+        }
         // Charge-to-full: announce the target even while the allow write is
         // still in flight (amperage ≤ 0 for a beat after toggling) — without
         // this, the paused branch below would flash "not charging" copy the
@@ -897,6 +904,9 @@ struct ContentView: View {
         if monitor.lastError != nil { return .red }
         if monitor.healthWarning != nil { return .red }
         if monitor.activeDischarging { return .orange }
+        // Mirrors statusMessage's sleep-hold branch: same orange treatment
+        // as discharge, since both mean "sleep is being overridden".
+        if monitor.autoManageEnabled && monitor.sleepHoldActive && state.adapterConnected { return .orange }
         // Match statusMessage's branching: blue for auto-hold (regardless of AC)
         // or manual pause while on AC. A manual-mode chargingPaused with no
         // adapter falls through to the "Connect power adapter" prompt, which
@@ -1091,7 +1101,7 @@ struct ContentView: View {
         // State-dependent like the pin/settings tooltips: each side says what
         // is active now and what flipping the toggle switches to.
         .help(monitor.autoManageEnabled
-            ? "On: Ampere keeps the battery between the bounds; charging starts below the lower bound and stops at the upper bound. Turn off for standard macOS charging with manual Pause/Resume."
+            ? "On: Ampere keeps the battery between the bounds; charging starts below the lower bound and stops at the upper bound. A below-lower charge keeps the Mac awake until it finishes; other charges pause during sleep and resume on wake. Turn off for standard macOS charging with manual Pause/Resume."
             : "Off: standard macOS charging to full, with manual Pause/Resume while on AC. Turn on to keep the battery between the lower and upper bounds automatically. Requires admin access.")
     }
 
