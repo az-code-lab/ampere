@@ -2,8 +2,10 @@
 #
 # Release script: build app bundle, sign, notarize, publish
 #
-# Usage: ./release.sh <version>
+# Usage: ./release.sh <version> [--force]
 #   e.g. ./release.sh 1.0.0
+#   --force allows re-releasing a version whose tag already exists
+#   (replaces the tag, the GitHub release, and the cask entry)
 #
 # Prerequisites:
 #   - Xcode with Developer ID certificate
@@ -18,9 +20,27 @@ REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$REPO_DIR/.project.env"
 
 VERSION="${1:-}"
+FORCE="${2:-}"
 if [ -z "$VERSION" ]; then
-    echo "Usage: ./release.sh <version>"
+    echo "Usage: ./release.sh <version> [--force]"
     echo "Example: ./release.sh 1.0.0"
+    exit 1
+fi
+
+# Plain dotted digits only. A "v" prefix would ship a cask version that
+# parseDottedVersion rejects on every client — the in-app update would
+# silently never be offered for that release.
+if ! [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+    echo "ERROR: version must be plain dotted digits (e.g. 1.2.3), got: $VERSION"
+    exit 1
+fi
+
+# Reusing a version number silently replaces the old tag, GitHub release,
+# and cask entry (tag -f / push -f / gh release delete below). Make that
+# an explicit choice rather than a typo's outcome.
+if git rev-parse -q --verify "refs/tags/v$VERSION" > /dev/null && [ "$FORCE" != "--force" ]; then
+    echo "ERROR: tag v$VERSION already exists — releasing would replace it"
+    echo "       To re-release deliberately: ./release.sh $VERSION --force"
     exit 1
 fi
 
@@ -32,8 +52,13 @@ DMG_PATH="/tmp/${SCHEME}.dmg"
 cd "$REPO_DIR"
 
 echo "==> Verifying clean working tree..."
-if ! git diff --quiet HEAD; then
-    echo "ERROR: uncommitted changes — commit or stash before releasing"
+# git status --porcelain (unlike git diff HEAD) also catches untracked
+# files: a forgotten `git add` would otherwise compile into the shipped
+# binary while the pushed tag lacks the file, making the release
+# irreproducible from source.
+if [ -n "$(git status --porcelain)" ]; then
+    echo "ERROR: working tree not clean — commit, stash, or remove these before releasing:"
+    git status --short
     exit 1
 fi
 

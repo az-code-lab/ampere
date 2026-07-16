@@ -26,6 +26,15 @@ private struct UpdateError: LocalizedError {
     var errorDescription: String? { message }
 }
 
+/// Thrown when the two-rename fallback fails AND the rollback rename fails,
+/// i.e. no bundle sits at the live path anymore. Distinguished from
+/// UpdateError so the staging cleanup knows to leave the hidden copies on
+/// disk — they are the only intact bits left to recover from.
+private struct UnrecoverableSwapError: LocalizedError {
+    let message: String
+    var errorDescription: String? { message }
+}
+
 // MARK: - Self-Update
 
 extension BatteryMonitor {
@@ -57,8 +66,10 @@ extension BatteryMonitor {
         guard let update = updateAvailable else { return }
         let appBundleURL = Bundle.main.bundleURL
         // Dev builds (`swift build` bare executable) have no bundle to swap.
-        // Unreachable in practice: their version string is a git hash, which
-        // isNewerVersion rejects, so updateAvailable is never set.
+        // Reachable there: a dev build sitting exactly on a release tag gets
+        // a parseable "vX.Y.Z" from `git describe`, so an older tag can be
+        // offered an update — this guard turns the click into a clear error
+        // instead of attempting to swap a bare executable.
         guard appBundleURL.pathExtension == "app" else {
             updateState = .failed("Not running from an app bundle")
             return
@@ -83,13 +94,23 @@ extension BatteryMonitor {
                 try? fm.removeItem(at: workDir)
                 try fm.createDirectory(at: workDir, withIntermediateDirectories: true)
                 let dmgURL = workDir.appendingPathComponent("Ampere.dmg")
-                try fm.moveItem(at: tempURL, to: dmgURL)
+                do {
+                    try fm.moveItem(at: tempURL, to: dmgURL)
+                } catch {
+                    // The workDir name is PID-scoped, so a later run would
+                    // never reclaim it — clean up before bailing.
+                    try? fm.removeItem(at: workDir)
+                    throw error
+                }
                 DispatchQueue.main.async { self.updateState = .installing }
                 DispatchQueue.global(qos: .userInitiated).async {
                     self.verifyAndInstall(update: update, dmgURL: dmgURL, workDir: workDir,
                                           appBundleURL: appBundleURL)
                 }
             } catch {
+                // A user-initiated cancel is not a failure — cancelUpdate
+                // already reset the state; don't overwrite it with .failed.
+                if (error as? URLError)?.code == .cancelled { return }
                 self.failUpdate(error)
             }
         }
@@ -139,27 +160,35 @@ extension BatteryMonitor {
             //    team as the running app.
             try Self.verifyCodeSignature(newApp: newApp, currentApp: appBundleURL)
 
-            // 4. Stage a copy next to the destination (same volume, so the
-            //    swap below is two atomic renames), then swap. The running
-            //    executable's inode stays alive unlinked-but-open, so
-            //    removing the old bundle is safe.
+            // 4. Stage a copy next to the destination (same volume), then
+            //    swap it with the live bundle. renamex_np(RENAME_SWAP)
+            //    exchanges the two paths atomically — at no instant is
+            //    Ampere.app missing from disk. Volumes without swap support
+            //    fall back to two renames; only that path has a (tiny)
+            //    window, and a rollback failure there is surfaced rather
+            //    than swallowed. The running executable's inode stays alive
+            //    unlinked-but-open, so removing the old bundle is safe.
+            //    Failure paths remove the staged copy — a hidden bundle
+            //    must not outlive a failed install (except after a failed
+            //    rollback, where the hidden copies are the only intact
+            //    bits left to recover from).
             let appName = appBundleURL.lastPathComponent
             let destDir = appBundleURL.deletingLastPathComponent()
             let staged = destDir.appendingPathComponent(".\(appName).update-staged")
             let old = destDir.appendingPathComponent(".\(appName).update-old")
             try? fm.removeItem(at: staged)
             try? fm.removeItem(at: old)
-            // ditto preserves signatures, xattrs, and permissions exactly.
-            try Self.runChecked("/usr/bin/ditto", [newApp.path, staged.path],
-                                failure: "Couldn't stage the new version in \(destDir.path)")
-            try fm.moveItem(at: appBundleURL, to: old)
             do {
-                try fm.moveItem(at: staged, to: appBundleURL)
+                // ditto preserves signatures, xattrs, and permissions exactly.
+                try Self.runChecked("/usr/bin/ditto", [newApp.path, staged.path],
+                                    failure: "Couldn't stage the new version in \(destDir.path)")
+                try Self.swapIntoPlace(staged: staged, live: appBundleURL, old: old)
             } catch {
-                try? fm.moveItem(at: old, to: appBundleURL)  // roll back
+                if !(error is UnrecoverableSwapError) {
+                    try? fm.removeItem(at: staged)
+                }
                 throw error
             }
-            try? fm.removeItem(at: old)
             // The bundle is verified; strip any quarantine flag so the
             // relaunch doesn't stall on a Gatekeeper first-open dialog.
             _ = Self.runProcess("/usr/bin/xattr", ["-dr", "com.apple.quarantine", appBundleURL.path])
@@ -172,6 +201,53 @@ extension BatteryMonitor {
         } catch {
             failUpdate(error)
         }
+    }
+
+    /// Exchange `staged` and `live` atomically when the volume supports it
+    /// (APFS does), falling back to two renames via `old`. On success the
+    /// outgoing bundle is removed and `live` holds the new one.
+    /// Internal (not private) so the swap postconditions — and the fallback
+    /// rollback leaving `live` untouched — can be pinned by tests.
+    static func swapIntoPlace(staged: URL, live: URL, old: URL) throws {
+        let fm = FileManager.default
+        if renamex_np(staged.path, live.path, UInt32(RENAME_SWAP)) == 0 {
+            // `staged` now holds the outgoing bundle; best-effort cleanup.
+            try? fm.removeItem(at: staged)
+            return
+        }
+        // Fallback for volumes without RENAME_SWAP: two renames with an
+        // unavoidable sub-millisecond gap where `live` is missing.
+        try fm.moveItem(at: live, to: old)
+        do {
+            try fm.moveItem(at: staged, to: live)
+        } catch {
+            do {
+                try fm.moveItem(at: old, to: live)  // roll back
+            } catch let rollbackError {
+                // Neither bundle is at the live path now. Leave both hidden
+                // copies in place for manual recovery and say exactly that —
+                // deleting them here would turn a bad state into an
+                // unrecoverable one.
+                throw UnrecoverableSwapError(message:
+                    "Install failed mid-swap and rolling back also failed ("
+                    + rollbackError.localizedDescription + "). Restore "
+                    + old.lastPathComponent + " in " + live.deletingLastPathComponent().path
+                    + " to \(live.lastPathComponent), or reinstall: brew reinstall --cask ampere")
+            }
+            throw error
+        }
+        try? fm.removeItem(at: old)
+    }
+
+    /// Cancel an in-flight download. No-op outside `.downloading` — the
+    /// install stage is short and swaps atomically, so it isn't cancellable.
+    func cancelUpdate() {
+        guard case .downloading = updateState else { return }
+        updateDownloadTask?.cancel()
+        // The download completion handler maps the resulting
+        // URLError.cancelled to a silent return; reset here too so the
+        // footer reverts to the Update button instantly.
+        updateState = .idle
     }
 
     // MARK: Helpers

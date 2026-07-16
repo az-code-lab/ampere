@@ -142,6 +142,9 @@ final class BatteryMonitor: ObservableObject {
 
     private var timer: Timer?
     private var updateCheckTimer: Timer?
+    /// IOKit power-source change notifications (plug/unplug, charge ticks)
+    /// drive an immediate refresh; removed from the run loop in deinit.
+    private var powerSourceRunLoopSource: CFRunLoopSource?
     // Self-update plumbing, used by the extension in Updater.swift. Not
     // `private`: stored properties can't live in a cross-file extension,
     // but the logic that touches them does.
@@ -303,18 +306,21 @@ final class BatteryMonitor: ObservableObject {
             // persisted with pct already at/above upper. Without this correction,
             // shouldInhibit below would compute false and the launch cleanup
             // would briefly write CHTE=allow, violating the invariant until the
-            // first refresh self-corrects.
-            if chargeToUpperBound, launchBattery != nil, launchPercentage >= chargeUpperBound {
+            // first refresh self-corrects. reachedBound: for a 100% upper
+            // bound the BMS fully-charged flag counts as "at the bound",
+            // same rule the state machine applies.
+            if chargeToUpperBound, let lb = launchBattery,
+               Self.reachedBound(chargeUpperBound, percentage: lb.percentage,
+                                 fullyCharged: lb.fullyCharged) {
                 chargeToUpperBound = false
                 defaults.set(false, forKey: "chargeToUpperBound")
             }
             // Same crash-window repair for charge-to-full against its own
             // target: a crash between the at-full inhibit write and the
-            // in-memory clear must not resurrect the override. The BMS
-            // fully-charged flag counts as "at 100" — worn batteries can
-            // terminate below a displayed 100% (see evaluateAutoManageStep).
+            // in-memory clear must not resurrect the override.
             if chargeToFull, let lb = launchBattery,
-               lb.percentage >= 100 || lb.fullyCharged {
+               Self.reachedBound(100, percentage: lb.percentage,
+                                 fullyCharged: lb.fullyCharged) {
                 chargeToFull = false
                 defaults.set(false, forKey: "chargeToFull")
             }
@@ -359,6 +365,26 @@ final class BatteryMonitor: ObservableObject {
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 60.0, repeats: true) { [weak self] _ in
             self?.refresh()
+        }
+        // React to power-source changes the moment they happen instead of
+        // waiting out the poll interval: rule 2 and the charge-to-full
+        // session semantics key off the connected→disconnected edge, which
+        // a short unplug could otherwise slip past entirely between polls,
+        // and a discharge left running after an unplug should stop within
+        // seconds, not at the next tick. The timer above remains the
+        // fallback cadence and drives health checks when nothing changes.
+        // passUnretained is safe: the source is removed in deinit, so no
+        // callback can outlive self. The callback fires on the run loop the
+        // source is added to — main, where refresh() belongs.
+        let iopsContext = Unmanaged.passUnretained(self).toOpaque()
+        if let source = IOPSNotificationCreateRunLoopSource({ context in
+            guard let context else { return }
+            Unmanaged<BatteryMonitor>.fromOpaque(context).takeUnretainedValue().refresh()
+        }, iopsContext)?.takeRetainedValue() {
+            CFRunLoopAddSource(CFRunLoopGetMain(), source, .defaultMode)
+            powerSourceRunLoopSource = source
+        } else {
+            NSLog("Ampere: IOPS notification source unavailable — timer-only polling")
         }
         // Check for updates: 5 minutes after launch, then once daily at a random interval
         updateCheckTimer = Timer.scheduledTimer(withTimeInterval: 300, repeats: false) { [weak self] _ in
@@ -564,6 +590,9 @@ final class BatteryMonitor: ObservableObject {
         timer?.invalidate()
         updateCheckTimer?.invalidate()
         updateDownloadTask?.cancel()
+        if let source = powerSourceRunLoopSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .defaultMode)
+        }
         if let observer = terminationObserver {
             NotificationCenter.default.removeObserver(observer)
         }
@@ -1065,6 +1094,17 @@ final class BatteryMonitor: ObservableObject {
         let newState: AutoManageState
     }
 
+    /// "Reached the bound" for charge decisions. For a 100% bound the BMS's
+    /// charge-termination flag also counts: worn batteries can terminate
+    /// below a displayed 100%, and comparing the percentage alone would
+    /// keep CHTE=allow forever, trickle-charging at the top. Bounds below
+    /// 100 are unaffected — the BMS never terminates there.
+    /// One definition shared by the state machine and the launch-time
+    /// crash repairs in init; internal (not private) so tests can pin it.
+    static func reachedBound(_ bound: Int, percentage: Int, fullyCharged: Bool) -> Bool {
+        percentage >= bound || (bound == 100 && fullyCharged)
+    }
+
     /// Core auto-manage state machine. Pure function: given the prior state and
     /// the currently observed inputs, return the SMC action to issue and the
     /// state to store after the action completes. Encodes:
@@ -1115,13 +1155,8 @@ final class BatteryMonitor: ObservableObject {
             return AutoManageDecision(action: .none, newState: next)
         }
 
-        // "Reached the bound" for charge decisions. For a 100% bound the
-        // BMS's charge-termination flag also counts: worn batteries can
-        // terminate below a displayed 100%, and comparing the percentage
-        // alone would keep CHTE=allow forever, trickle-charging at the top.
-        // Bounds below 100 are unaffected — the BMS never terminates there.
-        let reached: (Int) -> Bool = { bound in
-            inputs.percentage >= bound || (bound == 100 && inputs.fullyCharged)
+        let reached: (Int) -> Bool = {
+            reachedBound($0, percentage: inputs.percentage, fullyCharged: inputs.fullyCharged)
         }
 
         // chargeToUpperBound is only meaningful below the upper bound (init

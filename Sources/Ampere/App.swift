@@ -855,8 +855,8 @@ struct ContentView: View {
         if monitor.activeDischarging {
             // SMC discharge has been requested but may not have engaged yet
             // (transient at startup or just after toggling the feature on).
-            // Be honest about the *current* state — the battery is still
-            // gaining charge — instead of claiming the system is discharging.
+            // Describe the *current* state — the battery is still gaining
+            // charge — instead of claiming the system is discharging.
             if (state.amperage ?? 0) > 0 {
                 return "Discharge starting — sleep is temporarily disabled"
             }
@@ -1248,9 +1248,22 @@ struct ContentView: View {
     private func updateControl(_ update: AvailableUpdate) -> some View {
         switch monitor.updateState {
         case .downloading(let fraction):
-            Text("Downloading… \(Int((fraction * 100).rounded()))%")
-                .font(.system(size: 12))
-                .foregroundColor(.secondary)
+            HStack(spacing: 4) {
+                Text("Downloading… \(Int((fraction * 100).rounded()))%")
+                    .font(.system(size: 12))
+                    .foregroundColor(.secondary)
+                // A stalled connection would otherwise pin the footer here
+                // until URLSession's timeouts fire, with quitting the app as
+                // the only recourse.
+                Button {
+                    monitor.cancelUpdate()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 12))
+                }
+                .buttonStyle(FooterButtonStyle())
+                .help("Cancel the download — the Update button returns and nothing is changed")
+            }
         case .installing:
             Text("Installing…")
                 .font(.system(size: 12))

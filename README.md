@@ -135,7 +135,7 @@ Health checks only run while a power adapter is connected — on battery the app
 
 #### Polling and Health Check Timing
 
-The app polls battery state on a timer. Health checks run every poll cycle after an initial 3-cycle warm-up (to let launch cleanup settle), whenever a power adapter is connected.
+The app polls battery state on a timer. Power-source changes (plug/unplug, charge-level ticks) also trigger an immediate poll via an IOKit notification, so adapter transitions are handled within about a second rather than at the next interval — a short unplug between polls still cancels Charge to Full and stops an active discharge. Health checks run every poll cycle after an initial 3-cycle warm-up (to let launch cleanup settle), whenever a power adapter is connected.
 
 |  | Popover closed (slow) | Popover open (fast) |
 |---|---|---|
@@ -152,9 +152,9 @@ Health checks also run immediately after revoking admin access, and after re-gra
 
 The app checks the Homebrew cask for a newer version 5 minutes after launch and about once a day after that. When one is found, the menu bar battery icon gains a small blue badge dot (hover for the version; the dot renders alongside the orange health-warning tint when both apply) and the panel footer shows an **Update to X** button. Clicking it:
 
-1. Downloads the release DMG from GitHub Releases (progress shown in the footer).
+1. Downloads the release DMG from GitHub Releases (progress shown in the footer, with a cancel button).
 2. Verifies the download: SHA-256 must match the cask, the code signature must be intact, and the Team ID must match the running app.
-3. Swaps the new bundle into place (two atomic renames) and relaunches.
+3. Swaps the new bundle into place (one atomic exchange; volumes without swap support fall back to two renames) and relaunches.
 
 The relaunch takes the normal quit → restart path: SMC overrides are restored on the way down, and persisted state (auto charge, bounds, an in-progress charge/discharge to upper bound) resumes in the new copy. If the bundled SMCWriter changed, the next launch asks for your admin password once to install the new helper — same as after a Homebrew upgrade.
 

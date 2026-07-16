@@ -206,6 +206,14 @@ func saveSleepMarkers() -> Bool {
     }
     if needDisplay, !savePmsetMarker(key: "displaysleep", paths: savedDisplaySleepPaths,
                                      customOutput: customOutput) {
+        // A half-saved pair must not outlive this call: a leftover sleep
+        // marker with no displaysleep marker would make the next restore
+        // path (nodischarge, watchdog, release-sleep-hold — all keyed on
+        // the sleep marker existing) fabricate displaysleep=10/10 over the
+        // user's real setting. Remove only what this call just wrote — a
+        // pre-existing marker belongs to an active override and still
+        // holds the genuine originals.
+        if needSleep { removeMarkers([savedSleepPaths[0]]) }
         fputs("ERROR: cannot save original displaysleep values — refusing to override sleep\n", stderr)
         return false
     }
