@@ -1014,18 +1014,12 @@ struct ContentView: View {
                 get: { monitor.autoManageEnabled },
                 set: { newValue in
                     if newValue {
-                        // Set immediately so the toggle doesn't flicker
+                        // Set immediately so the toggle doesn't flicker.
+                        // No rule-1 arming here: the state machine arms
+                        // chargeToUpperBound itself when it sees below-lower
+                        // on AC (any entry path), so the refresh below
+                        // handles a fresh enable in that condition too.
                         monitor.autoManageEnabled = true
-                        // Rule-1 entry condition: if currently below the lower
-                        // bound on AC, the documented behavior is to charge to
-                        // upper. The state machine's branch 3 requires
-                        // chargingPaused=true which a manual→auto transition
-                        // doesn't have, so set chargeToUpperBound here.
-                        if let state = monitor.state,
-                           state.adapterConnected,
-                           state.percentage < monitor.chargeLowerBound {
-                            monitor.chargeToUpperBound = true
-                        }
                         monitor.ensureSudoInstalled { ok in
                             if ok {
                                 // Act on the new mode now (inhibit/allow per
@@ -1093,8 +1087,11 @@ struct ContentView: View {
             // active: charge-to-upper by the higher target, and discharge
             // because activating charge-to-full turned the preference off —
             // showing the row would invite re-enabling it against the
-            // in-progress full charge.
-            if !monitor.chargeToFull {
+            // in-progress full charge. Both rows are also adapter-gated,
+            // like Charge to Full below and the manual Pause/Resume button:
+            // they drive AC charging behavior, so on battery the toggles
+            // would be inert until the next plug-in.
+            if !monitor.chargeToFull && state.adapterConnected {
                 if state.percentage > monitor.chargeUpperBound {
                     HStack {
                         Image(systemName: "arrow.down.to.line")

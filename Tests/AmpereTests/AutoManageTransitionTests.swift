@@ -149,13 +149,11 @@ final class AutoManageTransitionTests: XCTestCase {
     }
 
     func testRule1_FreshEnableFromManualMode_ChargesToUpper() {
-        // Scenario from fix AY: user enables auto-manage from manual mode
-        // while battery is below the lower bound on AC. The UI handler sets
-        // chargeToUpperBound=true so the eventual charge-to-upper happens
-        // (state machine's branch 3 needs chargingPaused which a fresh
-        // enable doesn't have). Verify the state machine then doesn't
-        // inhibit while charging through the lower bound and inhibits only
-        // at upper.
+        // Enabling auto-manage from manual mode below the lower bound on AC.
+        // The machine's rule-1 arm sets chargeToUpperBound on the first tick
+        // (pinned by the unpaused-and-unarmed tests above); this test pins
+        // the continuation: with the intent armed, no inhibit fires while
+        // charging through the band, and the charge stops only at upper.
         let sim = Simulator(
             chargingPaused: false,
             chargeToUpperBound: true,  // UI handler set this on fresh enable
@@ -181,6 +179,74 @@ final class AutoManageTransitionTests: XCTestCase {
         let action = sim.step(percentage: 35, adapterConnected: true)
         XCTAssertEqual(action, .allow)
         XCTAssertTrue(sim.state.chargeToUpperBound)
+    }
+
+    func testRule1_PlugInBelowLowerWhileUnpausedAndUnarmed_ArmsAndChargesToUpper() {
+        // Gap confirmed on hardware: auto-manage enabled while ON BATTERY
+        // below the lower bound (the UI enable handler can't arm without an
+        // adapter), then AC connects. chargingPaused is false and nothing is
+        // armed, so no branch used to fire — and the between-bounds branch
+        // then parked the charge at the lower bound instead of the upper.
+        let sim = Simulator(
+            chargingPaused: false,
+            chargeToUpperBound: false,
+            lastAdapterConnected: false
+        )
+        // On-battery ticks after the enable — must stay pure.
+        sim.step(percentage: 35, adapterConnected: false)
+        XCTAssertFalse(sim.state.chargeToUpperBound, "No arm without an adapter")
+
+        // AC connects below the lower bound: rule 1 must arm the intent.
+        // CHTE is already allow (unpaused), so a pure arm with no SMC
+        // action is the correct decision.
+        let plugIn = sim.step(percentage: 35, adapterConnected: true)
+        XCTAssertEqual(plugIn, .none, "Unpaused below-lower arm needs no SMC write")
+        XCTAssertTrue(sim.state.chargeToUpperBound,
+                      "Rule 1: below lower on AC must arm charge-to-upper even when unpaused")
+
+        // Charging through the band must not park at the lower bound.
+        sim.chargeFrom(36, to: 59)
+        XCTAssertEqual(sim.issued.filter { $0 == .inhibit }.count, 0,
+                       "Must not inhibit at the lower-bound crossing")
+        XCTAssertFalse(sim.state.chargingPaused)
+        XCTAssertTrue(sim.state.chargeToUpperBound)
+
+        // Terminates only at the upper bound.
+        sim.step(percentage: 60, adapterConnected: true)
+        XCTAssertTrue(sim.state.chargingPaused)
+        XCTAssertFalse(sim.state.chargeToUpperBound)
+    }
+
+    func testRule1_UnplugAboveLowerThenDrainBelow_Reconnect_ChargesToUpper() {
+        // The pure-auto-mode entry into the same gap (reproduced on hardware
+        // 2026-07-16): unplug during a charge-to-upper run at/above the lower
+        // bound (rule 2 clears the intent by design, chargingPaused stays
+        // false), drain below the lower bound on battery, reconnect. Rule 1
+        // must re-arm and charge to the upper bound, not park at the lower.
+        let sim = Simulator(
+            chargingPaused: false,
+            chargeToUpperBound: true,
+            lastAdapterConnected: true
+        )
+        sim.step(percentage: 45, adapterConnected: true)   // mid charge-to-upper
+        sim.step(percentage: 45, adapterConnected: false)  // unplug above lower
+        XCTAssertFalse(sim.state.chargeToUpperBound, "Rule 2 clears the intent on unplug above lower")
+        XCTAssertFalse(sim.state.chargingPaused)
+
+        sim.drainFrom(44, to: 38)                          // drain below lower on battery
+
+        let reconnect = sim.step(percentage: 38, adapterConnected: true)
+        XCTAssertEqual(reconnect, .none, "CHTE is already allow; the arm is pure")
+        XCTAssertTrue(sim.state.chargeToUpperBound,
+                      "Rule 1 must re-arm on reconnect below the lower bound")
+
+        sim.chargeFrom(39, to: 59)
+        XCTAssertEqual(sim.issued.filter { $0 == .inhibit }.count, 0,
+                       "Must not park at the lower bound")
+
+        sim.step(percentage: 60, adapterConnected: true)
+        XCTAssertTrue(sim.state.chargingPaused)
+        XCTAssertFalse(sim.state.chargeToUpperBound)
     }
 
     // MARK: - Rule 2: unplug above lower → stop at interrupt point on reconnect

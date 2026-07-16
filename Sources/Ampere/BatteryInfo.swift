@@ -1030,6 +1030,20 @@ final class BatteryMonitor: ObservableObject {
             next.chargeToFull = false
         }
 
+        // Rule 1, unpaused entry: below the lower bound on AC always means
+        // "charge to the upper bound". The paused entry arms in the allow
+        // branch below, but the below-lower state can also be entered
+        // unpaused with nothing armed — auto-manage enabled while on
+        // battery, or an unplug at/above lower (rule 2 clears the intent)
+        // followed by a drain below it. Without this arm, the between-bounds
+        // branch would inhibit at the lower-bound crossing and park the
+        // charge there. Pure arm, no SMC action: unpaused means CHTE is
+        // already in the allow state.
+        if !next.chargingPaused, !next.chargeToUpperBound, !next.chargeToFull,
+           inputs.percentage < inputs.lowerBound {
+            next.chargeToUpperBound = true
+        }
+
         // While charge-to-full is active the configured upper bound stops
         // being a charge terminator; 100% is the only ceiling. Cleared above
         // when full, so an active flag always means "keep charging".
@@ -1360,8 +1374,9 @@ final class BatteryMonitor: ObservableObject {
             if chargeToUpperBound != decision.newState.chargeToUpperBound, decision.action == .none {
                 chargeToUpperBound = decision.newState.chargeToUpperBound
                 // Pure paths in both directions: rule 2 (AC disconnect above
-                // lower) and the at/above-upper staleness repair clear it; the
-                // charge-to-full disconnect downgrade below lower sets it.
+                // lower) and the at/above-upper staleness repair clear it;
+                // the charge-to-full disconnect downgrade and the rule-1 arm
+                // (below lower on AC while unpaused) set it.
                 NSLog("Ampere: %@ chargeToUpperBound at %d%%",
                       decision.newState.chargeToUpperBound ? "Set" : "Cleared", b.percentage)
             }
