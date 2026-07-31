@@ -149,4 +149,45 @@ final class PmsetStateTests: XCTestCase {
         XCTAssertFalse(PmsetState.validMinutes(-1))
         XCTAssertFalse(PmsetState.validMinutes(1441))
     }
+
+    // MARK: - SleepDisabled marker
+
+    func testFlagMarkerRoundTrip() {
+        XCTAssertEqual(PmsetState.flagMarkerString(true), "1")
+        XCTAssertEqual(PmsetState.flagMarkerString(false), "0")
+        XCTAssertEqual(PmsetState.parseFlagMarker("1"), true)
+        XCTAssertEqual(PmsetState.parseFlagMarker("0"), false)
+    }
+
+    func testParseFlagMarker_TrimsWhitespace() {
+        XCTAssertEqual(PmsetState.parseFlagMarker(" 1\n"), true)
+    }
+
+    func testParseFlagMarker_GarbageOrMissing_ReturnsNil() {
+        // nil/garbage must parse to nil — the restore then falls back to
+        // disablesleep 0, never to a guessed 1 that could leave a Mac
+        // permanently unable to sleep.
+        XCTAssertNil(PmsetState.parseFlagMarker(nil))
+        XCTAssertNil(PmsetState.parseFlagMarker(""))
+        XCTAssertNil(PmsetState.parseFlagMarker("2"))
+        XCTAssertNil(PmsetState.parseFlagMarker("true"))
+        XCTAssertNil(PmsetState.parseFlagMarker("1 0"))
+    }
+
+    func testRestoreSleepDisabled_OnlyWhenSavedAndStillRaised() {
+        // Saved 1 + flag still raised: the external holder (e.g. Lidless)
+        // is presumed alive — put its hold back instead of cancelling it.
+        XCTAssertTrue(PmsetState.restoreSleepDisabled(marker: true, current: true))
+        // Saved 1 but the flag was cleared mid-override: the holder
+        // released (auto-off timer, quit); restoring 1 would strand the
+        // Mac unable to sleep with nobody left to clear it.
+        XCTAssertFalse(PmsetState.restoreSleepDisabled(marker: true, current: false))
+        // Saved 0: restore 0 regardless of the current flag (which mid-
+        // override is our own 1).
+        XCTAssertFalse(PmsetState.restoreSleepDisabled(marker: false, current: true))
+        XCTAssertFalse(PmsetState.restoreSleepDisabled(marker: false, current: false))
+        // No marker (pre-marker builds, wiped state dir): legacy behavior.
+        XCTAssertFalse(PmsetState.restoreSleepDisabled(marker: nil, current: true))
+        XCTAssertFalse(PmsetState.restoreSleepDisabled(marker: nil, current: false))
+    }
 }

@@ -306,4 +306,58 @@ final class HealthCheckTests: XCTestCase {
             }
         }
     }
+
+    // MARK: - chteRepairOp (health check self-repair)
+
+    func testChteRepair_DriftToAllowWhilePaused_RepairsInhibit() {
+        // The field case: firmware/PD renegotiation reset CHTE to allow
+        // while the app is holding at/above the upper bound. The state
+        // machine is edge-triggered and won't re-issue the inhibit; the
+        // health check must.
+        XCTAssertEqual(
+            BatteryMonitor.chteRepairOp(
+                chteMatch: false, chieMatch: true, chie: SMC.chieNormalInt,
+                expectedChte: SMC.chteInhibitHex, activeDischarging: false),
+            .inhibit)
+    }
+
+    func testChteRepair_DriftToInhibitMidCharge_RepairsAllow() {
+        // The reverse drift: CHTE flipped to inhibit while a charge-to-upper
+        // is supposed to be running — without repair the charge silently
+        // never finishes.
+        XCTAssertEqual(
+            BatteryMonitor.chteRepairOp(
+                chteMatch: false, chieMatch: true, chie: SMC.chieNormalInt,
+                expectedChte: SMC.chteAllowHex, activeDischarging: false),
+            .allow)
+    }
+
+    func testChteRepair_CHTEMatches_NoRepair() {
+        XCTAssertNil(BatteryMonitor.chteRepairOp(
+            chteMatch: true, chieMatch: true, chie: SMC.chieNormalInt,
+            expectedChte: SMC.chteInhibitHex, activeDischarging: false))
+    }
+
+    func testChteRepair_CHIEMismatch_NoRepair() {
+        // A CHIE problem means a discharge failed to start or stop — that
+        // belongs to the state machine (sleep overrides, watchdog), not to
+        // a bare SMC write from the health check.
+        XCTAssertNil(BatteryMonitor.chteRepairOp(
+            chteMatch: false, chieMatch: false, chie: SMC.chieNormalInt,
+            expectedChte: SMC.chteInhibitHex, activeDischarging: false))
+    }
+
+    func testChteRepair_DischargeCHIE_NoRepair() {
+        // chieMatch=true with chie=discharge (expected discharge, matching)
+        // must still not repair: during discharge CHTE is firmware noise.
+        XCTAssertNil(BatteryMonitor.chteRepairOp(
+            chteMatch: false, chieMatch: true, chie: SMC.chieDischargeInt,
+            expectedChte: SMC.chteInhibitHex, activeDischarging: false))
+    }
+
+    func testChteRepair_ActiveDischarging_NoRepair() {
+        XCTAssertNil(BatteryMonitor.chteRepairOp(
+            chteMatch: false, chieMatch: true, chie: SMC.chieNormalInt,
+            expectedChte: SMC.chteInhibitHex, activeDischarging: true))
+    }
 }

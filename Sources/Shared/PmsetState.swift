@@ -79,4 +79,39 @@ public enum PmsetState {
     public static func validMinutes(_ n: Int) -> Bool {
         n >= 0 && n <= 1440
     }
+
+    // MARK: - SleepDisabled marker
+
+    /// Marker file format for the saved SleepDisabled flag: "1" or "0".
+    public static func flagMarkerString(_ value: Bool) -> String {
+        value ? "1" : "0"
+    }
+
+    /// Parse a SleepDisabled marker. Strict on purpose: anything but a bare
+    /// "0"/"1" (whitespace-trimmed) is nil, and callers treat nil as
+    /// "restore 0" — an unreadable marker must never guess its way into
+    /// leaving a Mac unable to sleep.
+    public static func parseFlagMarker(_ raw: String?) -> Bool? {
+        guard let raw else { return nil }
+        switch raw.trimmingCharacters(in: .whitespacesAndNewlines) {
+        case "1": return true
+        case "0": return false
+        default: return nil
+        }
+    }
+
+    /// The disablesleep value a restore should write back. The saved marker
+    /// alone is not enough: "1" is only trustworthy while the flag is in
+    /// fact still raised. The external holder that justified the save can
+    /// release mid-override (Lidless's auto-off timer, its crash watchdog,
+    /// a manual `pmset disablesleep 0`) — the flag then reads 0 despite our
+    /// own override, because the bit is global and last-writer-wins. In
+    /// that case restoring the saved "1" would strand the Mac unable to
+    /// sleep with nobody left to clear it, which is the one outcome every
+    /// restore path in this project is designed to avoid. So: restore 1
+    /// only when the marker says 1 AND the flag still reads 1; every other
+    /// combination (no marker, saved 0, externally cleared) restores 0.
+    public static func restoreSleepDisabled(marker: Bool?, current: Bool) -> Bool {
+        (marker ?? false) && current
+    }
 }

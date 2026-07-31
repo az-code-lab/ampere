@@ -11,6 +11,12 @@ public enum AppConstants {
     public static let stateDirPath = "/Library/Application Support/\(appPrefix)"
     public static let savedSleepPath = "\(stateDirPath)/saved-sleep"
     public static let savedDisplaySleepPath = "\(stateDirPath)/saved-sleep-display"
+    /// Pre-override value of the system-wide SleepDisabled flag ("1"/"0").
+    /// Captured alongside the sleep-minute markers so a restore can put the
+    /// flag back instead of forcing 0 — forcing 0 silently cancels any
+    /// OTHER keep-awake tool (e.g. Lidless) that had raised the same flag.
+    /// No legacy /tmp path: older builds never wrote this marker.
+    public static let savedSleepDisabledPath = "\(stateDirPath)/saved-sleep-disabled"
     /// Legacy marker locations used by older builds. Readers fall back to
     /// these so an upgrade with a marker still outstanding restores correctly.
     public static let legacySavedSleepPath = "/tmp/.\(appPrefix)-saved-sleep"

@@ -121,6 +121,9 @@ func readPmsetCustomOutput() -> String? {
 /// marker from an older build is outstanding can restore correctly.
 let savedSleepPaths = [AppConstants.savedSleepPath, AppConstants.legacySavedSleepPath]
 let savedDisplaySleepPaths = [AppConstants.savedDisplaySleepPath, AppConstants.legacySavedDisplaySleepPath]
+/// No legacy path: older builds never saved the SleepDisabled flag (their
+/// restore forced 0). A restore that finds no marker keeps that behavior.
+let savedSleepDisabledPaths = [AppConstants.savedSleepDisabledPath]
 
 func markerExists(_ paths: [String]) -> Bool {
     paths.contains { FileManager.default.fileExists(atPath: $0) }
@@ -194,11 +197,48 @@ func restoredPmsetValues(_ paths: [String]) -> PmsetProfileValues {
 /// falling back to 10/10 for a missing marker — a fabricated displaysleep=10
 /// stamped over the user's real setting is the bug the extra save prevents
 /// (the unchanged value just round-trips).
+///
+/// The SleepDisabled flag is captured alongside them, with one extra rule
+/// the minute markers don't need: on re-entry with the flag reading 0, the
+/// marker is corrected to "0". The flag is a global bit shared with other
+/// keep-awake tools; our override raised it, so reading 0 mid-override
+/// means whichever external holder justified a saved "1" (e.g. Lidless)
+/// has since released — restoring that stale "1" would leave the Mac
+/// unable to sleep with nobody left to clear it. (Re-entry happens every
+/// time the app re-asserts a hold it observed cleared externally, and on
+/// a re-arm whose markers survived — a launch whose cleanup restore
+/// failed, or an upgrade from a build without this marker.)
 func saveSleepMarkers() -> Bool {
     let needSleep = !markerExists(savedSleepPaths)
     let needDisplay = !markerExists(savedDisplaySleepPaths)
-    guard needSleep || needDisplay else { return true }
-    let customOutput = readPmsetCustomOutput()
+    let disabledNow = readSleepDisabledFlag()
+    // A disabled marker is only meaningful alongside the sleep marker —
+    // every restore path is keyed on the sleep marker existing, and removes
+    // the pair together. One found without it is a stale orphan (crash
+    // between a restore's marker removals): recapture rather than trust it.
+    let existingDisabled: Bool? = needSleep
+        ? nil
+        : PmsetState.parseFlagMarker(readMarker(savedSleepDisabledPaths))
+    let disabledToWrite: Bool?
+    if needSleep {
+        // Fresh arm: nothing of ours is raised yet (the sleep marker is
+        // removed only after a successful restore), so the flag as read IS
+        // the pre-override original — 1 means an external holder.
+        disabledToWrite = disabledNow
+    } else if existingDisabled == nil {
+        // Re-entry with the pair intact but no/garbage disabled marker —
+        // an upgrade from a build that predates this marker, mid-override.
+        // The flag now reads our own 1, so capturing it would make the
+        // restore strand disablesleep=1. Capture 0: exactly what those
+        // builds' restore would have written.
+        disabledToWrite = false
+    } else if existingDisabled == true, !disabledNow {
+        disabledToWrite = false                // external holder released mid-override
+    } else {
+        disabledToWrite = nil                  // genuine original — keep it
+    }
+    guard needSleep || needDisplay || disabledToWrite != nil else { return true }
+    let customOutput = (needSleep || needDisplay) ? readPmsetCustomOutput() : nil
     if needSleep, !savePmsetMarker(key: "sleep", paths: savedSleepPaths,
                                    customOutput: customOutput) {
         fputs("ERROR: cannot save original sleep values — refusing to override sleep\n", stderr)
@@ -206,7 +246,7 @@ func saveSleepMarkers() -> Bool {
     }
     if needDisplay, !savePmsetMarker(key: "displaysleep", paths: savedDisplaySleepPaths,
                                      customOutput: customOutput) {
-        // A half-saved pair must not outlive this call: a leftover sleep
+        // A half-saved set must not outlive this call: a leftover sleep
         // marker with no displaysleep marker would make the next restore
         // path (nodischarge, watchdog, release-sleep-hold — all keyed on
         // the sleep marker existing) fabricate displaysleep=10/10 over the
@@ -215,6 +255,18 @@ func saveSleepMarkers() -> Bool {
         // holds the genuine originals.
         if needSleep { removeMarkers([savedSleepPaths[0]]) }
         fputs("ERROR: cannot save original displaysleep values — refusing to override sleep\n", stderr)
+        return false
+    }
+    if let disabled = disabledToWrite,
+       !writeMarker(PmsetState.flagMarkerString(disabled), to: savedSleepDisabledPaths) {
+        // Same half-saved rule as above. A failed *correction* leaves the
+        // pre-existing markers alone (they belong to the active override);
+        // the restore side still can't strand disablesleep=1 from the stale
+        // marker, because restoreSleepDisabled also requires the flag to
+        // still read 1 at restore time.
+        if needSleep { removeMarkers([savedSleepPaths[0]]) }
+        if needDisplay { removeMarkers([savedDisplaySleepPaths[0]]) }
+        fputs("ERROR: cannot save original SleepDisabled value — refusing to override sleep\n", stderr)
         return false
     }
     return true
@@ -238,12 +290,21 @@ func setDischargeSleepPrevention(enabled: Bool) -> Bool {
         return runPmset(["-a", "sleep", "0", "disablesleep", "1", "displaysleep", "0"])
     }
 
-    // Restore the original values per profile, then clear disablesleep.
+    // Restore the original values per profile, then put SleepDisabled back
+    // to its captured pre-override value instead of forcing 0 — forcing 0
+    // cancels any OTHER keep-awake tool (e.g. Lidless) whose hold predates
+    // ours, putting a lid-closed Mac to sleep out from under it. The saved
+    // "1" is honored only while the flag still reads 1 (see
+    // restoreSleepDisabled); a missing marker restores 0, matching builds
+    // that predate the marker.
     let sleep = restoredPmsetValues(savedSleepPaths)
     let display = restoredPmsetValues(savedDisplaySleepPaths)
+    let disabled = PmsetState.restoreSleepDisabled(
+        marker: PmsetState.parseFlagMarker(readMarker(savedSleepDisabledPaths)),
+        current: readSleepDisabledFlag())
     let okBattery = runPmset(["-b", "sleep", "\(sleep.battery)", "displaysleep", "\(display.battery)"])
     let okAC = runPmset(["-c", "sleep", "\(sleep.ac)", "displaysleep", "\(display.ac)"])
-    let okDisable = runPmset(["-a", "disablesleep", "0"])
+    let okDisable = runPmset(["-a", "disablesleep", disabled ? "1" : "0"])
     guard okBattery && okAC && okDisable else { return false }
     // Markers are consumed only after every pmset call succeeds — a failed
     // restore keeps the originals in place so the watchdog or a later
@@ -251,6 +312,7 @@ func setDischargeSleepPrevention(enabled: Bool) -> Bool {
     // to the 10/10 defaults.
     removeMarkers(savedSleepPaths)
     removeMarkers(savedDisplaySleepPaths)
+    removeMarkers(savedSleepDisabledPaths)
     return true
 }
 
@@ -319,7 +381,10 @@ if action.hasPrefix("spawn-watchdog:") {
 // no PD renegotiation in this path, so the screen may sleep normally while
 // the machine stays awake charging. Uses the same markers as discharge, so
 // every existing restore path (release-sleep-hold, nodischarge, watchdog)
-// can undo it — including after a crash.
+// can undo it — including after a crash. The app also re-issues this command
+// when it observes an engaged hold's SleepDisabled flag cleared externally
+// (another keep-awake tool released the shared bit); saveSleepMarkers then
+// corrects the saved flag value, see its doc comment.
 if action == "hold-sleep" {
     guard saveSleepMarkers() else {
         exit(4)

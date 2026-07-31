@@ -154,6 +154,13 @@ final class BatteryMonitor: ObservableObject {
     private var wakeObserver: NSObjectProtocol?
     private var sleepObserver: NSObjectProtocol?
     private var autoManageInFlight = false
+    /// True once the health check has dispatched a CHTE repair for the
+    /// current unhealthy episode; cleared on the next healthy check. The
+    /// first repair runs silently (a transient firmware reset that the very
+    /// next check confirms fixed shouldn't flash the red warning); only a
+    /// mismatch that survives a repair attempt surfaces it, where "revoke &
+    /// re-grant admin" is plausible advice again.
+    private var chteRepairAttempted = false
     /// Sleep-hold intent from the state machine, persisted so a crash or
     /// in-app upgrade mid-hold re-arms after relaunch (launch cleanup always
     /// restores pmset via nodischarge, so without the persisted intent a
@@ -190,6 +197,13 @@ final class BatteryMonitor: ObservableObject {
     /// reconnect; literal duplication would let a typo silently break the
     /// clear path.
     private static let noAdapterError = "No power adapter connected"
+
+    /// Shown when the SMC persistently disagrees with the expected state.
+    /// Single definition because performHealthCheck both suppresses it (the
+    /// first, silent repair attempt) and sets it (repair didn't stick, or
+    /// wasn't applicable) — the strings must stay identical for that
+    /// sequence to read as one warning.
+    private static let smcMismatchWarning = "SMC mismatch — revoke & re-grant admin"
 
     /// Skip health checks on the first N refresh cycles so launch-time SMC
     /// writes have a chance to settle before we assert on their results.
@@ -1346,6 +1360,31 @@ final class BatteryMonitor: ObservableObject {
         }
     }
 
+    /// Decide whether a failed health check should self-repair CHTE, and
+    /// with which write. Firmware or a PD renegotiation can reset CHTE at
+    /// any time (observed across sleep, and a failed wake re-assert is
+    /// never retried), and the state machine is edge-triggered: once its
+    /// in-memory state matches its last decision it returns `.none` forever,
+    /// so a drifted CHTE would otherwise persist until the next sleep/wake
+    /// cycle while the battery charges past the bound (or refuses to charge
+    /// to it). The health check already computes the expected value every
+    /// tick — level-triggered enforcement is one write away.
+    ///
+    /// CHTE only, and only while CHIE is in its expected normal state:
+    /// repairing a CHIE mismatch would mean starting or stopping a
+    /// discharge, which the state machine owns (with sleep overrides and a
+    /// watchdog attached) — and during an active discharge CHTE is firmware
+    /// noise anyway (see healthCheckAutoMode). Internal so tests can pin
+    /// the eligibility rules.
+    static func chteRepairOp(
+        chteMatch: Bool, chieMatch: Bool, chie: Int,
+        expectedChte: String, activeDischarging: Bool
+    ) -> SMCWriteOp? {
+        guard !chteMatch, chieMatch, chie == SMC.chieNormalInt,
+              !activeDischarging else { return nil }
+        return expectedChte == SMC.chteInhibitHex ? .inhibit : .allow
+    }
+
     // MARK: - Refresh
 
     /// Publish the latest battery reading, gated to avoid noisy SwiftUI
@@ -1574,6 +1613,23 @@ final class BatteryMonitor: ObservableObject {
                 lastError = nil
             }
 
+            // An engaged hold can be released out from under us: the
+            // SleepDisabled flag is a single global bit shared with other
+            // keep-awake tools (e.g. Lidless), and their auto-off timer,
+            // quit, or crash watchdog clears it without knowing we need it
+            // — the lid-closed Mac then sleeps mid-charge and the SMC
+            // charges past the upper bound with nobody awake to stop it.
+            // Verify the flag while a hold should be engaged; observing it
+            // cleared drops sleepHoldActive so the dispatch below re-applies
+            // the hold (hold-sleep also corrects the saved marker — the
+            // external holder that justified restoring "1" is evidently
+            // gone).
+            if sleepHoldActive, decision.newState.sleepHold, !activeDischarging,
+               !readSleepDisabledFlag() {
+                sleepHoldActive = false
+                NSLog("Ampere: Sleep hold cleared externally at %d%% — re-arming", b.percentage)
+            }
+
             // SMC action dispatch, plus pmset reconciliation for the sleep
             // hold (engaged state vs the machine's intent — retried every
             // tick until they match). Hold ops never run while a discharge
@@ -1751,10 +1807,11 @@ final class BatteryMonitor: ObservableObject {
         var newExpected = ""
         var newCHTEMatch = true
         var newCHIEMatch = true
-        let newWarning: String?
+        var newWarning: String?
         if healthy {
             newStatus = "pass"
             newWarning = nil
+            chteRepairAttempted = false
         } else {
             newStatus = "FAIL"
             let expected = Self.expectedSMCValues(
@@ -1773,7 +1830,36 @@ final class BatteryMonitor: ObservableObject {
             NSLog("Ampere: Health check failed — CHTE=%d CHIE=%d charge=%d%% paused=%d auto=%d discharge=%d bounds=[%d,%d]",
                   chte, chie, battery.percentage, chargingPaused, autoManageEnabled, autoDischargeEnabled,
                   chargeLowerBound, chargeUpperBound)
-            newWarning = "SMC mismatch — revoke & re-grant admin"
+
+            // Self-repair a drifted CHTE instead of only reporting it (see
+            // chteRepairOp). No in-memory state mirror is needed: the write
+            // drives the hardware toward the state the app already claims.
+            // Takes the same in-flight token as every other SMC dispatch
+            // site. No refresh() from the completion — if firmware reverts
+            // the write instantly, an immediate re-check would tight-loop;
+            // the next tick (60s slow / 10s popover) re-verifies at a sane
+            // cadence and clears the FAIL status once the repair sticks.
+            if let op = Self.chteRepairOp(
+                   chteMatch: newCHTEMatch, chieMatch: newCHIEMatch, chie: chie,
+                   expectedChte: expected.chte, activeDischarging: activeDischarging),
+               !autoManageInFlight, isSudoRuleInstalled {
+                newWarning = chteRepairAttempted ? Self.smcMismatchWarning : nil
+                chteRepairAttempted = true
+                autoManageInFlight = true
+                let pct = battery.percentage
+                smcQueue.async { [weak self] in
+                    guard let self else { return }
+                    let ok = self.runSMCWrite(op)
+                    DispatchQueue.main.async {
+                        self.autoManageInFlight = false
+                        NSLog("Ampere: Health check CHTE repair (%@) at %d%% %@",
+                              op == .inhibit ? "inhibit" : "allow", pct,
+                              ok ? "applied" : "failed")
+                    }
+                }
+            } else {
+                newWarning = Self.smcMismatchWarning
+            }
         }
 
         // Publishing any of these fires objectWillChange, which redraws the
