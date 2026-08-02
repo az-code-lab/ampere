@@ -600,6 +600,14 @@ struct ContentView: View {
                 autoManageContent(state)
             }
 
+            Divider().padding(.horizontal)
+
+            // Keep Awake lives on the main panel, outside the mode
+            // sections: it works in manual and auto mode alike, and stays
+            // visible on battery (where the toggle holds its intent for
+            // the next plug-in rather than acting immediately).
+            keepAwakeRow()
+
             Divider().padding(.horizontal).padding(.top, 8)
 
             // Footer actions
@@ -1042,6 +1050,48 @@ struct ContentView: View {
         }
         .padding(.horizontal, 16)
         .help("Show the charge percentage next to the battery icon in the menu bar; off shows the icon only (the freed space is reclaimed when this panel closes)")
+    }
+
+    private func keepAwakeRow() -> some View {
+        HStack {
+            // Bare glyph in the shared 26 pt frame like the other main-panel
+            // rows (the *.circle.fill family is the settings section's).
+            // Coffee cup: the universal keep-awake metaphor (caffeinate).
+            Image(systemName: "cup.and.saucer.fill")
+                .font(.system(size: 14))
+                .foregroundColor(monitor.keepAwakeEnabled ? .accentColor : .secondary)
+                .frame(width: 26)
+            Text("Keep Awake")
+                .font(.system(size: 13, weight: .semibold))
+            if monitor.keepAwakeEnabled, let deadline = monitor.keepAwakeDeadline {
+                Text("until " + deadline.formatted(date: .omitted, time: .shortened))
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+            }
+            Spacer()
+            Picker("", selection: Binding(
+                get: { monitor.keepAwakeMinutes },
+                set: { monitor.setKeepAwakeDuration(minutes: $0) }
+            )) {
+                ForEach(BatteryMonitor.keepAwakeDurations, id: \.self) { minutes in
+                    Text(BatteryMonitor.keepAwakeDurationLabel(minutes)).tag(minutes)
+                }
+            }
+            .pickerStyle(.menu)
+            .controlSize(.small)
+            .fixedSize()
+            .help("How long a keep-awake session lasts; Forever holds until toggled off. Changing it while on restarts the countdown from now.")
+            Toggle("", isOn: Binding(
+                get: { monitor.keepAwakeEnabled },
+                set: { monitor.setKeepAwake($0) }
+            ))
+            .toggleStyle(.switch)
+            .controlSize(.small)
+        }
+        .padding(.horizontal, 16)
+        .help(monitor.keepAwakeEnabled
+            ? "On: keeping the Mac awake while the power adapter is connected; on battery it sleeps normally. Turn off to allow normal sleep."
+            : "Off: normal macOS sleep. Turn on to keep the Mac awake while the power adapter is connected, for the selected duration; on battery it sleeps normally. Does not affect display sleep.")
     }
 
     private func autoManageToggle() -> some View {

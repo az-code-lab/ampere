@@ -20,6 +20,7 @@ A lightweight macOS menu bar app for monitoring battery status and controlling c
 - **In-app updates** - checks the Homebrew cask for new versions about once a day; a small blue badge dot on the menu bar icon signals a pending update, and clicking **Update to X** in the panel downloads, verifies, installs, and relaunches
 - **Menu bar icon** - battery shape with live charge level and animated fill when charging or discharging; hovering it shows the current charge and status (e.g. "85% — Charging — 32m to 80%"); the percent readout beside it can be hidden (Settings → Percent in Menu Bar) for a narrower menu bar footprint
 - **Pinnable popover** - pin the panel to keep it open while you work
+- **Keep awake** - optionally prevent idle sleep while on AC power, for a set duration or until turned off (the Keep Awake row on the panel); a standard power assertion, so it needs no admin rights and is auto-released on quit or crash
 - **Launch at login** - start automatically when you log in
 - **Registration** - register with an email and registration key, bound to this Mac; the panel shows "Unregistered" until then. The registration is re-verified against the license server about once a day — network failures never clear it — and can be deregistered from the panel to move the key to another Mac.
 
@@ -114,6 +115,14 @@ Residual gaps, by design: plugging in a Mac that is *already asleep* charges it 
 
 When auto charge is off and a power adapter is connected, a manual **Pause Charging** / **Resume Charging** button is available.
 
+### Keep Awake
+
+The **Keep Awake** row on the panel stops the Mac from going to idle sleep while a power adapter is connected, for a chosen duration (15 minutes to 8 hours, or Forever). While a timed session runs, the row shows its end time ("until 3:45 PM"). It holds a standard macOS power assertion, the same mechanism `caffeinate` uses, so it needs no admin rights and cannot outlive the app: quitting releases it, and the kernel drops it automatically after a crash. The display still sleeps normally.
+
+On battery the assertion is released and the Mac sleeps as usual; the toggle keeps its intent, so plugging back in re-engages it. The duration is a wall-clock deadline ("until 3:45 PM"), not a stopwatch: it keeps counting on battery, survives an app restart mid-session, and when it passes the toggle turns itself off. Changing the duration during a session restarts the countdown from now.
+
+Unlike the charge sleep hold and the discharge override (which use the system-wide `pmset` override precisely because they must survive a lid close), Keep Awake never blocks lid-close sleep on an undocked Mac. In clamshell mode (external display + power) a closed lid does not sleep the Mac anyway.
+
 ### Behavior on Sleep/Wake and Quit/Restart
 
 | Scenario | Sleep → Wake | Quit → Restart |
@@ -124,7 +133,7 @@ When auto charge is off and a power adapter is connected, a manual **Pause Charg
 
 ### Settings and Safety
 
-- **Settings persist across restarts** - auto charge, discharge toggle, and charge bounds are saved and restored when the app relaunches.
+- **Settings persist across restarts** - auto charge, discharge toggle, charge bounds, and keep awake (including a mid-session deadline) are saved and restored when the app relaunches.
 - **Quitting the app restores system defaults** - all SMC overrides (charging inhibit, discharge) and power management changes (sleep settings) are cleared when the app exits. Your Mac returns to its normal charging and sleep behavior. If the app crashes or is force-killed, a watchdog daemon cleans up automatically within a few seconds.
 
 ### Health Check

@@ -2,6 +2,7 @@ import Foundation
 import AppKit
 import CryptoKit
 import IOKit.ps
+import IOKit.pwr_mgt
 import Shared
 
 
@@ -76,6 +77,30 @@ final class BatteryMonitor: ObservableObject {
     @Published var showMenuBarPercent: Bool {
         didSet { UserDefaults.standard.set(showMenuBarPercent, forKey: "showMenuBarPercent") }
     }
+    /// Keep-awake toggle: hold a powerd assertion (the caffeinate
+    /// mechanism) that prevents idle system sleep while the adapter is
+    /// connected. Deliberately NOT the helper's pmset sleep hold: an
+    /// assertion needs no root, is refcounted per process, and the kernel
+    /// drops it on crash/quit, so it can never strand the system. The
+    /// trade-off is that it cannot absorb lid-close sleep — that remains
+    /// exclusive to the charge/discharge overrides. On battery the intent
+    /// persists but the assertion is released (see
+    /// keepAwakeAssertionDesired); the display still sleeps normally.
+    @Published var keepAwakeEnabled: Bool {
+        didSet { UserDefaults.standard.set(keepAwakeEnabled, forKey: "keepAwakeEnabled") }
+    }
+    /// Session length in minutes; 0 = no deadline (hold until toggled off).
+    @Published var keepAwakeMinutes: Int {
+        didSet { UserDefaults.standard.set(keepAwakeMinutes, forKey: "keepAwakeMinutes") }
+    }
+    /// Wall-clock end of the current keep-awake session; nil while off or
+    /// for a Forever session. Persisted as an absolute date so a restart
+    /// mid-session resumes the remaining time rather than a fresh window,
+    /// and time on battery counts against it (the promise is "awake until
+    /// 3:45", not "3 hours of awake time"). Written only via
+    /// setKeepAwakeDeadline so the stored value and the expiry timer can't
+    /// diverge.
+    @Published private(set) var keepAwakeDeadline: Date?
     @Published var lastError: String?
     @Published var pinned: Bool = false
     @Published var healthWarning: String?
@@ -142,6 +167,14 @@ final class BatteryMonitor: ObservableObject {
 
     private var timer: Timer?
     private var updateCheckTimer: Timer?
+    /// The held powerd assertion backing keepAwakeEnabled; 0/false = none.
+    /// Reconciled against the desired state every refresh tick, same
+    /// retry-until-they-match contract as sleepHoldActive vs intent.
+    private var keepAwakeAssertionID: IOPMAssertionID = 0
+    private var keepAwakeAssertionHeld = false
+    /// One-shot timer at the session deadline, so expiry lands on time
+    /// instead of waiting out the current poll interval (up to 60 s).
+    private var keepAwakeExpiryTimer: Timer?
     /// IOKit power-source change notifications (plug/unplug, charge ticks)
     /// drive an immediate refresh; removed from the run loop in deinit.
     private var powerSourceRunLoopSource: CFRunLoopSource?
@@ -220,6 +253,35 @@ final class BatteryMonitor: ObservableObject {
         self.autoDischargeEnabled = defaults.bool(forKey: "autoDischargeEnabled")
         // Default true (shown) — bool(forKey:) would read a missing key as false.
         self.showMenuBarPercent = defaults.object(forKey: "showMenuBarPercent") as? Bool ?? true
+        // Keep-awake: restore the toggle and its wall-clock deadline. A
+        // deadline that passed while the app wasn't running means the
+        // session is over — restore "off" and persist the negation (didSet
+        // doesn't fire during init), same pattern as the flag repairs
+        // below. A deadline found without its toggle is half-written state
+        // from a crash between the two defaults writes; drop it. The
+        // assertion itself is re-acquired by the first refresh's reconcile,
+        // and the expiry timer by the same path (timers can't be scheduled
+        // this early in init anyway).
+        // Repair a corrupted duration to Forever — a value outside the
+        // preset list would leave the picker with no selected item.
+        let storedKeepAwakeMinutes = defaults.object(forKey: "keepAwakeMinutes") as? Int ?? 0
+        self.keepAwakeMinutes = Self.keepAwakeDurations.contains(storedKeepAwakeMinutes)
+            ? storedKeepAwakeMinutes : 0
+        let persistedKeepAwake = defaults.bool(forKey: "keepAwakeEnabled")
+        let persistedKeepAwakeDeadline = (defaults.object(forKey: "keepAwakeDeadline") as? Double)
+            .map { Date(timeIntervalSince1970: $0) }
+        if persistedKeepAwake, let deadline = persistedKeepAwakeDeadline, deadline <= Date() {
+            self.keepAwakeEnabled = false
+            self.keepAwakeDeadline = nil
+            defaults.set(false, forKey: "keepAwakeEnabled")
+            defaults.removeObject(forKey: "keepAwakeDeadline")
+        } else {
+            self.keepAwakeEnabled = persistedKeepAwake
+            self.keepAwakeDeadline = persistedKeepAwake ? persistedKeepAwakeDeadline : nil
+            if !persistedKeepAwake, persistedKeepAwakeDeadline != nil {
+                defaults.removeObject(forKey: "keepAwakeDeadline")
+            }
+        }
         let originalLower = defaults.object(forKey: "chargeLowerBound") as? Int
         let originalUpper = defaults.object(forKey: "chargeUpperBound") as? Int
         var lower = originalLower ?? 40
@@ -603,6 +665,11 @@ final class BatteryMonitor: ObservableObject {
     deinit {
         timer?.invalidate()
         updateCheckTimer?.invalidate()
+        keepAwakeExpiryTimer?.invalidate()
+        // Redundant with process exit (the kernel drops assertions of a
+        // dead process) but keeps a torn-down monitor from pinning the
+        // system awake for the remainder of the process's lifetime.
+        if keepAwakeAssertionHeld { IOPMAssertionRelease(keepAwakeAssertionID) }
         updateDownloadTask?.cancel()
         if let source = powerSourceRunLoopSource {
             CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .defaultMode)
@@ -1061,6 +1128,137 @@ final class BatteryMonitor: ObservableObject {
         return withUnsafeBytes(of: &raw) { Array($0.prefix(Int(dataSize))) }
     }
 
+    // MARK: - Keep awake (idle-sleep assertion)
+
+    /// Duration presets in minutes; 0 = Forever. Single source of truth
+    /// for the picker's items, the init-time repair of a persisted value,
+    /// and the labels — a preset outside this list would render a menu
+    /// with no selected item.
+    static let keepAwakeDurations = [0, 15, 30, 60, 120, 240, 480]
+
+    /// Menu label for a duration preset: "Forever", "15 min", "1 hour".
+    static func keepAwakeDurationLabel(_ minutes: Int) -> String {
+        if minutes <= 0 { return "Forever" }
+        if minutes < 60 { return "\(minutes) min" }
+        let hours = minutes / 60
+        return hours == 1 ? "1 hour" : "\(hours) hours"
+    }
+
+    /// Pure gate for whether the keep-awake assertion should be held.
+    /// AC-only by design: an assertion on battery would drain a forgotten
+    /// Mac, and it cannot absorb lid-close sleep anyway, so on battery the
+    /// toggle keeps its intent and the Mac sleeps normally. A deadline at
+    /// or before `now` means the session ended.
+    static func keepAwakeAssertionDesired(
+        enabled: Bool, adapterConnected: Bool, deadline: Date?, now: Date
+    ) -> Bool {
+        guard enabled, adapterConnected else { return false }
+        if let deadline, deadline <= now { return false }
+        return true
+    }
+
+    /// Deadline for a session of `minutes` starting at `from`; 0 = Forever
+    /// (no deadline).
+    static func keepAwakeDeadline(minutes: Int, from: Date) -> Date? {
+        minutes > 0 ? from.addingTimeInterval(TimeInterval(minutes) * 60) : nil
+    }
+
+    /// UI entry point for the toggle. Starting a session stamps the
+    /// deadline from the configured duration; stopping clears it.
+    func setKeepAwake(_ on: Bool) {
+        guard on != keepAwakeEnabled else { return }
+        keepAwakeEnabled = on
+        setKeepAwakeDeadline(on ? Self.keepAwakeDeadline(minutes: keepAwakeMinutes, from: Date()) : nil)
+        reconcileKeepAwake(adapterConnected: state?.adapterConnected ?? false)
+    }
+
+    /// UI entry point for the duration picker. Changing the duration
+    /// during an active session restarts the countdown from now, so the
+    /// picker's value and the session in force can never disagree.
+    func setKeepAwakeDuration(minutes: Int) {
+        guard minutes != keepAwakeMinutes else { return }
+        keepAwakeMinutes = minutes
+        if keepAwakeEnabled {
+            setKeepAwakeDeadline(Self.keepAwakeDeadline(minutes: minutes, from: Date()))
+            reconcileKeepAwake(adapterConnected: state?.adapterConnected ?? false)
+        }
+    }
+
+    /// Single writer for the deadline: keeps the published value, the
+    /// persisted value, and the expiry timer in lockstep.
+    private func setKeepAwakeDeadline(_ date: Date?) {
+        keepAwakeDeadline = date
+        if let date {
+            UserDefaults.standard.set(date.timeIntervalSince1970, forKey: "keepAwakeDeadline")
+        } else {
+            UserDefaults.standard.removeObject(forKey: "keepAwakeDeadline")
+        }
+        scheduleKeepAwakeExpiry()
+    }
+
+    /// Arm the one-shot expiry timer for the current deadline (clearing
+    /// any previous one). The handler only refreshes — the flip-off lives
+    /// in reconcileKeepAwake, so a timer that fires late (system was
+    /// asleep at the deadline on battery) and the poll path both converge
+    /// on the same transition.
+    private func scheduleKeepAwakeExpiry() {
+        keepAwakeExpiryTimer?.invalidate()
+        keepAwakeExpiryTimer = nil
+        guard keepAwakeEnabled, let deadline = keepAwakeDeadline else { return }
+        let interval = max(deadline.timeIntervalSinceNow, 0) + 0.5
+        keepAwakeExpiryTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: false) { [weak self] _ in
+            guard let self else { return }
+            self.keepAwakeExpiryTimer = nil
+            self.refresh()
+        }
+    }
+
+    /// Reconcile the powerd assertion with the desired state. Runs on
+    /// every refresh tick (adapter transitions arrive there via the IOPS
+    /// notification source), from the UI entry points, and from the expiry
+    /// timer's refresh. A failed create simply retries next tick, same
+    /// contract as the SMC reconciliation.
+    private func reconcileKeepAwake(adapterConnected: Bool) {
+        let now = Date()
+        // Session over: flip the toggle off (didSet persists) so the UI
+        // reads "off", never "on but expired".
+        if keepAwakeEnabled, let deadline = keepAwakeDeadline, deadline <= now {
+            keepAwakeEnabled = false
+            setKeepAwakeDeadline(nil)
+            NSLog("Ampere: Keep-awake session expired")
+        }
+        // Launch case: a deadline restored by init has no timer yet
+        // (timers can't be scheduled mid-init).
+        if keepAwakeExpiryTimer == nil, keepAwakeEnabled, keepAwakeDeadline != nil {
+            scheduleKeepAwakeExpiry()
+        }
+        let desired = Self.keepAwakeAssertionDesired(
+            enabled: keepAwakeEnabled, adapterConnected: adapterConnected,
+            deadline: keepAwakeDeadline, now: now)
+        guard desired != keepAwakeAssertionHeld else { return }
+        if desired {
+            var id: IOPMAssertionID = 0
+            let rc = IOPMAssertionCreateWithName(
+                kIOPMAssertionTypePreventUserIdleSystemSleep as CFString,
+                IOPMAssertionLevel(kIOPMAssertionLevelOn),
+                "Ampere: Keep Mac Awake" as CFString, &id)
+            if rc == kIOReturnSuccess {
+                keepAwakeAssertionID = id
+                keepAwakeAssertionHeld = true
+                NSLog("Ampere: Keep-awake assertion acquired")
+            } else {
+                NSLog("Ampere: Keep-awake assertion create failed (0x%08x)", UInt32(bitPattern: rc))
+            }
+        } else {
+            // Release cannot meaningfully fail (the ID is one we created);
+            // clear unconditionally so a stale ID can't wedge the state.
+            IOPMAssertionRelease(keepAwakeAssertionID)
+            keepAwakeAssertionID = 0
+            keepAwakeAssertionHeld = false
+            NSLog("Ampere: Keep-awake assertion released")
+        }
+    }
+
     // MARK: - Auto-manage decision (pure, testable)
 
     /// Pure state carried across refresh() cycles for the auto-manage state machine.
@@ -1428,6 +1626,13 @@ final class BatteryMonitor: ObservableObject {
         // this defer, the menu bar would be stuck at "0%" and the popover
         // at "no battery" whenever the first refresh trips an early return.
         defer { publishStateIfNeeded(battery) }
+
+        // Keep-awake reconcile runs ahead of the early-return branches
+        // below: the assertion must track adapter state even on ticks that
+        // dispatch SMC work and exit. A failed battery read releases it
+        // (sleep allowed) — the safe direction for unknown state, matching
+        // the rest of this file.
+        reconcileKeepAwake(adapterConnected: battery?.adapterConnected ?? false)
 
         // Stop discharge if the adapter disconnected mid-discharge. Gated
         // separately from the chargingPaused synthesize branch because the
