@@ -1754,7 +1754,8 @@ private struct PowerFlowDiagram: View {
                 case .acOnly:
                     singleBandBody(leftX: leftX, rightX: rightX,
                                     leftRX: leftRX, rightRX: rightRX, midY: midY,
-                                    sourceIcon: "powerplug.fill", sourceLabel: adapterWatts,
+                                    sourceIcon: "powerplug.fill", sourceMirrored: true,
+                                    sourceLabel: adapterWatts,
                                     sinkIcon: "laptopcomputer", sinkLabel: electronicsWatts,
                                     color: acColor)
                 case .batteryOnly:
@@ -1789,7 +1790,8 @@ private struct PowerFlowDiagram: View {
 
         flowRibbon(elecRibbon, color: acColor)
         flowRibbon(battRibbon, color: acColor, endColor: chargeColor)
-        node(icon: "powerplug.fill", watts: adapterWatts, tint: acColor, at: CGPoint(x: leftX, y: midY))
+        node(icon: "powerplug.fill", watts: adapterWatts, tint: acColor,
+             at: CGPoint(x: leftX, y: midY), mirrored: true)
         node(icon: "laptopcomputer", watts: electronicsWatts, tint: acColor, at: CGPoint(x: rightX, y: elecY))
         batteryNode(watts: batteryWatts, tint: chargeColor, at: CGPoint(x: rightX, y: battY))
     }
@@ -1815,7 +1817,8 @@ private struct PowerFlowDiagram: View {
 
         flowRibbon(acRibbon, color: acColor)
         flowRibbon(battRibbon, color: drainColor)
-        node(icon: "powerplug.fill", watts: adapterWatts, tint: acColor, at: CGPoint(x: leftX, y: acY))
+        node(icon: "powerplug.fill", watts: adapterWatts, tint: acColor,
+             at: CGPoint(x: leftX, y: acY), mirrored: true)
         batteryNode(watts: batteryWatts, tint: drainColor, at: CGPoint(x: leftX, y: battY))
         node(icon: "laptopcomputer", watts: electronicsWatts, tint: drainColor, at: CGPoint(x: rightX, y: midY))
     }
@@ -1823,14 +1826,16 @@ private struct PowerFlowDiagram: View {
     @ViewBuilder
     private func singleBandBody(leftX: CGFloat, rightX: CGFloat,
                                  leftRX: CGFloat, rightRX: CGFloat, midY: CGFloat,
-                                 sourceIcon: String, sourceLabel: Double?,
+                                 sourceIcon: String, sourceMirrored: Bool = false,
+                                 sourceLabel: Double?,
                                  sinkIcon: String, sinkLabel: Double?,
                                  color: Color) -> some View {
         let h2 = Self.maxRibbonH / 2
         let ribbon = RibbonShape(x1: leftRX, y1a: midY - h2, y1b: midY + h2,
                                  x2: rightRX, y2a: midY - h2, y2b: midY + h2)
         flowRibbon(ribbon, color: color)
-        node(icon: sourceIcon, watts: sourceLabel, tint: color, at: CGPoint(x: leftX, y: midY))
+        node(icon: sourceIcon, watts: sourceLabel, tint: color,
+             at: CGPoint(x: leftX, y: midY), mirrored: sourceMirrored)
         node(icon: sinkIcon, watts: sinkLabel, tint: color, at: CGPoint(x: rightX, y: midY))
     }
 
@@ -1887,11 +1892,17 @@ private struct PowerFlowDiagram: View {
     /// strip out essential sinks (the Computer node renders `electronicsWatts`
     /// which can clamp to 0 when adapter and battery telemetry briefly
     /// disagree — the node must stay visible or the diagram makes no sense).
-    private func node(icon: String, watts: Double?, tint: Color, at p: CGPoint) -> some View {
+    /// `mirrored` flips the glyph horizontally — used for the plug, whose
+    /// SF Symbol is drawn cord-left / prongs-right. Mirroring puts the
+    /// prongs on the outer edge (the wall, off-diagram) and the cord end
+    /// against the ribbon it feeds.
+    private func node(icon: String, watts: Double?, tint: Color,
+                      at p: CGPoint, mirrored: Bool = false) -> some View {
         VStack(spacing: Self.nodeVStackSpacing) {
             Image(systemName: icon)
                 .font(.system(size: 28, weight: .semibold))
                 .foregroundColor(tint)
+                .scaleEffect(x: mirrored ? -1 : 1, y: 1)
                 .frame(height: Self.glyphAreaH)
             Text(formatWatts(watts))
                 .font(.system(size: 12, weight: .medium, design: .rounded))
