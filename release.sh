@@ -44,7 +44,23 @@ if git rev-parse -q --verify "refs/tags/v$VERSION" > /dev/null && [ "$FORCE" != 
     exit 1
 fi
 
-SIGN_IDENTITY="$(security find-identity -v -p codesigning | grep "$TEAM_ID" | head -1 | sed 's/.*"\(.*\)"/\1/')"
+# Match on the certificate NAME, not just the team: an "Apple Development"
+# certificate carries the team id too, and signing a release with it produces
+# a bundle Gatekeeper rejects on every machine that did not build it. Matching
+# the team alone left that to whatever `find-identity` happened to list first.
+#
+# `|| true`, with the emptiness test below as the only error path: a grep that
+# matches nothing exits 1, `set -o pipefail` fails the whole substitution on
+# it, and `set -e` ends the script right here — swallowing the one message
+# that names the certificate that is missing.
+SIGN_IDENTITY="$(security find-identity -v -p codesigning \
+    | grep "Developer ID Application" | grep "$TEAM_ID" \
+    | sed -n '1s/.*"\(.*\)"/\1/p' || true)"
+if [ -z "$SIGN_IDENTITY" ]; then
+    echo "ERROR: no \"Developer ID Application\" certificate for team $TEAM_ID in the keychain"
+    echo "       Xcode > Settings > Accounts > Manage Certificates > + > Developer ID Application"
+    exit 1
+fi
 BUILD_DIR="/tmp/${SCHEME}Build"
 APP_DIR="$BUILD_DIR/$SCHEME.app"
 DMG_PATH="/tmp/${SCHEME}.dmg"
@@ -164,6 +180,27 @@ hdiutil create -volname "$SCHEME" \
     -srcfolder "/tmp/${SCHEME}DMG" \
     -ov -format UDZO "$DMG_PATH"
 
+# The disk image gets the same treatment as the app it carries. The app's
+# stapled ticket is what clears a first launch, so this is not what makes the
+# download open — but an unsigned image reads as "no usable signature" to any
+# assessment of the file itself, and `spctl -a -t open` is exactly what macOS
+# runs when a quarantined image is opened.
+echo "==> Signing DMG..."
+codesign --force --timestamp --sign "$SIGN_IDENTITY" "$DMG_PATH"
+codesign --verify --strict --verbose=2 "$DMG_PATH"
+
+echo "==> Notarizing DMG..."
+xcrun notarytool submit "$DMG_PATH" \
+    --keychain-profile "$SCHEME" \
+    --wait
+
+echo "==> Stapling DMG ticket..."
+xcrun stapler staple "$DMG_PATH"
+xcrun stapler validate "$DMG_PATH"
+
+# AFTER the signing and stapling above, both of which rewrite the file: a hash
+# taken any earlier is the hash of an image nobody will ever download, and
+# `brew install` would refuse the real one as a checksum mismatch.
 SHA256=$(shasum -a 256 "$DMG_PATH" | awk '{print $1}')
 echo "==> DMG SHA256: $SHA256"
 
