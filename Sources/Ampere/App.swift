@@ -31,6 +31,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var registrationShowObserver: NSObjectProtocol?
     private var pinnedObserver: AnyCancellable?
     private var stateObserver: AnyCancellable?
+    private var registrationObserver: AnyCancellable?
     private var mouseMonitor: Any?
     private var globalMouseMonitor: Any?
     /// Re-renders the icon when the menu bar flips light/dark. Needed
@@ -56,8 +57,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // placeholder icon is already visible during this; clicks land on a
         // button with no action and are no-ops, which is the right behavior
         // until the popover is wired up below.
-        monitor = BatteryMonitor()
+        // RegistrationManager first (cheap: defaults reads and a timer). The
+        // monitor's init locks the charge bounds to the defaults for an
+        // unregistered copy, and that has to be settled before its
+        // launch-time inhibit/allow decision reads the lower bound.
         registration = RegistrationManager()
+        monitor = BatteryMonitor(chargeBoundsLocked: !registration.isRegistered)
 
         // 3. Wire the button to togglePopover and refresh the icon with real
         // data. Done after monitor is ready so updateMenuBarIcon can read it.
@@ -84,6 +89,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         pinnedObserver = monitor.$pinned.combineLatest(monitor.$sheetVisible)
             .sink { [weak self] pinned, sheetVisible in
                 self?.popover.behavior = (pinned || sheetVisible) ? .applicationDefined : .transient
+            }
+
+        // Custom charge bounds are the licensed feature: mirror the
+        // registration state into the monitor's lock. Fires for the initial
+        // value too (a no-op, init already applied it) and for every later
+        // flip, whether from the registration window or a daily verify that
+        // finds the license revoked or moved to another Mac. The reset must
+        // not depend on the panel being open, hence here and not in the view.
+        registrationObserver = registration.$isRegistered
+            .removeDuplicates()
+            .sink { [weak self] registered in
+                self?.monitor.chargeBoundsLocked = !registered
             }
 
         // The panel's Registration row posts this; the window is owned here.
@@ -406,7 +423,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     deinit {
-        // pinnedObserver / stateObserver are AnyCancellable — they cancel
+        // pinnedObserver / stateObserver / registrationObserver are
+        // AnyCancellable — they cancel
         // automatically when this AppDelegate's stored properties go out of
         // scope, so no explicit .cancel() needed here. NSKeyValueObservation
         // also self-invalidates on deinit; the explicit call just makes the
@@ -1169,11 +1187,20 @@ struct ContentView: View {
                 currentLevel: Double(state.percentage),
                 step: 5,
                 minGap: Double(BatteryMonitor.chargeBoundMinGap),
-                upperOverridden: monitor.chargeToFull
+                upperOverridden: monitor.chargeToFull,
+                locked: monitor.chargeBoundsLocked
             )
             .frame(height: 68)
             .padding(.top, 2)
             .background(WindowDragBlocker())
+
+            // Custom bounds are the licensed feature. The slider stays fully
+            // drawn while locked (the default range really is in force) but
+            // its draggers refuse input, so this row explains the refusal
+            // and links to the only way to lift it.
+            if monitor.chargeBoundsLocked {
+                ChargeBoundsLockRow(lower: monitor.chargeLowerBound, upper: monitor.chargeUpperBound)
+            }
 
             // Both bound-relative rows are subsumed while charge-to-full is
             // active: charge-to-upper by the higher target, and discharge
@@ -2018,6 +2045,12 @@ struct BatteryRangeSlider: View {
     /// and the target-range highlight extends to 100% to show the actual
     /// charge target. The stored bound is untouched throughout.
     var upperOverridden: Bool = false
+    /// True while the bounds are pinned (unregistered copy, see
+    /// BatteryMonitor.chargeBoundsLocked): both draggers are drawn as usual,
+    /// since the range they mark is in force, but ignore drags, keep the
+    /// arrow cursor, and say why in their tooltips. The panel puts a
+    /// ChargeBoundsLockRow with the registration link beneath the slider.
+    var locked: Bool = false
 
     private let batteryHeight: CGFloat = 28
     private let cornerRadius: CGFloat = 6
@@ -2094,16 +2127,19 @@ struct BatteryRangeSlider: View {
                     .frame(width: markerWidth, height: geo.size.height)
                     .contentShape(Rectangle())
                     .position(x: inset + lowerX, y: midY)
-                    .help("Lower bound: charging starts when battery drops below this level")
+                    .help(locked
+                        ? "Lower bound, locked at \(Int(lower))%: register Ampere to set your own charge bounds"
+                        : "Lower bound: charging starts when battery drops below this level")
                     .onHover { hovering in
-                        if hovering { NSCursor.resizeLeftRight.set() } else { NSCursor.arrow.set() }
+                        if hovering && !locked { NSCursor.resizeLeftRight.set() } else { NSCursor.arrow.set() }
                     }
                     .gesture(
                         DragGesture()
                             .onChanged { drag in
                                 let raw = Double(drag.location.x - inset) / Double(innerW) * 100
                                 lower = snap(max(0, min(raw, upper - minGap)))
-                            }
+                            },
+                        including: locked ? .none : .all
                     )
 
                 if !upperOverridden {
@@ -2137,20 +2173,56 @@ struct BatteryRangeSlider: View {
                         .frame(width: markerWidth, height: geo.size.height)
                         .contentShape(Rectangle())
                         .position(x: inset + upperX, y: midY)
-                        .help("Upper bound: charging stops when battery reaches this level")
+                        .help(locked
+                            ? "Upper bound, locked at \(Int(upper))%: register Ampere to set your own charge bounds"
+                            : "Upper bound: charging stops when battery reaches this level")
                         .onHover { hovering in
-                            if hovering { NSCursor.resizeLeftRight.set() } else { NSCursor.arrow.set() }
+                            if hovering && !locked { NSCursor.resizeLeftRight.set() } else { NSCursor.arrow.set() }
                         }
                         .gesture(
                             DragGesture()
                                 .onChanged { drag in
                                     let raw = Double(drag.location.x - inset) / Double(innerW) * 100
                                     upper = snap(min(100, max(raw, lower + minGap)))
-                                }
+                                },
+                            including: locked ? .none : .all
                         )
                 }
             }
         }
+    }
+}
+
+// MARK: - Charge Bounds Lock Row
+
+/// Shown beneath the range slider while the bounds are locked (unregistered
+/// copy): names the lock and links to the registration window, the only way
+/// to lift it. Same layout as the toggle rows it sits among (icon in a 26pt
+/// column, semibold label, trailing control) and the same orange
+/// call-to-register as the settings' Registration row.
+struct ChargeBoundsLockRow: View {
+    let lower: Int
+    let upper: Int
+
+    var body: some View {
+        HStack {
+            Image(systemName: "lock.fill")
+                .font(.system(size: 14))
+                .foregroundColor(.orange)
+                .frame(width: 26)
+            Text("Charge Bounds")
+                .font(.system(size: 13, weight: .semibold))
+            Spacer()
+            Button(action: {
+                NotificationCenter.default.post(name: .ampereShowRegistrationWindow, object: nil)
+            }) {
+                Text("Register to change")
+                    .font(.system(size: 12))
+                    .foregroundColor(.orange)
+            }
+            .buttonStyle(.plain)
+        }
+        .help("Charge bounds are locked at the default \(lower) to \(upper)% until Ampere is registered; click the link to enter the registration key from your purchase email and set your own bounds.")
     }
 }
 
@@ -2206,7 +2278,7 @@ struct RegistrationView: View {
                         .keyboardShortcut(.defaultAction)
                 }
             } else {
-                Text("Enter the email you purchased with and your registration key to activate Ampere on this Mac.")
+                Text("Enter the email you purchased with and your registration key to activate Ampere on this Mac and unlock custom charge bounds.")
                     .font(.system(size: 12))
                     .foregroundColor(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

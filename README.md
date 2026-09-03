@@ -10,7 +10,7 @@ A lightweight macOS menu bar app for monitoring battery status and controlling c
 
 - **Real-time battery stats** - percentage, cycle count, health, temperature, raw charge, and battery age, plus wattage (adapter / battery / system), voltage (adapter / battery), and current (adapter / battery)
 - **Charge control** - pause and resume charging via SMC
-- **Auto charge** - configurable upper/lower bounds to keep your battery in an optimal charge range
+- **Auto charge** - configurable upper/lower bounds to keep your battery in an optimal charge range; custom bounds are the licensed feature, and an unregistered copy runs the default 40 to 60% range
 - **Micro-charge prevention** - inhibits charging between bounds after restart; only charges from below the lower bound or on explicit user request
 - **Sleep-safe charging** - an in-progress charge never overshoots the upper bound while the Mac sleeps: between the bounds it pauses just before sleep and resumes on wake; below the lower bound the Mac is kept awake until the charge completes
 - **Charge to upper bound** - explicitly allow charging from the current level to the upper bound
@@ -22,7 +22,7 @@ A lightweight macOS menu bar app for monitoring battery status and controlling c
 - **Pinnable popover** - pin the panel to keep it open while you work
 - **Keep awake** - optionally prevent idle sleep while on AC power, for a set duration or until turned off (the Keep Awake row on the panel); a standard power assertion, so it needs no admin rights and is auto-released on quit or crash
 - **Launch at login** - start automatically when you log in
-- **Registration** - register with an email and registration key, bound to this Mac; the panel shows "Unregistered" until then. The registration is re-verified against the license server about once a day — network failures never clear it — and can be deregistered from the panel to move the key to another Mac.
+- **Registration** - register with an email and registration key, bound to this Mac; the panel shows "Unregistered" until then. The registration is re-verified against the license server about once a day — network failures never clear it — and can be deregistered from the panel to move the key to another Mac. Registering unlocks custom charge bounds; every other feature works the same unregistered.
 
 ## Requirements
 
@@ -62,6 +62,12 @@ When enabled, the app automatically manages charging between configurable bounds
 - **Below lower bound** - starts charging, continues until the upper bound is reached
 - **Between bounds** - holds (charging inhibited); use **Charge to Upper Bound** to explicitly start charging
 - **Above upper bound** - inhibits charging; use **Discharge to Upper Bound** to actively drain to the target
+
+#### Charge Bounds and Registration
+
+Custom charge bounds are the licensed feature. An unregistered copy runs the default 40 to 60% range: the slider still shows the bounds, but the draggers are locked (their tooltips say so), and a **Register to change** link beneath the slider opens the registration window. Everything else, including auto charge itself, micro-charge prevention, charge and discharge to upper bound, charge to full, and keep awake, works the same unregistered.
+
+Registering unlocks the draggers immediately. If the registration lapses (deregistered from the panel, the key registered on another Mac, or the daily verify reporting the license revoked), both bounds return to 40 to 60% at once and the draggers lock again; the state machine treats that like any other bound change, so a charge already past 60% is inhibited on the next poll. The reset is also applied at launch, so a custom range persisted by a lapsed registration never resurfaces after a restart. Network failures never lapse a registration, so an offline Mac keeps its custom bounds.
 
 #### Micro-Charge Prevention
 
@@ -133,7 +139,7 @@ Unlike the charge sleep hold and the discharge override (which use the system-wi
 
 ### Settings and Safety
 
-- **Settings persist across restarts** - auto charge, discharge toggle, charge bounds, and keep awake (including a mid-session deadline) are saved and restored when the app relaunches.
+- **Settings persist across restarts** - auto charge, discharge toggle, charge bounds (an unregistered copy always relaunches with the default 40 to 60%), and keep awake (including a mid-session deadline) are saved and restored when the app relaunches.
 - **Quitting the app restores system defaults** - all SMC overrides (charging inhibit, discharge) and power management changes (sleep settings) are cleared when the app exits. Your Mac returns to its normal charging and sleep behavior. If the app crashes or is force-killed, a watchdog daemon cleans up automatically within a few seconds.
 
 ### Health Check

@@ -145,10 +145,36 @@ final class BatteryMonitor: ObservableObject {
     }
     /// Minimum gap between charge bounds, matches the slider's `minGap`.
     static let chargeBoundMinGap = 5
+    /// The range every copy starts with, and the only range an unregistered
+    /// copy runs (see `chargeBoundsLocked`).
+    static let defaultChargeLowerBound = 40
+    static let defaultChargeUpperBound = 60
+
+    /// True while the bounds are pinned to the defaults because the copy is
+    /// unregistered. Custom charge bounds are the licensed feature:
+    /// AppDelegate mirrors `!RegistrationManager.isRegistered` here, at
+    /// launch through the init parameter (so the launch-time inhibit/allow
+    /// decision already reads the locked range) and on every later change,
+    /// whether from the registration window or a daily verify that finds
+    /// the license revoked or moved to another Mac. Engaging the lock
+    /// resets both bounds to the defaults, and while it holds, any other
+    /// assignment is undone by the bounds' didSets, so the persisted values
+    /// never diverge from the range in force. Not persisted itself: the
+    /// registration state it derives from is.
+    @Published var chargeBoundsLocked: Bool {
+        didSet {
+            if chargeBoundsLocked { resetChargeBoundsToDefaults() }
+        }
+    }
 
     @Published var chargeLowerBound: Int {
         didSet {
-            if chargeLowerBound < 0 { chargeLowerBound = 0 }
+            if chargeBoundsLocked && chargeLowerBound != Self.defaultChargeLowerBound {
+                // Locked: the only legal value is the default. Reset both
+                // ends together instead of fixing this one in place, so the
+                // gap clamp below can never fight the correction.
+                resetChargeBoundsToDefaults()
+            } else if chargeLowerBound < 0 { chargeLowerBound = 0 }
             else if chargeLowerBound > chargeUpperBound - Self.chargeBoundMinGap {
                 chargeLowerBound = chargeUpperBound - Self.chargeBoundMinGap
             }
@@ -157,12 +183,54 @@ final class BatteryMonitor: ObservableObject {
     }
     @Published var chargeUpperBound: Int {
         didSet {
-            if chargeUpperBound > 100 { chargeUpperBound = 100 }
+            if chargeBoundsLocked && chargeUpperBound != Self.defaultChargeUpperBound {
+                resetChargeBoundsToDefaults()
+            } else if chargeUpperBound > 100 { chargeUpperBound = 100 }
             else if chargeUpperBound < chargeLowerBound + Self.chargeBoundMinGap {
                 chargeUpperBound = chargeLowerBound + Self.chargeBoundMinGap
             }
             UserDefaults.standard.set(chargeUpperBound, forKey: "chargeUpperBound")
         }
+    }
+
+    /// Put both bounds back to the defaults, in the assignment order the gap
+    /// clamps accept: lower first when the default lower fits under the
+    /// current upper, otherwise upper first. One of the two always works.
+    /// If neither did, the current range would lie both entirely below the
+    /// default lower and entirely above the default upper, which is
+    /// impossible for a valid pair (and while locked, the other end is
+    /// already at its default, so a transient single-ended violation
+    /// cannot block both orders either). Each assignment re-enters the
+    /// didSets with a default value, which the lock guard accepts.
+    private func resetChargeBoundsToDefaults() {
+        let lower = Self.defaultChargeLowerBound
+        let upper = Self.defaultChargeUpperBound
+        if lower <= chargeUpperBound - Self.chargeBoundMinGap {
+            if chargeLowerBound != lower { chargeLowerBound = lower }
+            if chargeUpperBound != upper { chargeUpperBound = upper }
+        } else {
+            if chargeUpperBound != upper { chargeUpperBound = upper }
+            if chargeLowerBound != lower { chargeLowerBound = lower }
+        }
+    }
+
+    /// The bounds to run with, given what UserDefaults held (nil = never
+    /// saved). Repairs, in order: each end clamped to 0...100; both reset to
+    /// the defaults if the saved gap violates the minGap invariant
+    /// (corrupted defaults, or values written by an older build); and while
+    /// the bounds are locked, the defaults regardless of what was saved. A
+    /// custom range left behind by a registration that lapsed must not
+    /// resurface on the next launch of the now-unregistered copy.
+    static func repairedChargeBounds(lower: Int?, upper: Int?, locked: Bool) -> (lower: Int, upper: Int) {
+        if locked { return (defaultChargeLowerBound, defaultChargeUpperBound) }
+        var lower = lower ?? defaultChargeLowerBound
+        var upper = upper ?? defaultChargeUpperBound
+        if lower < 0 { lower = 0 }
+        if upper > 100 { upper = 100 }
+        if upper - lower < chargeBoundMinGap {
+            return (defaultChargeLowerBound, defaultChargeUpperBound)
+        }
+        return (lower, upper)
     }
 
     private var timer: Timer?
@@ -245,7 +313,11 @@ final class BatteryMonitor: ObservableObject {
     private static let sudoersPath = AppConstants.sudoersPath
     private static let helperPath = AppConstants.helperPath
 
-    init() {
+    /// `chargeBoundsLocked`: true for an unregistered copy, so the bounds are
+    /// pinned to the defaults from the launch-time SMC decision onward (see
+    /// the property).
+    init(chargeBoundsLocked: Bool) {
+        self.chargeBoundsLocked = chargeBoundsLocked
         // Load persisted auto-manage settings
         let defaults = UserDefaults.standard
         let autoManage = defaults.bool(forKey: "autoManageEnabled")
@@ -284,20 +356,17 @@ final class BatteryMonitor: ObservableObject {
         }
         let originalLower = defaults.object(forKey: "chargeLowerBound") as? Int
         let originalUpper = defaults.object(forKey: "chargeUpperBound") as? Int
-        var lower = originalLower ?? 40
-        var upper = originalUpper ?? 60
-        if lower < 0 { lower = 0 }
-        if upper > 100 { upper = 100 }
-        // Reset to defaults if the saved gap violates the minGap invariant
-        // (corrupted UserDefaults or values written by an older build).
-        // didSet doesn't fire on init, so this is the only chance to repair.
-        if upper - lower < Self.chargeBoundMinGap { lower = 40; upper = 60 }
-        self.chargeLowerBound = lower
-        self.chargeUpperBound = upper
-        // Persist the repair if it differs from what was on disk —
-        // otherwise the corrupted values would resurface on every launch.
-        if originalLower != lower { defaults.set(lower, forKey: "chargeLowerBound") }
-        if originalUpper != upper { defaults.set(upper, forKey: "chargeUpperBound") }
+        // didSet doesn't fire on init, so this is the only chance to repair
+        // the saved values (repairedChargeBounds lists what gets repaired).
+        let bounds = Self.repairedChargeBounds(lower: originalLower, upper: originalUpper,
+                                               locked: chargeBoundsLocked)
+        self.chargeLowerBound = bounds.lower
+        self.chargeUpperBound = bounds.upper
+        // Persist the repair if it differs from what was on disk, otherwise
+        // the corrupted (or locked-out custom) values would resurface on
+        // every launch.
+        if originalLower != bounds.lower { defaults.set(bounds.lower, forKey: "chargeLowerBound") }
+        if originalUpper != bounds.upper { defaults.set(bounds.upper, forKey: "chargeUpperBound") }
         // Charge-to-upper intent persists across restart so a crash mid-recovery
         // resumes the in-progress charge rather than parking at the current level.
         // Clear it if auto-manage is disabled (it has no effect outside auto mode).
