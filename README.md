@@ -49,9 +49,11 @@ Download the latest `.dmg` from the [GitHub Releases](https://github.com/az-code
 
 Pausing/resuming charging requires root access to write to the SMC. Ampere handles this as follows:
 
-1. **On launch** - the app installs (or updates) its helper binary. If the helper is missing or outdated, macOS prompts for your admin password. If cancelled, the app exits.
-2. **Setup** - a compiled helper binary (`SMCWriter`) is installed at `/usr/local/bin/az-ampere-smc` (owned by root), along with a sudoers rule at `/etc/sudoers.d/az-ampere` that allows passwordless execution of the helper. The rule is pinned to the helper's SHA-256 digest, so sudo refuses to run a swapped or tampered binary at that path.
-3. **Subsequent launches** - the helper is verified at startup. If unchanged, no password is needed. After a Homebrew upgrade, the new helper is installed automatically (one password prompt).
+1. **On launch** - the app installs (or updates) its helper binary. If the helper is missing, outdated, or not authorized for the current account, macOS prompts for your admin password. If cancelled, the app exits.
+2. **Setup** - a compiled helper binary (`SMCWriter`) is installed at `/Library/PrivilegedHelperTools/az-ampere-smc` (owned by root), along with a sudoers rule at `/etc/sudoers.d/az-ampere` that allows passwordless execution of the helper. The rule is pinned to the helper's SHA-256 digest. The helper and every directory leading to it are checked for root ownership, write permissions, ACLs, and symlinks, preventing replacement by an ordinary app.
+3. **Subsequent launches** - the helper and the current account's passwordless authorization are verified at startup. If both are current, no password is needed. After a Homebrew upgrade, the new helper is installed automatically (one password prompt).
+
+Upgrading from the former `/usr/local/bin/az-ampere-smc` location migrates the helper during that same administrator prompt. The replacement is verified before installation, restores the previous session's charging and sleep state, and retires the old helper and watchdogs. Preferences, charge bounds, and registration stay intact; no manual migration is needed.
 
 > **Note:** Admin access is granted per macOS user account — the sudoers rule names the account that installed it. If another account on the same Mac grants access, the rule is rewritten for that account, and the first account will be prompted for its password again on its next launch.
 
@@ -202,17 +204,19 @@ Or delete `Ampere.app` from Applications.
 
 Charge control installs privileged files that persist after the app is deleted:
 
-- `/usr/local/bin/az-ampere-smc` - the SMCWriter helper binary (runs as root to write SMC keys)
+- `/Library/PrivilegedHelperTools/az-ampere-smc` - the SMCWriter helper binary (runs as root to write SMC keys)
 - `/etc/sudoers.d/az-ampere` - the sudoers rule that allows passwordless execution of the helper
 - `/Library/Application Support/az-ampere/` - state directory for the saved-sleep markers (only exists if discharge or the mid-charge sleep hold was ever used)
 
-**From the UI:** Click **Settings** in the panel footer, then **Revoke** on the Admin Access row. This removes all of them (prompts for your admin password).
+**From the UI:** Click **Settings** in the panel footer, then **Revoke** on the Admin Access row. This restores charging and sleep settings, then removes the privileged files (one administrator prompt). If restoration fails, the files and recovery watchdog remain available and the app reports the failure.
 
-**From the command line:**
+**From the command line:** Quit Ampere first, then restore before deleting. The `&&` operators stop removal if cleanup fails.
 
 ```bash
-sudo rm -f /usr/local/bin/az-ampere-smc
-sudo rm -f /etc/sudoers.d/az-ampere
+sudo /Library/PrivilegedHelperTools/az-ampere-smc restore &&
+sudo /Library/PrivilegedHelperTools/az-ampere-smc remove-legacy &&
+sudo rm -f /Library/PrivilegedHelperTools/az-ampere-smc \
+    /etc/sudoers.d/az-ampere &&
 sudo rm -rf '/Library/Application Support/az-ampere'
 ```
 
@@ -265,7 +269,7 @@ While **Charge to Full** is active, this table applies with the upper bound read
 
 Both keys are written via IOKit's `IOConnectCallStructMethod` (selector 2) to the `AppleSMCKeysEndpoint` service (falling back to `AppleSMC`). Writing requires root privileges. Reading does not require root.
 
-The helper binary (`SMCWriter`) is a minimal executable with no AppKit/SwiftUI dependencies. It is root-owned and not user-writable.
+The helper binary (`SMCWriter`) is a minimal executable with no AppKit/SwiftUI dependencies. Its installation at `/Library/PrivilegedHelperTools/az-ampere-smc` is root-owned, and the complete path must prevent writes or replacement by ordinary users. The watchdog always starts from this checked installation path.
 
 ### Clamshell Mode and the Black Screen Problem
 
@@ -310,11 +314,11 @@ A **watchdog daemon** is always running while the app is active. It is spawned v
    - Clears `CHTE = 0x00` (allows charging)
    - Clears `CHIE = 0x00` (stops discharge)
    - Restores sleep settings via `pmset` — only if the save-sleep marker file exists (i.e. discharge or the mid-charge sleep hold had overridden pmset); otherwise leaves the user's sleep settings untouched
-   - Exits cleanly (no orphaned processes, no leftover files)
+   - Exits after successful recovery; if an SMC or pmset operation fails, retries on the next poll and retains any sleep settings still needing restoration
 
 The watchdog must be spawned with `posix_spawn` (not `fork`) because the Swift/ObjC runtime is not fork-safe — forked children crash when using Foundation, IOKit, or Objective-C APIs. Similarly, signal handlers (`SIGTERM`/`SIGHUP`) cannot be used for cleanup because they can only call async-signal-safe C functions, not Swift/Foundation/IOKit APIs. It is spawned with `POSIX_SPAWN_SETSID` so it runs in its own session: without that it would share the app's foreground process group, and a terminal Ctrl+C (dev runs via `run.sh`) would SIGINT the watchdog at the same instant as the app it exists to clean up after.
 
-On app launch, any orphaned watchdog processes from a previous crash are killed via `pkill`, and CHIE/sleep settings are cleared. CHTE is set to inhibit only when auto charge is enabled, the battery is at or above the lower bound, AND no in-progress charge-to-upper-bound is being resumed (i.e. `chargeToUpperBound` is not persisted as `true`); otherwise CHTE is cleared. A fresh watchdog is then spawned.
+On app launch, CHIE and saved sleep settings are restored before existing watchdogs are retired. CHTE is set to inhibit when auto charge is enabled, the battery is at or above the lower bound (or the BMS reports a full battery for a 100% target), and no valid charge-to-upper or charge-to-full session is being resumed; otherwise CHTE is cleared. A fresh watchdog is then spawned. Normal quit uses a single `restore` command that restores both SMC keys and sleep before retiring the watchdog. If cleanup fails, the watchdog remains alive to retry after the app exits.
 
 ### Process Architecture
 
@@ -338,10 +342,17 @@ Ampere (GUI, user)
   |     \-- exit(0)
   |
   |-- sudo SMCWriter nodischarge             (one-shot, root)
-  |     |-- pkill watchdog                   kill existing watchdog
   |     |-- SMC write CHIE = 0x00            disable active discharge
   |     |-- pmset restore sleep settings     only if save-sleep file exists
-  |     \-- exit(0)
+  |     |-- pkill watchdog                   only after successful restore
+  |     \-- exit(0)                          failure returns nonzero
+  |
+  |-- sudo SMCWriter restore                 (quit / revoke / migration)
+  |     |-- SMC write CHIE = 0x00            disable active discharge
+  |     |-- SMC write CHTE = 0x00            allow charging
+  |     |-- pmset restore sleep settings     only after CHIE clears
+  |     |-- pkill watchdog                   only after all restores succeed
+  |     \-- exit(0)                          failure preserves recovery
   |
   |-- sudo SMCWriter hold-sleep              (one-shot, root)
   |     |-- save pmset markers               same markers as discharge
@@ -359,10 +370,10 @@ Ampere (GUI, user)
   \-- SMCWriter watchdog:<app-pid>           (daemon, root, detached)
         |-- sleep(2) loop                    poll every 2 seconds
         |-- if app PID gone:
-        |     |-- SMC write CHTE = 0x00      allow charging
         |     |-- SMC write CHIE = 0x00      stop discharge
+        |     |-- SMC write CHTE = 0x00      allow charging
         |     |-- pmset restore sleep        only if save-sleep file exists
-        |     \-- exit(0)                    clean exit
+        |     \-- exit(0)                    retry on failure
         \-- (runs until app dies)
 ```
 

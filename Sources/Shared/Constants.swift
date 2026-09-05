@@ -2,7 +2,10 @@ public enum AppConstants {
     // Only the derived paths below are part of the public API — keep the
     // raw prefix private since nothing outside this file references it.
     private static let appPrefix = "az-ampere"
-    public static let helperPath = "/usr/local/bin/\(appPrefix)-smc"
+    public static let helperDirectory = "/Library/PrivilegedHelperTools"
+    public static let helperPath = "\(helperDirectory)/\(appPrefix)-smc"
+    /// Removed after the new helper has restored the old session successfully.
+    public static let legacyHelperPath = "/usr/local/bin/\(appPrefix)-smc"
     public static let sudoersPath = "/etc/sudoers.d/\(appPrefix)"
     /// Root-owned state directory for the saved-pmset markers. Deliberately
     /// NOT under /tmp: macOS wipes /tmp at boot, while `pmset -a` overrides

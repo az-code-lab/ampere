@@ -319,16 +319,66 @@ func setDischargeSleepPrevention(enabled: Bool) -> Bool {
 // MARK: - Main
 
 guard CommandLine.arguments.count == 2 else {
-    fputs("Usage: smc-writer inhibit|allow|discharge:pid|nodischarge|hold-sleep|release-sleep-hold|spawn-watchdog:pid|watchdog:pid\n", stderr)
+    fputs("Usage: smc-writer check|restore|remove-legacy|inhibit|allow|discharge:pid|nodischarge|hold-sleep|release-sleep-hold|spawn-watchdog:pid|watchdog:pid\n", stderr)
     exit(1)
 }
 
 let action = CommandLine.arguments[1]
 
+// A harmless authorization probe: sudo -n -k must be able to run this
+// command without a cached password before the app trusts its setup.
+if action == "check" {
+    exit(geteuid() == 0 && HelperSecurity.isProtected(path: AppConstants.helperPath) ? 0 : 1)
+}
+
+if action == "remove-legacy" {
+    if !HelperSecurity.removeFileWithoutFollowingDirectories(at: AppConstants.legacyHelperPath) {
+        // Its sudoers rule is already retired. Leaving an unused legacy
+        // file is preferable to following an unsafe path during migration.
+        fputs("WARNING: legacy helper could not be safely removed\n", stderr)
+    }
+    exit(0)
+}
+
+/// Restore only settings we actually overrode. Delay after a CHIE write
+/// before re-enabling clamshell sleep so USB-C PD has time to settle.
+func restoreSavedSleep() -> Bool {
+    guard markerExists(savedSleepPaths) else { return true }
+    sleep(3)
+    return setDischargeSleepPrevention(enabled: false)
+}
+
+/// Retire both generations during migration. Called only after cleanup
+/// succeeds; on failure the existing watchdog remains a recovery path.
+func stopWatchdogs() -> Bool {
+    let paths = [AppConstants.helperPath, AppConstants.legacyHelperPath]
+        .map { NSRegularExpression.escapedPattern(for: $0) }
+    let task = Process()
+    task.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+    task.arguments = ["-f", "^(" + paths.joined(separator: "|") + ") watchdog:[0-9]+$"]
+    task.standardInput = FileHandle.nullDevice
+    task.standardOutput = FileHandle.nullDevice
+    task.standardError = FileHandle.nullDevice
+    do {
+        try task.run()
+        task.waitUntilExit()
+        return task.terminationStatus == 0 || task.terminationStatus == 1
+    } catch {
+        fputs("WARNING: could not retire watchdogs: \(error.localizedDescription)\n", stderr)
+        return false
+    }
+}
+
 /// Spawn a detached watchdog daemon that monitors the given app PID.
 /// When the app dies, the watchdog clears CHTE, CHIE, and restores sleep.
 func spawnWatchdog(appPID: Int32) -> Bool {
-    let execPath = CommandLine.arguments[0]
+    // Never re-execute argv[0] from a potentially user-writable location.
+    // Every ancestor of the installed path must prevent replacement.
+    let execPath = AppConstants.helperPath
+    guard HelperSecurity.isProtected(path: execPath) else {
+        fputs("ERROR: watchdog executable is not protected\n", stderr)
+        return false
+    }
     var spawnPid: pid_t = 0
     var fileActions: posix_spawn_file_actions_t?
     posix_spawn_file_actions_init(&fileActions)
@@ -362,7 +412,7 @@ func spawnWatchdog(appPID: Int32) -> Bool {
 
 // "spawn-watchdog:PID" — spawn a watchdog daemon and exit immediately.
 if action.hasPrefix("spawn-watchdog:") {
-    guard let appPID = Int32(action.dropFirst("spawn-watchdog:".count)) else {
+    guard let appPID = Int32(action.dropFirst("spawn-watchdog:".count)), appPID > 0 else {
         fputs("ERROR: invalid PID\n", stderr)
         exit(1)
     }
@@ -414,7 +464,7 @@ if action == "release-sleep-hold" {
 
 // "discharge:PID" — set sleep prevention, write CHIE, spawn watchdog daemon, exit.
 if action.hasPrefix("discharge:") {
-    guard let appPID = Int32(action.dropFirst("discharge:".count)) else {
+    guard let appPID = Int32(action.dropFirst("discharge:".count)), appPID > 0 else {
         fputs("ERROR: invalid PID in discharge command\n", stderr)
         exit(1)
     }
@@ -477,7 +527,7 @@ if action.hasPrefix("discharge:") {
 // "watchdog:PID" — monitor app PID, clean up CHIE + sleep when app dies.
 // Spawned by the discharge command as a detached daemon.
 if action.hasPrefix("watchdog:") {
-    guard let appPID = Int32(action.dropFirst("watchdog:".count)) else {
+    guard let appPID = Int32(action.dropFirst("watchdog:".count)), appPID > 0 else {
         _exit(1)
     }
 
@@ -485,30 +535,25 @@ if action.hasPrefix("watchdog:") {
     while true {
         sleep(2)
         if kill(appPID, 0) != 0 {
-            // App is gone — clean up
+            // Retry on the next tick until both SMC keys and pmset are
+            // restored. Exiting after a failed attempt abandons the only
+            // remaining recovery path when the app has already died.
             if let conn = smcOpen() {
-                _ = smcWriteKey(conn, SMC.keyChargeInhibit, SMC.chieNormal)
-                _ = smcWriteKey(conn, SMC.keyChargeTerminate, SMC.chteAllow)
+                let restored = HelperRecovery.restore(
+                    clearDischarge: { smcWriteKey(conn, SMC.keyChargeInhibit, SMC.chieNormal) },
+                    allowCharging: { smcWriteKey(conn, SMC.keyChargeTerminate, SMC.chteAllow) },
+                    restoreSleep: restoreSavedSleep)
                 IOServiceClose(conn)
+                if restored { _exit(0) }
             }
-            // Only restore pmset if a save marker shows we previously
-            // overrode it (i.e. discharge was active). If the app died
-            // without ever enabling discharge, blindly running pmset would
-            // overwrite the user's actual sleep setting with our fallback.
-            if markerExists(savedSleepPaths) {
-                // Wait for PD renegotiation to settle before restoring sleep
-                sleep(3)
-                _ = setDischargeSleepPrevention(enabled: false)
-            }
-            _exit(0)
         }
     }
 }
 
 // One-shot commands
-let validActions: Set<String> = ["inhibit", "allow", "nodischarge"]
+let validActions: Set<String> = ["inhibit", "allow", "nodischarge", "restore"]
 guard validActions.contains(action) else {
-    fputs("Usage: smc-writer inhibit|allow|discharge:pid|nodischarge|hold-sleep|release-sleep-hold|spawn-watchdog:pid|watchdog:pid\n", stderr)
+    fputs("Usage: smc-writer check|restore|remove-legacy|inhibit|allow|discharge:pid|nodischarge|hold-sleep|release-sleep-hold|spawn-watchdog:pid|watchdog:pid\n", stderr)
     exit(1)
 }
 
@@ -537,44 +582,20 @@ case "allow":
         exit(2)
     }
 
-case "nodischarge":
-    // Kill any watchdog processes first (we're already root).
-    let killTask = Process()
-    killTask.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-    killTask.arguments = ["-f", "\(AppConstants.helperPath) watchdog:"]
-    killTask.standardInput = FileHandle.nullDevice
-    killTask.standardOutput = FileHandle.nullDevice
-    killTask.standardError = FileHandle.nullDevice
-    // Guard waitUntilExit behind a successful run() — calling
-    // waitUntilExit on a never-launched Process blocks indefinitely,
-    // which would deadlock the caller. pkill missing is extremely
-    // rare on macOS, but the failure mode is unbounded so worth gating.
-    do {
-        try killTask.run()
-        killTask.waitUntilExit()
-    } catch {
-        fputs("WARNING: failed to run pkill: \(error.localizedDescription)\n", stderr)
-    }
-
-    // Use the save-sleep marker for "we previously overrode pmset" instead
-    // of reading CHIE — if the SMC read fails, defaulting to
-    // wasDischarging=false would silently strand the user with sleep=0.
-    // The marker is reliably written before the CHIE=0x08 write and
-    // cleaned up by setDischargeSleepPrevention(false).
-    let saveFileExists = markerExists(savedSleepPaths)
-    if smcWriteKey(conn, SMC.keyChargeInhibit, SMC.chieNormal) {
-        if saveFileExists {
-            // Wait for USB-C PD renegotiation to complete before re-enabling
-            // clamshell sleep, otherwise the brief display disruption triggers sleep.
-            sleep(3)
-            _ = setDischargeSleepPrevention(enabled: false)
-        }
-        print("OK: active discharge disabled")
-        exit(0)
-    } else {
-        fputs("ERROR: SMC write failed for CHIE\n", stderr)
+case "nodischarge", "restore":
+    let restored = HelperRecovery.restore(
+        clearDischarge: { smcWriteKey(conn, SMC.keyChargeInhibit, SMC.chieNormal) },
+        allowCharging: {
+            action != "restore" || smcWriteKey(conn, SMC.keyChargeTerminate, SMC.chteAllow)
+        },
+        restoreSleep: restoreSavedSleep,
+        stopWatchdogs: stopWatchdogs)
+    guard restored else {
+        fputs("ERROR: cleanup incomplete — retaining recovery state and watchdogs\n", stderr)
         exit(2)
     }
+    print(action == "restore" ? "OK: system defaults restored" : "OK: active discharge disabled")
+    exit(0)
 
 default:
     fatalError("unexpected action: \(action)")

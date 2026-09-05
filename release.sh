@@ -17,6 +17,7 @@
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$REPO_DIR"
 source "$REPO_DIR/.project.env"
 
 VERSION="${1:-}"

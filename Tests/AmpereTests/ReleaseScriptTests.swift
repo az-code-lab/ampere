@@ -62,10 +62,12 @@ final class ReleaseScriptTests: XCTestCase {
 
     /// Runs a bash snippet with `stdin` on its input, returning what it wrote
     /// and how it exited.
-    private func bash(_ script: String, stdin: String = "") -> (output: String, status: Int32) {
+    private func bash(_ script: String, stdin: String = "", arguments: [String] = [],
+                      directory: URL? = nil) -> (output: String, status: Int32) {
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/bin/bash")
-        task.arguments = ["-c", script]
+        task.arguments = ["-c", script, "release-test"] + arguments
+        task.currentDirectoryURL = directory
         let input = Pipe(), output = Pipe()
         task.standardInput = input
         task.standardOutput = output
@@ -86,6 +88,39 @@ final class ReleaseScriptTests: XCTestCase {
         let lines = try statements()
         XCTAssertGreaterThan(lines.count, 50, "release.sh parsed to \(lines.count) statements — it is not being read")
         XCTAssertNotNil(try firstLine { $0.hasPrefix("hdiutil create") }, "no hdiutil create found in release.sh")
+    }
+
+    func testExistingVersionGuardUsesTheReleaseRepositoryFromAnyWorkingDirectory() throws {
+        let fixture = FileManager.default.temporaryDirectory.appending(path: "ampere-release-\(UUID().uuidString)")
+        let repo = fixture.appending(path: "repo")
+        let elsewhere = fixture.appending(path: "elsewhere")
+        try FileManager.default.createDirectory(at: repo, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: elsewhere, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: fixture) }
+
+        // Execute only the real preflight. Stop before any signing, build,
+        // tag mutation, or publishing; .project.env is an empty fixture.
+        let text = try scriptText()
+        let boundary = try XCTUnwrap(text.range(of: "# Match on the certificate"))
+        let probe = repo.appending(path: "release.sh")
+        try (String(text[..<boundary.lowerBound]) + "printf 'guard passed\\n'\n")
+            .write(to: probe, atomically: true, encoding: .utf8)
+        try Data().write(to: repo.appending(path: ".project.env"))
+        let setup = bash("""
+            set -eu
+            git init -q
+            object=$(printf 'fixture' | git hash-object -w --stdin)
+            git update-ref refs/tags/v1.2.3 "$object"
+            """, directory: repo)
+        XCTAssertEqual(setup.status, 0, setup.output)
+
+        let refused = bash("exec /bin/bash \"$@\"", arguments: [probe.path, "1.2.3"], directory: elsewhere)
+        XCTAssertNotEqual(refused.status, 0)
+        XCTAssertTrue(refused.output.contains("tag v1.2.3 already exists"), refused.output)
+        XCTAssertFalse(refused.output.contains("guard passed"))
+        let forced = bash("exec /bin/bash \"$@\"", arguments: [probe.path, "1.2.3", "--force"], directory: elsewhere)
+        XCTAssertEqual(forced.status, 0, forced.output)
+        XCTAssertTrue(forced.output.contains("guard passed"))
     }
 
     func testTheDiskImageIsSignedNotarizedAndStapledItself() throws {
