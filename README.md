@@ -55,7 +55,7 @@ Pausing/resuming charging requires root access to write to the SMC. Ampere handl
 
 Upgrading from the former `/usr/local/bin/az-ampere-smc` location migrates the helper during that same administrator prompt. The replacement is verified before installation, restores the previous session's charging and sleep state, and retires the old helper and watchdogs. A restore failure does not block the installation; the app's launch cleanup and the watchdog retry it. Preferences, charge bounds, and registration stay intact; no manual migration is needed.
 
-> **Note:** Admin access is granted per macOS user account — the sudoers rule names the account that installed it. If another account on the same Mac grants access, the rule is rewritten for that account, and the first account will be prompted for its password again on its next launch.
+> **Note:** Admin access is granted per macOS user account: the sudoers file holds one line per account that has granted it. Another account on the same Mac is asked for its password once, after which both stay authorized, and an upgrade refreshes every line so only the first account to launch the new version is prompted. Revoke removes only the current account's line and deletes the helper once no account remains. Only one running copy of Ampere manages charge control at a time: with fast user switching, a copy launched while another account's copy is already running shows battery information but stands by, and takes over once that copy quits.
 
 ### Auto Charge
 
@@ -208,9 +208,9 @@ Charge control installs privileged files that persist after the app is deleted:
 - `/etc/sudoers.d/az-ampere` - the sudoers rule that allows passwordless execution of the helper
 - `/Library/Application Support/az-ampere/` - state directory for the saved-sleep markers (only exists if discharge or the mid-charge sleep hold was ever used)
 
-**From the UI:** Click **Settings** in the panel footer, then **Revoke** on the Admin Access row. This restores charging and sleep settings, then removes the privileged files (one administrator prompt). If restoration fails, the files and recovery watchdog remain available and the app reports the failure.
+**From the UI:** Click **Settings** in the panel footer, then **Revoke** on the Admin Access row. This restores charging and sleep settings, then removes your account's sudoers line and, once no other account is authorized, the helper binary and state directory (one administrator prompt). If restoration fails, the files and recovery watchdog remain available and the app reports the failure.
 
-**From the command line:** Quit Ampere first, then restore before deleting. The `&&` operators stop removal if cleanup fails.
+**From the command line:** Quit Ampere first, then restore before deleting. This removes access for every account. The `&&` operators stop removal if cleanup fails.
 
 ```bash
 sudo /Library/PrivilegedHelperTools/az-ampere-smc restore &&

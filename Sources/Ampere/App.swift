@@ -604,18 +604,23 @@ struct ContentView: View {
             // Status grid
             statusGrid(state)
 
-            if !monitor.autoManageEnabled && state.adapterConnected {
-                Divider().padding(.horizontal)
+            // Both mode sections write to the SMC; neither is offered while
+            // another Ampere process holds charge control (the status line
+            // says which one).
+            if !monitor.standingBy {
+                if !monitor.autoManageEnabled && state.adapterConnected {
+                    Divider().padding(.horizontal)
 
-                // Charge control: pause/discharge/resume
-                chargeControlSection()
-            }
+                    // Charge control: pause/discharge/resume
+                    chargeControlSection()
+                }
 
-            if monitor.autoManageEnabled {
-                Divider().padding(.horizontal)
+                if monitor.autoManageEnabled {
+                    Divider().padding(.horizontal)
 
-                // Auto charge content (slider + discharge toggle)
-                autoManageContent(state)
+                    // Auto charge content (slider + discharge toggle)
+                    autoManageContent(state)
+                }
             }
 
             Divider().padding(.horizontal)
@@ -792,7 +797,7 @@ struct ContentView: View {
                     // Reflect the actual grant state — a static "requires
                     // admin privileges" line reads as an error when access
                     // is already granted.
-                    Text(monitor.isSudoRuleInstalled
+                    Text(monitor.accountAuthorized
                         ? "Admin access granted for charge control."
                         : "Requires admin privileges for charge control.")
                         .font(.system(size: 12))
@@ -814,10 +819,14 @@ struct ContentView: View {
             if monitor.settingsExpanded {
                 Divider().padding(.horizontal)
                 autoManageToggle()
+                    .disabled(monitor.standingBy)
                 launchAtLoginRow()
                 menuBarPercentRow()
                 registrationRow()
-                if monitor.isSudoRuleInstalled {
+                // Only while this account holds passwordless access and this
+                // instance manages charge control: another account's rule is
+                // not ours to revoke, and neither is its running session.
+                if monitor.isSudoRuleInstalled && monitor.accountAuthorized && !monitor.standingBy {
                     revokeAdminRow()
                 }
             }
@@ -876,6 +885,14 @@ struct ContentView: View {
     }
 
     private func statusMessage(_ state: BatteryState) -> String {
+        switch monitor.chargeControlHold {
+        case .otherInstance(let other):
+            return "Charge control is in use by \(other)"
+        case .accessDeclined:
+            return "Admin access required for charge control. Pause charging or re-enable Auto Charge to grant it."
+        case nil:
+            break
+        }
         if let error = monitor.lastError { return error }
         if let warning = monitor.healthWarning { return warning }
         if monitor.activeDischarging {
@@ -927,6 +944,8 @@ struct ContentView: View {
     }
 
     private func statusMessageColor(_ state: BatteryState) -> Color {
+        if monitor.standingBy { return .secondary }
+        if monitor.chargeControlHold != nil { return .orange }
         if monitor.lastError != nil { return .red }
         if monitor.healthWarning != nil { return .red }
         if monitor.activeDischarging { return .orange }
@@ -1138,7 +1157,10 @@ struct ContentView: View {
                                 monitor.refresh()
                             } else {
                                 monitor.autoManageEnabled = false
-                                monitor.lastError = "Admin access required for auto charge"
+                                // The status line already explains a hold.
+                                if monitor.chargeControlHold == nil {
+                                    monitor.lastError = "Admin access required for auto charge"
+                                }
                             }
                         }
                     } else {
@@ -1417,7 +1439,7 @@ struct ContentView: View {
                 monitor.removeSudoRule()
             }
             .buttonStyle(FooterButtonStyle())
-            .help("Remove the helper binary and passwordless sudo rule (prompts for your admin password). Charge control stops working until access is granted again.")
+            .help("Remove this account's passwordless sudo rule, and the helper binary once no other account uses it (prompts for your admin password). Charge control stops working until access is granted again.")
         }
         .padding(.horizontal, 16)
         .help("Ampere has passwordless admin access for charge control; Revoke removes it")

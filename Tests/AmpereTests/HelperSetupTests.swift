@@ -66,7 +66,23 @@ final class HelperSetupTests: XCTestCase {
 
         func removal() throws -> String {
             try FileManager.default.copyItem(at: writer, to: URL(fileURLWithPath: paths.helper))
-            return HelperSetup.removalScript(paths: paths, stateDirectory: state.path, legacyMarkers: [])
+            return HelperSetup.removalScript(username: "test_user", paths: paths,
+                                             stateDirectory: state.path, legacyMarkers: [])
+                .replacingOccurrences(of: "/usr/sbin/chown root:wheel", with: "/usr/bin/true")
+        }
+
+        func rule(_ user: String, digest: String, path: String) -> String {
+            "\(user) ALL=(root) NOPASSWD: sha256:\(digest) \(path)"
+        }
+
+        func writeSudoers(_ lines: [String]) throws {
+            try Data(lines.map { $0 + "\n" }.joined().utf8)
+                .write(to: URL(fileURLWithPath: paths.sudoers))
+        }
+
+        var sudoersDirectoryContents: [String] {
+            (try? FileManager.default.contentsOfDirectory(
+                atPath: (paths.sudoers as NSString).deletingLastPathComponent)) ?? []
         }
     }
 
@@ -95,6 +111,48 @@ final class HelperSetupTests: XCTestCase {
         XCTAssertEqual(try String(contentsOfFile: fixture.paths.sudoers),
                        "test_user ALL=(root) NOPASSWD: sha256:\(fixture.digest) \(fixture.paths.helper)\n")
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: fixture.paths.directory), ["az-ampere-smc"])
+    }
+
+    /// Other accounts keep their access across an upgrade and the helper
+    /// move: their lines are rewritten with the new digest and path, in
+    /// file order, without duplicates. Lines this app never wrote are dropped.
+    func testInstallKeepsOtherAccountsAndMovesThemToTheNewHelper() throws {
+        let fixture = try Fixture()
+        let stale = String(repeating: "0", count: 64)
+        try fixture.writeSudoers([
+            fixture.rule("alice", digest: stale, path: fixture.paths.legacy),
+            "# not ours",
+            fixture.rule("bob", digest: stale, path: fixture.paths.helper),
+            "eve ALL=(root) NOPASSWD: /usr/bin/something-else",
+            fixture.rule("test_user", digest: stale, path: fixture.paths.legacy),
+            fixture.rule("bob", digest: stale, path: fixture.paths.legacy),
+            "mallory ALL=(root) NOPASSWD: sha256:\(stale) /tmp/elsewhere/az-ampere-smc",
+        ])
+        let result = try run(fixture.install())
+        XCTAssertEqual(result.status, 0, result.output)
+        XCTAssertEqual(try String(contentsOfFile: fixture.paths.sudoers), [
+            fixture.rule("alice", digest: fixture.digest, path: fixture.paths.helper),
+            fixture.rule("bob", digest: fixture.digest, path: fixture.paths.helper),
+            fixture.rule("test_user", digest: fixture.digest, path: fixture.paths.helper),
+        ].map { $0 + "\n" }.joined())
+        XCTAssertEqual(fixture.calls, ["restore", "remove-legacy", "spawn-watchdog:123"])
+    }
+
+    func testRevokeKeepsTheHelperWhileAnotherAccountStillUsesIt() throws {
+        let fixture = try Fixture()
+        let alice = fixture.rule("alice", digest: fixture.digest, path: fixture.paths.helper)
+        try fixture.writeSudoers([
+            fixture.rule("test_user", digest: fixture.digest, path: fixture.paths.helper),
+            alice,
+        ])
+        let result = try run(fixture.removal())
+        XCTAssertEqual(result.status, 0, result.output)
+        XCTAssertEqual(fixture.calls, ["restore", "remove-legacy"])
+        XCTAssertEqual(try String(contentsOfFile: fixture.paths.sudoers), alice + "\n")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.paths.helper))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.paths.legacy))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.state.path))
+        XCTAssertEqual(fixture.sudoersDirectoryContents, ["az-ampere"], "no staging file left behind")
     }
 
     func testDigestMismatchCannotExecuteOrReplaceAnything() throws {

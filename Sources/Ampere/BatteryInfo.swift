@@ -65,6 +65,9 @@ final class BatteryMonitor: ObservableObject {
         var helperStale: () -> Bool = BatteryMonitor.helperNeedsUpdate
         var installHelper: () -> Bool = BatteryMonitor.installSudo
         var setupRefusal: () -> String? = BatteryMonitor.helperSetupRefusal
+        /// Nil when this process should manage charge control; otherwise
+        /// how to name the earlier instance that holds it (InstanceGuard).
+        var competingInstance: () -> String? = { InstanceGuard.competingInstance()?.owner }
         var runAsAdmin: (String) -> Bool = BatteryMonitor.runAsAdmin
     }
 
@@ -151,6 +154,30 @@ final class BatteryMonitor: ObservableObject {
     @Published var lastError: String?
     @Published var pinned: Bool = false
     @Published var healthWarning: String?
+    /// Why this instance is not writing to the SMC, or nil while it manages
+    /// charge control. Battery information keeps updating either way.
+    enum ChargeControlHold: Equatable {
+        /// Another Ampere process, usually one belonging to another
+        /// logged-in account, started first and holds control (named for
+        /// the status line). Nothing is written until it is gone: no launch
+        /// cleanup, no watchdog, no pre-sleep pause, no restore at quit.
+        case otherInstance(String)
+        /// This account declined the password prompt while taking over
+        /// from that process. The next charge-control action asks again.
+        case accessDeclined
+    }
+    @Published private(set) var chargeControlHold: ChargeControlHold?
+    /// True while another process holds charge control; the panel hides
+    /// the controls, since nothing this instance could do would apply.
+    var standingBy: Bool {
+        if case .otherInstance = chargeControlHold { return true }
+        return false
+    }
+    /// True once this account has been verified (or granted) passwordless
+    /// access to the helper in this session; false again after Revoke. The
+    /// helper files alone no longer prove it: the sudoers file may name
+    /// other accounts and not this one.
+    @Published private(set) var accountAuthorized = false
     @Published var lastHealthCheckStatus: String = "pending"
     @Published var lastHealthCheckSMC: String = ""
     @Published var lastHealthCheckExpected: String = ""
@@ -486,102 +513,15 @@ final class BatteryMonitor: ObservableObject {
         // derived fresh from the rule conditions at launch.
         chargingPaused = false
         guard startMonitoring else { return }
-        // Install/update the helper or authorize this macOS account.
-        // brew uninstall would have removed the helper; a fresh app build
-        // would have a different helper binary. The install prompts for
-        // admin via osascript; cancellation terminates the app.
-        if !isSudoRuleInstalled || io.helperStale() || !io.helperAuthorized() {
-            NSLog("Ampere: Helper needs installation, update, or authorization")
-            if !io.installHelper() {
-                NSLog("Ampere: Helper install failed or cancelled, quitting")
-                // A refusal never showed a prompt, so do not send the user
-                // back to enter a password; say what blocks the install.
-                let refusal = io.setupRefusal()
-                DispatchQueue.main.async {
-                    let alert = NSAlert()
-                    if let refusal {
-                        alert.messageText = "Helper Setup Failed"
-                        alert.informativeText = refusal
-                    } else {
-                        alert.messageText = "Admin Access Required"
-                        alert.informativeText = "Ampere needs admin access to install its helper tool. Please relaunch and enter your admin password."
-                    }
-                    alert.alertStyle = .critical
-                    alert.runModal()
-                    NSApp.terminate(nil)
-                }
-                return
-            }
-        }
-        if isSudoRuleInstalled {
-            // Read battery once and remember whether the read actually
-            // succeeded — a failed read returns nil and `?? 0` would falsely
-            // claim "below lower bound", silently overwriting the persisted
-            // chargeToUpperBound value next time around.
-            let launchBattery = self.io.battery()
-            let launchPercentage = launchBattery?.percentage ?? 0
-            // Crash-recovery sanity: chargeToUpperBound=true is only valid below
-            // the upper bound. A crash between the state machine's CHTE=inhibit
-            // write and its in-memory ctu=false update can leave ctu=true
-            // persisted with pct already at/above upper. Without this correction,
-            // shouldInhibit below would compute false and the launch cleanup
-            // would briefly write CHTE=allow, violating the invariant until the
-            // first refresh self-corrects. reachedBound: for a 100% upper
-            // bound the BMS fully-charged flag counts as "at the bound",
-            // same rule the state machine applies.
-            if chargeToUpperBound, let lb = launchBattery,
-               Self.reachedBound(chargeUpperBound, percentage: lb.percentage,
-                                 fullyCharged: lb.fullyCharged) {
-                chargeToUpperBound = false
-                defaults.set(false, forKey: "chargeToUpperBound")
-            }
-            // Same crash-window repair for charge-to-full against its own
-            // target: a crash between the at-full inhibit write and the
-            // in-memory clear must not resurrect the override.
-            if chargeToFull, let lb = launchBattery,
-               Self.reachedBound(100, percentage: lb.percentage,
-                                 fullyCharged: lb.fullyCharged) {
-                chargeToFull = false
-                defaults.set(false, forKey: "chargeToFull")
-            }
-            // Respect persisted charge-to-upper/-full intent: if either is
-            // set, skip the inhibit so the in-progress charge survives a
-            // restart.
-            let shouldInhibit = autoManageEnabled
-                && launchBattery != nil
-                && (launchPercentage >= chargeLowerBound
-                    || Self.reachedBound(effectiveUpperBound, percentage: launchPercentage,
-                                         fullyCharged: launchBattery?.fullyCharged ?? false))
-                && !chargeToUpperBound
-                && !chargeToFull
-            if shouldInhibit {
-                chargingPaused = true
-            } else if autoManageEnabled, launchBattery != nil,
-                      launchPercentage < chargeLowerBound {
-                // Rule 1: below lower bound at launch — charge all the way to upper
-                chargeToUpperBound = true
-                // didSet doesn't fire during init, so explicitly persist —
-                // otherwise a quit-and-restart mid-charge wouldn't see the
-                // intent saved, breaking the "in-progress charge resumes"
-                // promise the README makes for this path.
-                defaults.set(true, forKey: "chargeToUpperBound")
-            }
-            // Cleanup runs synchronously here so the SMC is in the
-            // expected state by the time refresh() starts dispatching
-            // auto-manage actions — otherwise refresh's state machine
-            // could race against an in-flight cleanup write.
-            let okDischarge = runSMCWriteViaSudo("nodischarge")
-            let okChte = runSMCWriteViaSudo(shouldInhibit ? "inhibit" : "allow")
-            let pid = ProcessInfo.processInfo.processIdentifier
-            let okWatchdog = runSMCWriteViaSudo("spawn-watchdog:\(pid)")
-            if okDischarge && okChte {
-                NSLog("Ampere: Launch cleanup done (inhibit=%d)", shouldInhibit)
-            } else {
-                NSLog("Ampere: Launch cleanup failed (nodischarge=%d, chte=%d)", okDischarge, okChte)
-            }
-            if !okWatchdog {
-                NSLog("Ampere: Watchdog spawn failed at launch — crash safety net not installed")
-            }
+        // Only one Ampere process may manage charge control on this Mac
+        // (see InstanceGuard). An instance that starts while another one is
+        // already running reads the battery but writes nothing until the
+        // other quits; refresh() takes over from there.
+        if let other = io.competingInstance() {
+            chargeControlHold = .otherInstance(other)
+            NSLog("Ampere: Charge control is in use by %@; this instance stands by", other)
+        } else if !activateChargeControl(atLaunch: true) {
+            return
         }
 
         refresh()
@@ -634,9 +574,126 @@ final class BatteryMonitor: ObservableObject {
         }
     }
 
+    /// Take charge control: verify (or grant) this account's access to the
+    /// helper, reconcile the SMC and pmset with the persisted intent, and
+    /// spawn the crash watchdog. Runs synchronously so refresh() cannot race
+    /// the cleanup writes. At launch a failed or cancelled install quits the
+    /// app. When taking over later, after the instance that held control
+    /// quit, the same prompt appears if this account has not granted access
+    /// yet, but a cancel only leaves charge control on hold until the next
+    /// charge-control action asks again. Returns false when the app is quitting.
+    @discardableResult
+    private func activateChargeControl(atLaunch: Bool) -> Bool {
+        // Install/update the helper or authorize this macOS account.
+        // brew uninstall would have removed the helper; a fresh app build
+        // would have a different helper binary. The install prompts for
+        // admin via osascript; cancellation terminates the app.
+        if !isSudoRuleInstalled || io.helperStale() || !io.helperAuthorized() {
+            NSLog("Ampere: Helper needs installation, update, or authorization")
+            if !io.installHelper() {
+                guard atLaunch else {
+                    NSLog("Ampere: Helper install failed or cancelled; charge control stays on hold")
+                    chargeControlHold = .accessDeclined
+                    return true
+                }
+                NSLog("Ampere: Helper install failed or cancelled, quitting")
+                // A refusal never showed a prompt, so do not send the user
+                // back to enter a password; say what blocks the install.
+                let refusal = io.setupRefusal()
+                DispatchQueue.main.async {
+                    let alert = NSAlert()
+                    if let refusal {
+                        alert.messageText = "Helper Setup Failed"
+                        alert.informativeText = refusal
+                    } else {
+                        alert.messageText = "Admin Access Required"
+                        alert.informativeText = "Ampere needs admin access to install its helper tool. Please relaunch and enter your admin password."
+                    }
+                    alert.alertStyle = .critical
+                    alert.runModal()
+                    NSApp.terminate(nil)
+                }
+                return false
+            }
+        }
+        accountAuthorized = true
+        if isSudoRuleInstalled {
+            // Read battery once and remember whether the read actually
+            // succeeded — a failed read returns nil and `?? 0` would falsely
+            // claim "below lower bound", silently overwriting the persisted
+            // chargeToUpperBound value next time around.
+            let launchBattery = self.io.battery()
+            let launchPercentage = launchBattery?.percentage ?? 0
+            // Crash-recovery sanity: chargeToUpperBound=true is only valid below
+            // the upper bound. A crash between the state machine's CHTE=inhibit
+            // write and its in-memory ctu=false update can leave ctu=true
+            // persisted with pct already at/above upper. Without this correction,
+            // shouldInhibit below would compute false and the launch cleanup
+            // would briefly write CHTE=allow, violating the invariant until the
+            // first refresh self-corrects. reachedBound: for a 100% upper
+            // bound the BMS fully-charged flag counts as "at the bound",
+            // same rule the state machine applies.
+            if chargeToUpperBound, let lb = launchBattery,
+               Self.reachedBound(chargeUpperBound, percentage: lb.percentage,
+                                 fullyCharged: lb.fullyCharged) {
+                chargeToUpperBound = false
+                defaults.set(false, forKey: "chargeToUpperBound")
+            }
+            // Same crash-window repair for charge-to-full against its own
+            // target: a crash between the at-full inhibit write and the
+            // in-memory clear must not resurrect the override.
+            if chargeToFull, let lb = launchBattery,
+               Self.reachedBound(100, percentage: lb.percentage,
+                                 fullyCharged: lb.fullyCharged) {
+                chargeToFull = false
+                defaults.set(false, forKey: "chargeToFull")
+            }
+            // Respect persisted charge-to-upper/-full intent: if either is
+            // set, skip the inhibit so the in-progress charge survives a
+            // restart.
+            let shouldInhibit = autoManageEnabled
+                && launchBattery != nil
+                && (launchPercentage >= chargeLowerBound
+                    || Self.reachedBound(effectiveUpperBound, percentage: launchPercentage,
+                                         fullyCharged: launchBattery?.fullyCharged ?? false))
+                && !chargeToUpperBound
+                && !chargeToFull
+            if shouldInhibit {
+                chargingPaused = true
+            } else if autoManageEnabled, launchBattery != nil,
+                      launchPercentage < chargeLowerBound {
+                // Rule 1: below lower bound at launch — charge all the way to upper
+                chargeToUpperBound = true
+                // Persisted explicitly as well: a quit-and-restart mid-charge
+                // must find the intent saved, or the "in-progress charge
+                // resumes" promise the README makes for this path breaks.
+                defaults.set(true, forKey: "chargeToUpperBound")
+            }
+            // Cleanup runs synchronously here so the SMC is in the
+            // expected state by the time refresh() starts dispatching
+            // auto-manage actions — otherwise refresh's state machine
+            // could race against an in-flight cleanup write.
+            let okDischarge = runSMCWriteViaSudo("nodischarge")
+            let okChte = runSMCWriteViaSudo(shouldInhibit ? "inhibit" : "allow")
+            let pid = ProcessInfo.processInfo.processIdentifier
+            let okWatchdog = runSMCWriteViaSudo("spawn-watchdog:\(pid)")
+            if okDischarge && okChte {
+                NSLog("Ampere: Launch cleanup done (inhibit=%d)", shouldInhibit)
+            } else {
+                NSLog("Ampere: Launch cleanup failed (nodischarge=%d, chte=%d)", okDischarge, okChte)
+            }
+            if !okWatchdog {
+                NSLog("Ampere: Watchdog spawn failed at launch — crash safety net not installed")
+            }
+        }
+        return true
+    }
+
     func restoreBeforeTermination() {
         terminating = true
-        guard isSudoRuleInstalled else { return }
+        // On hold: nothing of ours is in force, and the restore belongs to
+        // the instance that holds control.
+        guard isSudoRuleInstalled, chargeControlHold == nil else { return }
         let done = DispatchSemaphore(value: 0)
         smcQueue.async {
             // A single helper transaction restores both SMC keys and sleep
@@ -655,6 +712,7 @@ final class BatteryMonitor: ObservableObject {
     /// full-charge or manual-resume request whose callback is still pending.
     func prepareForSleep() {
         preparingForSleep = true
+        guard chargeControlHold == nil else { return }
         smcQueue.sync {}
         guard isSudoRuleInstalled, let battery = io.battery(), battery.adapterConnected else { return }
         let pause: Bool
@@ -852,6 +910,10 @@ final class BatteryMonitor: ObservableObject {
 
     /// Restore charging and sleep before removing the privileged files.
     func removeSudoRule() {
+        if case .otherInstance(let other) = chargeControlHold {
+            lastError = "Charge control is in use by \(other); revoke from that account"
+            return
+        }
         guard !autoManageInFlight else {
             lastError = "Charge control is busy — try revoking access again in a moment"
             return
@@ -861,11 +923,16 @@ final class BatteryMonitor: ObservableObject {
             guard let self else { return }
             // Restoration and removal share the one existing admin prompt.
             // This also works when the sudoers rule belongs to another user.
+            // Only this account's rule goes; the helper itself is deleted
+            // once no account remains. Success means this account can no
+            // longer run the helper, whether or not the files still exist.
             let ok = HelperSecurity.isProtected(path: Self.helperPath)
-                && self.io.runAsAdmin(HelperSetup.removalScript())
+                && self.io.runAsAdmin(HelperSetup.removalScript(username: NSUserName()))
+                && !self.io.helperAuthorized()
             DispatchQueue.main.async {
                 self.autoManageInFlight = false
-                if ok && !self.isSudoRuleInstalled {
+                if ok {
+                    self.accountAuthorized = false
                     self.autoManageEnabled = false
                     self.autoDischargeEnabled = false
                     self.chargeToUpperBound = false
@@ -952,10 +1019,24 @@ final class BatteryMonitor: ObservableObject {
         return runAsAdmin(script) && checkHelperAuthorization()
     }
 
+    /// This account can run the helper: lift a declined-takeover hold and
+    /// show the Revoke row.
+    private func grantAccess() {
+        accountAuthorized = true
+        if chargeControlHold == .accessDeclined { chargeControlHold = nil }
+    }
+
     /// Ensure sudo helper is installed (prompts for password on background queue).
     /// Calls completion on the main queue with success/failure.
     func ensureSudoInstalled(completion: @escaping (Bool) -> Void) {
+        // Standing by: installing would run the migration's restore and
+        // spawn a watchdog against the instance that holds charge control.
+        if standingBy {
+            completion(false)
+            return
+        }
         if isSudoRuleInstalled && !io.helperStale() && io.helperAuthorized() {
+            grantAccess()
             completion(true)
             return
         }
@@ -963,8 +1044,10 @@ final class BatteryMonitor: ObservableObject {
             let ok = self?.io.installHelper() ?? false
             // The setup transaction already installed a fresh watchdog.
             DispatchQueue.main.async {
-                NSApp.activate(ignoringOtherApps: true)
+                // Optional chaining: NSApp is nil under the test host.
+                NSApp?.activate(ignoringOtherApps: true)
                 if ok {
+                    self?.grantAccess()
                     self?.recheckHealth()
                 }
                 completion(ok)
@@ -1623,6 +1706,24 @@ final class BatteryMonitor: ObservableObject {
         // (sleep allowed) — the safe direction for unknown state, matching
         // the rest of this file.
         reconcileKeepAwake(adapterConnected: battery?.adapterConnected ?? false)
+
+        // Only one Ampere process may manage charge control (see
+        // InstanceGuard). Stand by while an earlier instance runs; take over
+        // with the same reconciliation as at launch once it is gone.
+        if let other = io.competingInstance() {
+            if chargeControlHold != .otherInstance(other) {
+                chargeControlHold = .otherInstance(other)
+                NSLog("Ampere: Charge control is in use by %@; standing by", other)
+            }
+            return
+        }
+        if standingBy {
+            chargeControlHold = nil
+            NSLog("Ampere: Taking over charge control")
+            activateChargeControl(atLaunch: false)
+        }
+        // A declined takeover prompt: read-only until access is granted.
+        if chargeControlHold != nil { return }
 
         // Stop discharge if the adapter disconnected mid-discharge. Gated
         // separately from the chargingPaused synthesize branch because the
@@ -2376,7 +2477,10 @@ final class BatteryMonitor: ObservableObject {
         }
         ensureSudoInstalled { [weak self] ok in
             guard let self, ok else {
-                self?.lastError = "Admin access required to control charging"
+                // The status line already explains a hold.
+                if self?.chargeControlHold == nil {
+                    self?.lastError = "Admin access required to control charging"
+                }
                 return
             }
             self.requestedChargingPaused = shouldPause

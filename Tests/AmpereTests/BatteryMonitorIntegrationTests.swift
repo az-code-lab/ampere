@@ -25,6 +25,10 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         var stale = false
         var installed = true
         var installs = 0
+        /// False: the administrator prompt is cancelled.
+        var installSucceeds = true
+        /// Non-nil: an earlier Ampere process holds charge control.
+        var competing: String?
         let preferences = MemoryBatteryPreferences()
         private let lock = NSLock()
         private var commands: [String] = []
@@ -108,6 +112,7 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
             io.helperStale = { self.stale }
             io.installHelper = {
                 self.installs += 1
+                guard self.installSucceeds else { return false }
                 self.authorized = true
                 self.installed = true
                 self.stale = false
@@ -115,6 +120,7 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
             }
             io.runAsAdmin = { _ in XCTFail("Unexpected administrator command"); return false }
             io.setupRefusal = { nil }
+            io.competingInstance = { self.competing }
             return BatteryMonitor(chargeBoundsLocked: locked, defaults: preferences,
                                   io: io, startMonitoring: startMonitoring)
         }
@@ -378,6 +384,86 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         XCTAssertFalse(monitor.sleepHoldActive)
         XCTAssertEqual(hw.writes, ["inhibit"])
         XCTAssertEqual(monitor.lastHealthCheckStatus, "pass")
+    }
+
+    func testStandsByForAnEarlierInstanceAndTakesOverWhenItQuits() {
+        let hw = Hardware()
+        hw.competing = "Ampere running as alice"
+        let monitor = hw.monitor(startMonitoring: true)
+        XCTAssertEqual(monitor.chargeControlHold, .otherInstance("Ampere running as alice"))
+        XCTAssertTrue(monitor.standingBy)
+        XCTAssertEqual(hw.installs, 0)
+        XCTAssertFalse(monitor.accountAuthorized)
+        monitor.refresh()
+        monitor.prepareForSleep()
+        monitor.resumeAfterWake()
+        monitor.toggleCharging()
+        drainCallbacks()
+        XCTAssertEqual(hw.writes, [], "standing by never writes")
+        XCTAssertNil(monitor.lastError)
+
+        hw.competing = nil
+        monitor.refresh()
+        drainCallbacks()
+        XCTAssertNil(monitor.chargeControlHold)
+        XCTAssertTrue(monitor.accountAuthorized)
+        let pid = ProcessInfo.processInfo.processIdentifier
+        XCTAssertEqual(Array(hw.writes.prefix(3)), ["nodischarge", "inhibit", "spawn-watchdog:\(pid)"],
+                       "takeover runs the same reconciliation as a launch")
+        XCTAssertTrue(monitor.chargingPaused)
+    }
+
+    func testTakeoverByAnUnauthorizedAccountPromptsOnceAndThenManages() {
+        let hw = Hardware()
+        hw.competing = "Ampere running as alice"
+        hw.authorized = false
+        let monitor = hw.monitor(startMonitoring: true)
+        XCTAssertEqual(hw.installs, 0, "standing by never prompts")
+        hw.competing = nil
+        monitor.refresh()
+        drainCallbacks()
+        XCTAssertEqual(hw.installs, 1)
+        XCTAssertTrue(monitor.accountAuthorized)
+        XCTAssertNil(monitor.chargeControlHold)
+        XCTAssertEqual(Array(hw.writes.prefix(2)), ["nodischarge", "inhibit"])
+    }
+
+    func testDeclinedTakeoverPromptHoldsChargeControlUntilTheNextGrant() {
+        let hw = Hardware()
+        hw.competing = "Ampere running as alice"
+        hw.authorized = false
+        hw.installSucceeds = false
+        let monitor = hw.monitor(startMonitoring: true)
+        hw.competing = nil
+        monitor.refresh()
+        monitor.refresh()
+        monitor.prepareForSleep()
+        monitor.resumeAfterWake()
+        drainCallbacks()
+        XCTAssertEqual(hw.installs, 1, "one prompt per takeover, not one per poll")
+        XCTAssertEqual(monitor.chargeControlHold, .accessDeclined)
+        XCTAssertFalse(monitor.standingBy, "the controls stay available so a click can grant access")
+        XCTAssertFalse(monitor.accountAuthorized)
+        XCTAssertEqual(hw.writes, [])
+
+        hw.installSucceeds = true
+        monitor.toggleCharging()
+        awaitCondition { monitor.chargingPaused }
+        XCTAssertEqual(hw.installs, 2)
+        XCTAssertNil(monitor.chargeControlHold)
+        XCTAssertTrue(monitor.accountAuthorized)
+        XCTAssertEqual(hw.writes.first, "inhibit")
+    }
+
+    func testStandingByBlocksRevokeAndTheRestoreAtQuit() {
+        let hw = Hardware()
+        hw.competing = "Ampere running as alice"
+        let monitor = hw.monitor(startMonitoring: true)
+        monitor.removeSudoRule()
+        drainCallbacks()
+        XCTAssertEqual(monitor.lastError, "Charge control is in use by Ampere running as alice; revoke from that account")
+        monitor.restoreBeforeTermination()
+        XCTAssertEqual(hw.writes, [])
     }
 
     func testLaunchWithFullBatteryBelowLowerBoundDoesNotAllowCharging() {

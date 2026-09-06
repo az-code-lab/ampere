@@ -4,7 +4,23 @@ import Shared
 /// The migration runs inside the existing administrator prompt. Stage and
 /// verify the replacement before retiring the old helper; never run the
 /// legacy executable from its potentially writable directory as root.
+///
+/// The sudoers file holds one line per account that has granted access.
+/// Installing rewrites every existing line with the new digest and path,
+/// so an upgrade prompts only the first account to launch it; revoking
+/// drops only the current account's line and deletes the helper once no
+/// account remains.
 enum HelperSetup {
+    /// awk condition selecting the lines this app wrote for accounts other
+    /// than `user`: exactly our rule shape, for the current or the legacy
+    /// helper path, first occurrence per account. Everything else is
+    /// dropped when the file is rewritten, so it stays canonical.
+    private static let otherAccountRules = "NF == 5 && $1 != user"
+        + " && $1 ~ /^[A-Za-z0-9_][A-Za-z0-9_.-]*$/"
+        + " && $2 == \"ALL=(root)\" && $3 == \"NOPASSWD:\""
+        + " && length($4) == 71 && $4 ~ /^sha256:[0-9a-f]+$/"
+        + " && ($5 == helper || $5 == legacy) && !seen[$1]++"
+
     static func quote(_ value: String) -> String {
         "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
@@ -44,7 +60,12 @@ enum HelperSetup {
         /usr/sbin/chown root:wheel "$stage/helper"
         actual=$(/usr/bin/shasum -a 256 "$stage/helper" | /usr/bin/awk '{print $1}')
         [ "$actual" = \(quote(digest)) ]
-        /usr/bin/printf '%s' \(quote(rule)) > "$stage/sudoers"
+        {
+            if [ -f \(quote(paths.sudoers)) ]; then
+                /usr/bin/awk -v user=\(quote(username)) -v digest=\(quote(digest)) -v helper="$helper" -v legacy=\(quote(paths.legacy)) '\(otherAccountRules) { print $1 " ALL=(root) NOPASSWD: sha256:" digest " " helper }' \(quote(paths.sudoers))
+            fi
+            /usr/bin/printf '%s' \(quote(rule))
+        } > "$stage/sudoers"
         /bin/chmod 0440 "$stage/sudoers"
         /usr/sbin/chown root:wheel "$stage/sudoers"
         /usr/sbin/visudo -cf "$stage/sudoers"
@@ -61,16 +82,38 @@ enum HelperSetup {
         """
     }
 
-    static func removalScript(paths: Paths = Paths(),
+    static func removalScript(username: String, paths: Paths = Paths(),
                               stateDirectory: String = AppConstants.stateDirPath,
                               legacyMarkers: [String] = [AppConstants.legacySavedSleepPath,
                                                          AppConstants.legacySavedDisplaySleepPath]) -> String {
-        // && is intentional: a restore failure retains both the executable
-        // and the saved settings, along with its still-running watchdog.
-        return "\(quote(paths.helper)) restore"
-            + " && \(quote(paths.helper)) remove-legacy"
-            + " && /bin/rm -f \(quote(paths.sudoers)) \(quote(paths.helper))"
-            + legacyMarkers.map { " " + quote($0) }.joined()
-            + " && /bin/rm -rf \(quote(stateDirectory))"
+        let sudoersDirectory = (paths.sudoers as NSString).deletingLastPathComponent
+        return """
+        set -eu
+        umask 022
+        helper=\(quote(paths.helper))
+        sudoers=\(quote(paths.sudoers))
+        # A restore failure stops here, keeping the executable, the saved
+        # settings, and the still-running watchdog for a retry.
+        "$helper" restore
+        "$helper" remove-legacy
+        remaining=''
+        if [ -f "$sudoers" ]; then
+            remaining=$(/usr/bin/awk -v user=\(quote(username)) -v helper="$helper" -v legacy=\(quote(paths.legacy)) '\(otherAccountRules) { print }' "$sudoers")
+        fi
+        if [ -n "$remaining" ]; then
+            # Other accounts still use the helper: drop only this account's
+            # line. sudo ignores the dotted staging name until it is moved.
+            stage=$(/usr/bin/mktemp \(quote(sudoersDirectory + "/.az-ampere.XXXXXX")))
+            trap '/bin/rm -f "$stage"' EXIT
+            /usr/bin/printf '%s\\n' "$remaining" > "$stage"
+            /bin/chmod 0440 "$stage"
+            /usr/sbin/chown root:wheel "$stage"
+            /usr/sbin/visudo -cf "$stage"
+            /bin/mv -f "$stage" "$sudoers"
+        else
+            /bin/rm -f "$sudoers" "$helper"\(legacyMarkers.map { " " + quote($0) }.joined())
+            /bin/rm -rf \(quote(stateDirectory))
+        fi
+        """
     }
 }
