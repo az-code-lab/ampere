@@ -5,6 +5,16 @@ import IOKit.ps
 import IOKit.pwr_mgt
 import Shared
 
+/// Persistence is injected so integration tests can exercise real callbacks
+/// without changing the user's settings or invoking privileged operations.
+protocol BatteryPreferences: AnyObject {
+    func bool(forKey key: String) -> Bool
+    func object(forKey key: String) -> Any?
+    func set(_ value: Any?, forKey key: String)
+    func removeObject(forKey key: String)
+}
+
+extension UserDefaults: BatteryPreferences {}
 
 struct BatteryState: Equatable {
     let percentage: Int
@@ -41,6 +51,34 @@ struct BatteryState: Equatable {
 }
 
 final class BatteryMonitor: ObservableObject {
+    struct IO {
+        var battery: () -> BatteryState? = BatteryMonitor.readBattery
+        var lidClosed: () -> Bool = BatteryMonitor.readClamshellClosed
+        var sleepDisabled: () -> Bool = readSleepDisabledFlag
+        var readKey: (String) -> [UInt8]? = BatteryMonitor.smcReadKey
+        var writeHelper: (String) -> Bool = BatteryMonitor.executeHelper
+        var helperInstalled: () -> Bool = {
+            FileManager.default.fileExists(atPath: AppConstants.sudoersPath)
+                && HelperSecurity.isProtected(path: AppConstants.helperPath)
+        }
+        var helperAuthorized: () -> Bool = BatteryMonitor.checkHelperAuthorization
+        var helperStale: () -> Bool = BatteryMonitor.helperNeedsUpdate
+        var installHelper: () -> Bool = BatteryMonitor.installSudo
+        var setupRefusal: () -> String? = BatteryMonitor.helperSetupRefusal
+        var runAsAdmin: (String) -> Bool = BatteryMonitor.runAsAdmin
+    }
+
+    private let defaults: BatteryPreferences
+    private let io: IO
+    /// Changes to user intent or the AC session invalidate an in-flight
+    /// decision's saved intentions, but not the hardware write it completed.
+    private var controlRevision: UInt64 = 0
+    private var requestedChargingPaused: Bool? {
+        didSet { if oldValue != requestedChargingPaused { controlRevision &+= 1 } }
+    }
+    private var preparingForSleep = false
+    private var terminating = false
+    private var wakeReassertPending = false
     @Published var state: BatteryState?
     @Published var chargingPaused: Bool = false
     @Published var activeDischarging: Bool = false
@@ -51,10 +89,16 @@ final class BatteryMonitor: ObservableObject {
     /// refresh() reconciles the two, retrying failed ops every tick.
     @Published var sleepHoldActive: Bool = false
     @Published var autoDischargeEnabled: Bool {
-        didSet { UserDefaults.standard.set(autoDischargeEnabled, forKey: "autoDischargeEnabled") }
+        didSet {
+            if oldValue != autoDischargeEnabled { controlRevision &+= 1 }
+            defaults.set(autoDischargeEnabled, forKey: "autoDischargeEnabled")
+        }
     }
     @Published var chargeToUpperBound: Bool {
-        didSet { UserDefaults.standard.set(chargeToUpperBound, forKey: "chargeToUpperBound") }
+        didSet {
+            if oldValue != chargeToUpperBound { controlRevision &+= 1 }
+            defaults.set(chargeToUpperBound, forKey: "chargeToUpperBound")
+        }
     }
     /// One-shot "Charge to Full" override. While set, the effective upper
     /// bound is 100 — the configured bounds are untouched. Cleared by the
@@ -63,7 +107,10 @@ final class BatteryMonitor: ObservableObject {
     /// auto-manage is disabled. Persisted so an in-progress full charge
     /// resumes across restart/crash.
     @Published var chargeToFull: Bool {
-        didSet { UserDefaults.standard.set(chargeToFull, forKey: "chargeToFull") }
+        didSet {
+            if oldValue != chargeToFull { controlRevision &+= 1 }
+            defaults.set(chargeToFull, forKey: "chargeToFull")
+        }
     }
     /// The charge ceiling currently in force: 100 while "Charge to Full" is
     /// active, otherwise the configured upper bound. UI labels and ETA/
@@ -75,7 +122,7 @@ final class BatteryMonitor: ObservableObject {
     /// @AppStorage because AppDelegate (not the SwiftUI tree) renders the
     /// menu bar item and needs a change signal via objectWillChange.
     @Published var showMenuBarPercent: Bool {
-        didSet { UserDefaults.standard.set(showMenuBarPercent, forKey: "showMenuBarPercent") }
+        didSet { defaults.set(showMenuBarPercent, forKey: "showMenuBarPercent") }
     }
     /// Keep-awake toggle: hold a powerd assertion (the caffeinate
     /// mechanism) that prevents idle system sleep while the adapter is
@@ -87,11 +134,11 @@ final class BatteryMonitor: ObservableObject {
     /// persists but the assertion is released (see
     /// keepAwakeAssertionDesired); the display still sleeps normally.
     @Published var keepAwakeEnabled: Bool {
-        didSet { UserDefaults.standard.set(keepAwakeEnabled, forKey: "keepAwakeEnabled") }
+        didSet { defaults.set(keepAwakeEnabled, forKey: "keepAwakeEnabled") }
     }
     /// Session length in minutes; 0 = no deadline (hold until toggled off).
     @Published var keepAwakeMinutes: Int {
-        didSet { UserDefaults.standard.set(keepAwakeMinutes, forKey: "keepAwakeMinutes") }
+        didSet { defaults.set(keepAwakeMinutes, forKey: "keepAwakeMinutes") }
     }
     /// Wall-clock end of the current keep-awake session; nil while off or
     /// for a Forever session. Persisted as an absolute date so a restart
@@ -140,7 +187,20 @@ final class BatteryMonitor: ObservableObject {
 
     @Published var autoManageEnabled: Bool {
         didSet {
-            UserDefaults.standard.set(autoManageEnabled, forKey: "autoManageEnabled")
+            if oldValue != autoManageEnabled { controlRevision &+= 1 }
+            if oldValue && !autoManageEnabled {
+                chargeToUpperBound = false
+                chargeToFull = false
+                // Resume a paused charge, including one whose inhibit is
+                // still in flight and has not updated chargingPaused yet;
+                // refresh() serializes the request. Nothing is queued
+                // otherwise: the rollback after a cancelled admin prompt
+                // must not leave behind a request that can never succeed.
+                if chargingPaused || autoManageInFlight {
+                    requestedChargingPaused = false
+                }
+            }
+            defaults.set(autoManageEnabled, forKey: "autoManageEnabled")
         }
     }
     /// Minimum gap between charge bounds, matches the slider's `minGap`.
@@ -169,6 +229,7 @@ final class BatteryMonitor: ObservableObject {
 
     @Published var chargeLowerBound: Int {
         didSet {
+            if oldValue != chargeLowerBound { controlRevision &+= 1 }
             if chargeBoundsLocked && chargeLowerBound != Self.defaultChargeLowerBound {
                 // Locked: the only legal value is the default. Reset both
                 // ends together instead of fixing this one in place, so the
@@ -178,18 +239,19 @@ final class BatteryMonitor: ObservableObject {
             else if chargeLowerBound > chargeUpperBound - Self.chargeBoundMinGap {
                 chargeLowerBound = chargeUpperBound - Self.chargeBoundMinGap
             }
-            UserDefaults.standard.set(chargeLowerBound, forKey: "chargeLowerBound")
+            defaults.set(chargeLowerBound, forKey: "chargeLowerBound")
         }
     }
     @Published var chargeUpperBound: Int {
         didSet {
+            if oldValue != chargeUpperBound { controlRevision &+= 1 }
             if chargeBoundsLocked && chargeUpperBound != Self.defaultChargeUpperBound {
                 resetChargeBoundsToDefaults()
             } else if chargeUpperBound > 100 { chargeUpperBound = 100 }
             else if chargeUpperBound < chargeLowerBound + Self.chargeBoundMinGap {
                 chargeUpperBound = chargeLowerBound + Self.chargeBoundMinGap
             }
-            UserDefaults.standard.set(chargeUpperBound, forKey: "chargeUpperBound")
+            defaults.set(chargeUpperBound, forKey: "chargeUpperBound")
         }
     }
 
@@ -269,7 +331,8 @@ final class BatteryMonitor: ObservableObject {
     private var sleepHoldIntent: Bool = false {
         didSet {
             guard oldValue != sleepHoldIntent else { return }
-            UserDefaults.standard.set(sleepHoldIntent, forKey: "sleepHoldIntent")
+            controlRevision &+= 1
+            defaults.set(sleepHoldIntent, forKey: "sleepHoldIntent")
         }
     }
     private var refreshCount = 0
@@ -283,11 +346,12 @@ final class BatteryMonitor: ObservableObject {
             // Skip the UserDefaults write when the value didn't actually
             // change — refresh re-assigns this every cycle.
             guard oldValue != lastAdapterConnected else { return }
+            controlRevision &+= 1
             // Encode nil as absence; only persist concrete true/false.
             if let v = lastAdapterConnected {
-                UserDefaults.standard.set(v, forKey: "lastAdapterConnected")
+                defaults.set(v, forKey: "lastAdapterConnected")
             } else {
-                UserDefaults.standard.removeObject(forKey: "lastAdapterConnected")
+                defaults.removeObject(forKey: "lastAdapterConnected")
             }
         }
     }
@@ -316,10 +380,12 @@ final class BatteryMonitor: ObservableObject {
     /// `chargeBoundsLocked`: true for an unregistered copy, so the bounds are
     /// pinned to the defaults from the launch-time SMC decision onward (see
     /// the property).
-    init(chargeBoundsLocked: Bool) {
+    init(chargeBoundsLocked: Bool, defaults: BatteryPreferences = UserDefaults.standard,
+         io: IO = IO(), startMonitoring: Bool = true) {
+        self.defaults = defaults
+        self.io = io
         self.chargeBoundsLocked = chargeBoundsLocked
         // Load persisted auto-manage settings
-        let defaults = UserDefaults.standard
         let autoManage = defaults.bool(forKey: "autoManageEnabled")
         self.autoManageEnabled = autoManage
         self.autoDischargeEnabled = defaults.bool(forKey: "autoDischargeEnabled")
@@ -419,18 +485,27 @@ final class BatteryMonitor: ObservableObject {
         // set it to true if shouldInhibit applies. Not persisted — always
         // derived fresh from the rule conditions at launch.
         chargingPaused = false
-        // If the helper is missing or out-of-date, install (or update) it.
+        guard startMonitoring else { return }
+        // Install/update the helper or authorize this macOS account.
         // brew uninstall would have removed the helper; a fresh app build
         // would have a different helper binary. The install prompts for
         // admin via osascript; cancellation terminates the app.
-        if !isSudoRuleInstalled || isHelperStale {
-            NSLog("Ampere: Helper %@, installing…", !isSudoRuleInstalled ? "missing" : "stale")
-            if !installSudo() {
+        if !isSudoRuleInstalled || io.helperStale() || !io.helperAuthorized() {
+            NSLog("Ampere: Helper needs installation, update, or authorization")
+            if !io.installHelper() {
                 NSLog("Ampere: Helper install failed or cancelled, quitting")
+                // A refusal never showed a prompt, so do not send the user
+                // back to enter a password; say what blocks the install.
+                let refusal = io.setupRefusal()
                 DispatchQueue.main.async {
                     let alert = NSAlert()
-                    alert.messageText = "Admin Access Required"
-                    alert.informativeText = "Ampere needs admin access to install its helper tool. Please relaunch and enter your admin password."
+                    if let refusal {
+                        alert.messageText = "Helper Setup Failed"
+                        alert.informativeText = refusal
+                    } else {
+                        alert.messageText = "Admin Access Required"
+                        alert.informativeText = "Ampere needs admin access to install its helper tool. Please relaunch and enter your admin password."
+                    }
                     alert.alertStyle = .critical
                     alert.runModal()
                     NSApp.terminate(nil)
@@ -443,7 +518,7 @@ final class BatteryMonitor: ObservableObject {
             // succeeded — a failed read returns nil and `?? 0` would falsely
             // claim "below lower bound", silently overwriting the persisted
             // chargeToUpperBound value next time around.
-            let launchBattery = Self.readBattery()
+            let launchBattery = self.io.battery()
             let launchPercentage = launchBattery?.percentage ?? 0
             // Crash-recovery sanity: chargeToUpperBound=true is only valid below
             // the upper bound. A crash between the state machine's CHTE=inhibit
@@ -474,7 +549,9 @@ final class BatteryMonitor: ObservableObject {
             // restart.
             let shouldInhibit = autoManageEnabled
                 && launchBattery != nil
-                && launchPercentage >= chargeLowerBound
+                && (launchPercentage >= chargeLowerBound
+                    || Self.reachedBound(effectiveUpperBound, percentage: launchPercentage,
+                                         fullyCharged: launchBattery?.fullyCharged ?? false))
                 && !chargeToUpperBound
                 && !chargeToFull
             if shouldInhibit {
@@ -487,7 +564,7 @@ final class BatteryMonitor: ObservableObject {
                 // otherwise a quit-and-restart mid-charge wouldn't see the
                 // intent saved, breaking the "in-progress charge resumes"
                 // promise the README makes for this path.
-                UserDefaults.standard.set(true, forKey: "chargeToUpperBound")
+                defaults.set(true, forKey: "chargeToUpperBound")
             }
             // Cleanup runs synchronously here so the SMC is in the
             // expected state by the time refresh() starts dispatching
@@ -541,194 +618,68 @@ final class BatteryMonitor: ObservableObject {
             forName: NSApplication.willTerminateNotification,
             object: nil, queue: .main
         ) { [weak self] _ in
-            guard let self = self else { return }
-            guard self.chargingPaused || self.activeDischarging || self.sleepHoldActive else { return }
-
-            // Capture on the main thread; the block below runs on smcQueue.
-            let wasDischarging = self.activeDischarging
-            let wasHolding = self.sleepHoldActive
-            let done = DispatchSemaphore(value: 0)
-            self.smcQueue.async {
-                // Always restore system defaults on quit.
-                // Use runSMCWriteViaSudo directly to avoid stopDischarge()
-                // spawning a redundant watchdog during shutdown.
-                if wasDischarging {
-                    _ = self.runSMCWriteViaSudo("nodischarge")
-                } else if wasHolding {
-                    // Mutually exclusive with discharge (and nodischarge
-                    // restores the same markers), but a plain quit mid-hold
-                    // takes this branch: put the user's sleep settings back
-                    // before exiting.
-                    _ = self.runSMCWriteViaSudo("release-sleep-hold")
-                }
-                // CHTE=allow unconditionally (not just when chargingPaused):
-                // a discharge can be active before the state machine has
-                // marked chargingPaused, and firmware on some Macs flips
-                // CHTE during discharge — either way, quit must leave the
-                // system at its default. nodischarge above pkills the
-                // watchdog, so nothing re-cleans after we exit.
-                _ = self.runSMCWriteViaSudo("allow")
-
-                done.signal()
-            }
-            _ = done.wait(timeout: .now() + 6.0)
+            self?.restoreBeforeTermination()
         }
-
-        // Pause an in-progress charge just before the system sleeps. The app
-        // is suspended during sleep, so a charge left in "allow" sails past
-        // the upper bound (the SMC keeps charging while the Mac sleeps); the
-        // wake handler below re-asserts "allow" for unpaused states, which
-        // resumes the charge where it left off. Deliberately SMC-only — the
-        // in-memory state is untouched, so a poll completion that lands
-        // after this handler can't diverge from it, and the wake re-assert
-        // reconciles CHTE from the unchanged state.
-        //
-        // Below the lower bound the sleep hold normally absorbs the sleep
-        // before this can fire; if it fires there anyway (hold arming raced
-        // the lid close, or arming failed), CHTE is left alone: charging
-        // through sleep and correcting on wake beats stranding the battery
-        // below the lower bound all night. Charge-to-full also charges
-        // through sleep — its ceiling is 100%, so there is no overshoot.
         sleepObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.willSleepNotification,
             object: nil, queue: .main
         ) { [weak self] _ in
-            guard let self = self, self.isSudoRuleInstalled else { return }
-            guard self.autoManageEnabled, !self.chargingPaused,
-                  !self.chargeToFull, !self.activeDischarging else { return }
-            guard let battery = Self.readBattery(), battery.adapterConnected,
-                  battery.percentage >= self.chargeLowerBound else { return }
-            // Synchronous on the main thread on purpose: the system holds
-            // sleep until notification handlers return, and the write takes
-            // well under a second. smcQueue.sync serializes behind any
-            // in-flight SMC dispatch so the pause is the last write to land
-            // before sleep.
-            let ok = self.smcQueue.sync { self.runSMCWrite(.inhibit) }
-            if ok {
-                NSLog("Ampere: Pre-sleep pause at %d%% — charge resumes on wake", battery.percentage)
-            } else {
-                NSLog("Ampere: Pre-sleep pause failed — charge may overshoot during sleep")
-            }
+            self?.prepareForSleep()
         }
-
-        // Re-assert SMC state on wake — firmware or PD renegotiation can reset
-        // CHTE during sleep, allowing charging to bypass micro-charge prevention.
-        // Delegate to evaluateAutoManageStep so rule 1/2/3 transitions are
-        // handled consistently with refresh() and don't race against it.
         wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didWakeNotification,
             object: nil, queue: .main
         ) { [weak self] _ in
-            guard let self = self, self.isSudoRuleInstalled else { return }
-            // Take the same in-flight token every other SMC dispatch site
-            // uses, so the wake write can't interleave with a concurrent
-            // timer-refresh dispatch. If one is already in flight, skip —
-            // its completion refresh() re-runs the state machine anyway.
-            guard !self.autoManageInFlight else {
-                NSLog("Ampere: System wake — SMC op in flight, deferring to refresh")
-                return
-            }
-            NSLog("Ampere: System wake — re-asserting SMC state")
-            self.autoManageInFlight = true
-
-            // Capture all state on main queue to avoid cross-queue reads.
-            let activeDischarging = self.activeDischarging
-            let chargingPausedSnapshot = self.chargingPaused
-            let priorState = AutoManageState(
-                chargingPaused: chargingPausedSnapshot,
-                chargeToUpperBound: self.chargeToUpperBound,
-                chargeToFull: self.chargeToFull,
-                lastAdapterConnected: self.lastAdapterConnected,
-                sleepHold: self.sleepHoldIntent
-            )
-            let autoManageEnabledSnapshot = self.autoManageEnabled
-            let lower = self.chargeLowerBound
-            let upper = self.chargeUpperBound
-
-            self.smcQueue.async {
-                if activeDischarging {
-                    if !self.startDischarge() {
-                        NSLog("Ampere: Wake — failed to re-assert active discharge state")
-                        // startDischarge's internal nodischarge killed any
-                        // existing watchdog; if the discharge:PID step then
-                        // failed, no new watchdog was spawned. Re-spawn one
-                        // so crash safety isn't lost until next refresh.
-                        let pid = ProcessInfo.processInfo.processIdentifier
-                        let okWatchdog = self.runSMCWriteViaSudo("spawn-watchdog:\(pid)")
-                        if !okWatchdog {
-                            NSLog("Ampere: Wake — watchdog respawn after failed discharge restart also failed")
-                        }
-                    }
-                    DispatchQueue.main.async {
-                        self.autoManageInFlight = false
-                        self.refresh()
-                    }
-                    return
-                }
-
-                guard let battery = Self.readBattery() else {
-                    DispatchQueue.main.async {
-                        self.autoManageInFlight = false
-                        self.refresh()
-                    }
-                    return
-                }
-
-                let inputs = AutoManageInputs(
-                    autoManageEnabled: autoManageEnabledSnapshot,
-                    adapterConnected: battery.adapterConnected,
-                    percentage: battery.percentage,
-                    lowerBound: lower,
-                    upperBound: upper,
-                    fullyCharged: battery.fullyCharged,
-                    lidClosed: Self.readClamshellClosed()
-                )
-                let decision = BatteryMonitor.evaluateAutoManageStep(
-                    state: priorState, inputs: inputs
-                )
-
-                // Determine the SMC op to write. An explicit transition from
-                // the pure function wins. Otherwise re-assert the CHTE value
-                // the current state expects: inhibit when paused (a firmware-
-                // induced reset during sleep must not bypass micro-charge
-                // prevention), allow when unpaused (the pre-sleep pause wrote
-                // inhibit without touching state, and this is what resumes
-                // the charge; also corrects a firmware flip the other way).
-                // Sleep-hold pmset reconciliation stays refresh()'s job — the
-                // refresh scheduled below runs it.
-                let op: SMCWriteOp?
-                switch decision.action {
-                case .allow:   op = .allow
-                case .inhibit: op = .inhibit
-                case .none:    op = chargingPausedSnapshot ? .inhibit : .allow
-                }
-
-                if let op = op {
-                    let ok = self.runSMCWrite(op)
-                    DispatchQueue.main.async {
-                        self.autoManageInFlight = false
-                        // Only mirror the state-machine's decision into
-                        // in-memory state if the SMC write actually landed.
-                        // Otherwise we'd report "paused" while CHTE still
-                        // allows charging (or vice versa) — divergence the
-                        // next refresh/health-check would have to clean up.
-                        if ok, decision.action != .none {
-                            self.chargingPaused = decision.newState.chargingPaused
-                            self.chargeToUpperBound = decision.newState.chargeToUpperBound
-                            self.chargeToFull = decision.newState.chargeToFull
-                            NSLog("Ampere: Wake — auto-manage %@ at %d%%",
-                                  op == .allow ? "allow" : "inhibit", battery.percentage)
-                        }
-                        self.refresh()
-                    }
-                } else {
-                    DispatchQueue.main.async {
-                        self.autoManageInFlight = false
-                        self.refresh()
-                    }
-                }
-            }
+            self?.resumeAfterWake()
         }
+    }
+
+    func restoreBeforeTermination() {
+        terminating = true
+        guard isSudoRuleInstalled else { return }
+        let done = DispatchSemaphore(value: 0)
+        smcQueue.async {
+            // A single helper transaction restores both SMC keys and sleep
+            // before retiring the watchdog. Failure leaves it alive to retry
+            // after this app exits. Queueing also covers an in-flight write
+            // that has not published chargingPaused/activeDischarging yet.
+            _ = self.runSMCWriteViaSudo("restore")
+            done.signal()
+        }
+        _ = done.wait(timeout: .now() + 6)
+    }
+
+    /// Block new poll-driven writes before draining those already queued.
+    /// chargingPaused may still be true while an allow is in flight, so it
+    /// must not gate the final inhibit. The last write also honors a newer
+    /// full-charge or manual-resume request whose callback is still pending.
+    func prepareForSleep() {
+        preparingForSleep = true
+        smcQueue.sync {}
+        guard isSudoRuleInstalled, let battery = io.battery(), battery.adapterConnected else { return }
+        let pause: Bool
+        if autoManageEnabled {
+            // Between bounds, pause until wake. Full-charge and below-lower
+            // sessions may charge through sleep, as documented.
+            pause = Self.reachedBound(effectiveUpperBound, percentage: battery.percentage,
+                                      fullyCharged: battery.fullyCharged)
+                || (!chargeToFull && battery.percentage >= chargeLowerBound)
+        } else if let requested = requestedChargingPaused {
+            pause = requested
+        } else {
+            return
+        }
+        let ok = smcQueue.sync { runSMCWrite(pause ? .inhibit : .allow) }
+        NSLog("Ampere: Pre-sleep %@ at %d%% %@", pause ? "pause" : "resume",
+              battery.percentage, ok ? "applied" : "failed")
+    }
+
+    func resumeAfterWake() {
+        preparingForSleep = false
+        // Keep this pending if another callback still owns the in-flight
+        // token. Its completion refresh will perform the re-assertion.
+        wakeReassertPending = true
+        refresh()
     }
 
     deinit {
@@ -875,17 +826,14 @@ final class BatteryMonitor: ObservableObject {
     // MARK: - Sudo Setup
 
     /// Check if the passwordless sudoers rule and helper binary are installed
-    var isSudoRuleInstalled: Bool {
-        FileManager.default.fileExists(atPath: Self.sudoersPath)
-            && FileManager.default.fileExists(atPath: Self.helperPath)
-    }
+    var isSudoRuleInstalled: Bool { io.helperInstalled() }
 
     /// Check if the installed helper differs from the bundled one. Returns
     /// `false` when either side can't be read — we can't reinstall what we
     /// don't have, so callers should fall through and use whatever helper
     /// is currently installed. The bundled-side miss is logged once per
     /// check because in a release build it indicates a corrupted bundle.
-    private var isHelperStale: Bool {
+    private static func helperNeedsUpdate() -> Bool {
         guard let installed = try? Data(contentsOf: URL(fileURLWithPath: Self.helperPath)) else {
             return false
         }
@@ -896,71 +844,35 @@ final class BatteryMonitor: ObservableObject {
         return installed != bundled
     }
 
-    /// Remove the sudoers rule and helper binary.
-    /// If charging is paused, resumes charging via sudo BEFORE removing the rule.
+    /// Restore charging and sleep before removing the privileged files.
     func removeSudoRule() {
-        let wasPaused = self.chargingPaused
-        let wasDischarging = self.activeDischarging
+        guard !autoManageInFlight else {
+            lastError = "Charge control is busy — try revoking access again in a moment"
+            return
+        }
+        autoManageInFlight = true
         smcQueue.async { [weak self] in
-            guard let self = self else { return }
-
-            // Also remove the saved-pmset state dir and any legacy /tmp
-            // markers — the nodischarge below has already restored sleep
-            // settings, so leftover markers would only mislead a future
-            // install into "restoring" values from a stale session.
-            let cmd = "rm -f \(Self.shQuote(Self.sudoersPath)) \(Self.shQuote(Self.helperPath))"
-                + " \(Self.shQuote(AppConstants.legacySavedSleepPath))"
-                + " \(Self.shQuote(AppConstants.legacySavedDisplaySleepPath))"
-                + " && rm -rf \(Self.shQuote(AppConstants.stateDirPath))"
-
-            // Always clear all SMC state BEFORE removing the helper (need sudo access).
-            // Use unconditional writes since in-memory state may not reflect actual SMC state.
-            _ = self.runSMCWriteViaSudo("nodischarge")
-            _ = self.runSMCWriteViaSudo("allow")
-
-            let ok = self.runAsAdmin(cmd)
-
+            guard let self else { return }
+            // Restoration and removal share the one existing admin prompt.
+            // This also works when the sudoers rule belongs to another user.
+            let ok = HelperSecurity.isProtected(path: Self.helperPath)
+                && self.io.runAsAdmin(HelperSetup.removalScript())
             DispatchQueue.main.async {
+                self.autoManageInFlight = false
                 if ok && !self.isSudoRuleInstalled {
                     self.autoManageEnabled = false
                     self.autoDischargeEnabled = false
                     self.chargeToUpperBound = false
                     self.chargeToFull = false
+                    self.requestedChargingPaused = nil
                     self.chargingPaused = false
                     self.activeDischarging = false
-                    // The nodischarge above restored sleep from the markers
-                    // (hold and discharge share them), and the state dir is
-                    // gone — nothing is held anymore.
                     self.sleepHoldActive = false
                     self.sleepHoldIntent = false
-                    // Clear any stale error — the user just acted on the
-                    // common "revoke and re-grant admin access" guidance.
                     self.lastError = nil
-                    self.recheckHealth()
+                    self.healthWarning = nil
                 } else {
-                    // Removal failed or was cancelled — restore previous SMC
-                    // state. The nodischarge command above pkill'd the
-                    // launch-time watchdog, so we must respawn one or the
-                    // app has no crash safety net for the rest of the session.
-                    // startDischarge spawns its own watchdog; the !wasDischarging
-                    // branch must respawn manually.
-                    //
-                    // The nodischarge also consumed the sleep markers, so any
-                    // engaged sleep hold is factually released — record that,
-                    // and the next refresh re-arms it from the intact intent.
-                    self.sleepHoldActive = false
-                    self.smcQueue.async {
-                        if wasPaused { self.runSMCWrite(.inhibit) }
-                        if wasDischarging {
-                            _ = self.startDischarge()
-                        } else {
-                            let pid = ProcessInfo.processInfo.processIdentifier
-                            let okWatchdog = self.runSMCWriteViaSudo("spawn-watchdog:\(pid)")
-                            if !okWatchdog {
-                                NSLog("Ampere: Watchdog spawn failed during removeSudoRule rollback — crash safety net not installed")
-                            }
-                        }
-                    }
+                    self.lastError = "Admin access was not revoked. Cleanup must succeed before the helper can be removed."
                 }
             }
         }
@@ -968,8 +880,10 @@ final class BatteryMonitor: ObservableObject {
 
     /// Run shell commands as root via osascript "with administrator privileges".
     /// Shows the native macOS password dialog (one-time setup only).
-    private func runAsAdmin(_ commands: String) -> Bool {
-        let escaped = commands.replacingOccurrences(of: "\"", with: "\\\"")
+    private static func runAsAdmin(_ commands: String) -> Bool {
+        let escaped = commands.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: "\\n")
         let script = "do shell script \"\(escaped)\" with administrator privileges"
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
@@ -992,72 +906,56 @@ final class BatteryMonitor: ObservableObject {
     }
 
     /// Path to the SMCWriter binary (lightweight, no AppKit/SwiftUI)
-    private var smcWriterPath: String {
+    private static var smcWriterPath: String {
         let mainBinary = Bundle.main.executablePath ?? ProcessInfo.processInfo.arguments[0]
         // SMCWriter is a sibling executable in the same build directory
         return (mainBinary as NSString).deletingLastPathComponent + "/SMCWriter"
     }
 
-    /// Single-quote a string for safe use in a shell command, escaping any
-    /// embedded single quotes via the `'\''` idiom.
-    private static func shQuote(_ s: String) -> String {
-        "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    /// Why the helper cannot be installed at all, or nil when it can.
+    /// Checked before the administrator prompt; init shows the reason
+    /// instead of asking for a password that was never requested.
+    static func helperSetupRefusal() -> String? {
+        if !HelperSecurity.canInstall(in: AppConstants.helperDirectory) {
+            return "\(AppConstants.helperDirectory), or a directory above it, is not owned by root or can be modified by other users, so a root helper cannot be installed there safely. Fix its ownership and permissions, then relaunch Ampere."
+        }
+        if NSUserName().range(of: #"^[A-Za-z0-9_][A-Za-z0-9_.-]*$"#,
+                              options: .regularExpression) == nil {
+            return "The account name \"\(NSUserName())\" cannot be written into a sudoers rule. Charge control needs an account whose short name contains only letters, digits, periods, underscores, and hyphens."
+        }
+        if !FileManager.default.isReadableFile(atPath: smcWriterPath) {
+            return "The bundled helper is missing from Ampere.app. Reinstall Ampere."
+        }
+        return nil
     }
 
-    /// Install the SMCWriter binary at a root-owned fixed path, plus a sudoers rule.
-    /// Shows the native macOS password dialog (one-time).
-    private func installSudo() -> Bool {
-        // Digest-pin the sudoers rule to the exact binary being installed. A
-        // path-only NOPASSWD rule trusts whatever sits at helperPath — if the
-        // directory is ever non-root-writable (e.g. a migrated Intel-Homebrew
-        // /usr/local), swapping the binary would grant passwordless root.
-        // sudo verifies the digest on every invocation; a helper update
-        // rewrites the binary and this rule together, so they can't drift.
-        // (cp/xattr/chmod/chown don't alter the data fork, so the digest of
-        // the bundled source equals the digest of the installed copy.)
+    /// Install into the protected directory and migrate the old helper in
+    /// the same administrator prompt used for every normal helper update.
+    private static func installSudo() -> Bool {
+        if let refusal = helperSetupRefusal() {
+            NSLog("Ampere: Helper setup refused: %@", refusal)
+            return false
+        }
         guard let helperData = try? Data(contentsOf: URL(fileURLWithPath: smcWriterPath)) else {
-            NSLog("Ampere: bundled SMCWriter unreadable at %@ — cannot install", smcWriterPath)
+            NSLog("Ampere: bundled SMCWriter unreadable at %@", smcWriterPath)
             return false
         }
         let digest = SHA256.hash(data: helperData).map { String(format: "%02x", $0) }.joined()
-        let writer = Self.shQuote(smcWriterPath)
-        let helper = Self.shQuote(Self.helperPath)
-        let sudoers = Self.shQuote(Self.sudoersPath)
-        let rule = Self.shQuote("\(NSUserName()) ALL=(root) NOPASSWD: sha256:\(digest) \(Self.helperPath)\n")
-        let cmd = [
-            "mkdir -p /usr/local/bin",
-            "cp \(writer) \(helper)",
-            "xattr -cr \(helper)",
-            "chmod 0755 \(helper)",
-            "chown root:wheel \(helper)",
-            "printf '%s' \(rule) > \(sudoers)",
-            "chmod 0440 \(sudoers)",
-        ].joined(separator: " && ")
-
-        return runAsAdmin(cmd)
+        let script = HelperSetup.installScript(writer: smcWriterPath, digest: digest,
+            username: NSUserName(), appPID: ProcessInfo.processInfo.processIdentifier)
+        return runAsAdmin(script) && checkHelperAuthorization()
     }
 
     /// Ensure sudo helper is installed (prompts for password on background queue).
     /// Calls completion on the main queue with success/failure.
     func ensureSudoInstalled(completion: @escaping (Bool) -> Void) {
-        if isSudoRuleInstalled && !isHelperStale {
+        if isSudoRuleInstalled && !io.helperStale() && io.helperAuthorized() {
             completion(true)
             return
         }
         smcQueue.async { [weak self] in
-            let ok = self?.installSudo() ?? false
-            // If install succeeded, spawn a watchdog right away — the
-            // launch-time watchdog was likely killed by a previous
-            // removeSudoRule (which runs nodischarge), and refresh()
-            // doesn't re-spawn on its own. Without this, the app would
-            // have no crash safety net until the next launch.
-            if ok, let self = self {
-                let pid = ProcessInfo.processInfo.processIdentifier
-                let okWatchdog = self.runSMCWriteViaSudo("spawn-watchdog:\(pid)")
-                if !okWatchdog {
-                    NSLog("Ampere: Watchdog spawn failed after install — crash safety net not installed")
-                }
-            }
+            let ok = self?.io.installHelper() ?? false
+            // The setup transaction already installed a fresh watchdog.
             DispatchQueue.main.async {
                 NSApp.activate(ignoringOtherApps: true)
                 if ok {
@@ -1084,33 +982,32 @@ final class BatteryMonitor: ObservableObject {
     /// PID and cleans up if the app dies.
     private func startDischarge() -> Bool {
         // Clean up any stale watchdog/CHIE/sleep state first
-        _ = runSMCWriteViaSudo("nodischarge")
+        guard runSMCWriteViaSudo("nodischarge") else { return false }
 
         let ok = runSMCWriteViaSudo("discharge:\(ProcessInfo.processInfo.processIdentifier)")
         if ok {
             NSLog("Ampere: discharge daemon started")
+        } else if !runSMCWriteViaSudo("spawn-watchdog:\(ProcessInfo.processInfo.processIdentifier)") {
+            // The successful nodischarge retired the previous watchdog.
+            // Restore crash recovery even if discharge could not start.
+            NSLog("Ampere: Watchdog respawn after failed discharge start also failed")
         }
         return ok
     }
 
-    /// Stop discharge: clear CHIE, kill watchdog, restore sleep, then re-spawn
+    /// Stop discharge: clear CHIE, restore sleep, retire the watchdog, then re-spawn
     /// a watchdog so CHTE is still protected if the app is killed. Returns
     /// the success of the primary `nodischarge` write; logs but does not fail
     /// the overall call if only the watchdog respawn failed.
     private func stopDischarge() -> Bool {
-        let ok = runSMCWriteViaSudo("nodischarge")
+        // Failure preserves the current watchdog; do not create a duplicate.
+        guard runSMCWriteViaSudo("nodischarge") else { return false }
         let watchdogOk = runSMCWriteViaSudo("spawn-watchdog:\(ProcessInfo.processInfo.processIdentifier)")
         if !watchdogOk {
-            if ok {
-                NSLog("Ampere: nodischarge succeeded but watchdog respawn failed — CHTE protection on crash may be lost")
-            } else {
-                NSLog("Ampere: nodischarge failed AND watchdog respawn failed — discharge state may be stuck and no crash safety")
-            }
+            NSLog("Ampere: nodischarge succeeded but watchdog respawn failed — CHTE protection on crash may be lost")
         }
-        if ok {
-            NSLog("Ampere: discharge stopped")
-        }
-        return ok
+        NSLog("Ampere: discharge stopped")
+        return true
     }
 
     /// Run a high-level SMC operation via the sudoers helper (no password
@@ -1129,10 +1026,22 @@ final class BatteryMonitor: ObservableObject {
         }
     }
 
-    private func runSMCWriteViaSudo(_ arg: String) -> Bool {
+    private func runSMCWriteViaSudo(_ arg: String) -> Bool { io.writeHelper(arg) }
+
+    private static func checkHelperAuthorization() -> Bool {
+        // -k ignores cached sudo credentials for this command. Success
+        // therefore proves passwordless access for the current account.
+        executeHelper("check", ignoreCachedCredentials: true)
+    }
+
+    private static func executeHelper(_ arg: String) -> Bool {
+        executeHelper(arg, ignoreCachedCredentials: false)
+    }
+
+    private static func executeHelper(_ arg: String, ignoreCachedCredentials: Bool) -> Bool {
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
-        task.arguments = [Self.helperPath, arg]
+        task.arguments = ["-n"] + (ignoreCachedCredentials ? ["-k"] : []) + [Self.helperPath, arg]
         let errPipe = Pipe()
         task.standardInput = FileHandle.nullDevice
         task.standardError = errPipe
@@ -1141,9 +1050,10 @@ final class BatteryMonitor: ObservableObject {
         task.standardOutput = FileHandle.nullDevice
         do {
             try task.run()
+            let errorData = errPipe.fileHandleForReading.readDataToEndOfFile()
             task.waitUntilExit()
             if task.terminationStatus == 0 { return true }
-            let errMsg = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            let errMsg = String(data: errorData, encoding: .utf8) ?? ""
             // Include the helper arg and exit status — the previous log
             // ("sudo failed: %@") swallowed both when stderr was empty.
             NSLog("Ampere: sudo failed (arg=%@ status=%d): %@", arg, task.terminationStatus, errMsg)
@@ -1258,9 +1168,9 @@ final class BatteryMonitor: ObservableObject {
     private func setKeepAwakeDeadline(_ date: Date?) {
         keepAwakeDeadline = date
         if let date {
-            UserDefaults.standard.set(date.timeIntervalSince1970, forKey: "keepAwakeDeadline")
+            defaults.set(date.timeIntervalSince1970, forKey: "keepAwakeDeadline")
         } else {
-            UserDefaults.standard.removeObject(forKey: "keepAwakeDeadline")
+            defaults.removeObject(forKey: "keepAwakeDeadline")
         }
         scheduleKeepAwakeExpiry()
     }
@@ -1464,7 +1374,7 @@ final class BatteryMonitor: ObservableObject {
         // charge there. Pure arm, no SMC action: unpaused means CHTE is
         // already in the allow state.
         if !next.chargingPaused, !next.chargeToUpperBound, !next.chargeToFull,
-           inputs.percentage < inputs.lowerBound {
+           inputs.percentage < inputs.lowerBound, !reached(inputs.upperBound) {
             next.chargeToUpperBound = true
         }
 
@@ -1486,7 +1396,7 @@ final class BatteryMonitor: ObservableObject {
             // Between bounds without charge-to-upper/-full → inhibit (rule 3).
             next.chargingPaused = true
             action = .inhibit
-        } else if next.chargingPaused
+        } else if next.chargingPaused && !reached(effectiveUpper)
                     && (inputs.percentage < inputs.lowerBound
                         || next.chargeToUpperBound || next.chargeToFull) {
             // Below lower bound (rule 1) or explicit charge-to-upper/-full → allow.
@@ -1511,7 +1421,7 @@ final class BatteryMonitor: ObservableObject {
         // Charge-to-full is exempt: its ceiling is 100%, so sleep-charging
         // cannot overshoot, and an overnight full charge should sleep.
         if next.chargeToUpperBound, !next.chargeToFull,
-           inputs.percentage < inputs.lowerBound {
+           inputs.percentage < inputs.lowerBound, !reached(effectiveUpper) {
             next.sleepHold = true
         } else if next.sleepHold,
                   !next.chargeToUpperBound || next.chargeToFull
@@ -1541,8 +1451,12 @@ final class BatteryMonitor: ObservableObject {
         chargeLevel: Int, lowerBound: Int, upperBound: Int,
         dischargeEnabled: Bool, activeDischarging: Bool,
         chargeToUpperBound: Bool,
-        chie: Int, chte: Int
+        chie: Int, chte: Int, fullyCharged: Bool = false
     ) -> Bool {
+        if !(dischargeEnabled && activeDischarging),
+           reachedBound(upperBound, percentage: chargeLevel, fullyCharged: fullyCharged) {
+            return chte == SMC.chteInhibitInt && chie == SMC.chieNormalInt
+        }
         if dischargeEnabled {
             // The discharge daemon's CHIE=0x08 write persists as long as it's
             // running; activeDischarging tracks the daemon's lifetime, not
@@ -1569,9 +1483,7 @@ final class BatteryMonitor: ObservableObject {
             }
         } else {
             guard chie == SMC.chieNormalInt else { return false }
-            if chargeLevel >= upperBound {
-                return chte == SMC.chteInhibitInt
-            } else if chargeLevel >= lowerBound {
+            if chargeLevel >= lowerBound {
                 if chargeToUpperBound {
                     return chte == SMC.chteAllowInt
                 } else {
@@ -1588,9 +1500,13 @@ final class BatteryMonitor: ObservableObject {
         autoManageEnabled: Bool, pauseButtonPaused: Bool,
         chargeLevel: Int, lowerBound: Int, upperBound: Int,
         dischargeEnabled: Bool, activeDischarging: Bool,
-        chargeToUpperBound: Bool
+        chargeToUpperBound: Bool, fullyCharged: Bool = false
     ) -> (chte: String, chie: String) {
         if autoManageEnabled {
+            if !(dischargeEnabled && activeDischarging),
+               reachedBound(upperBound, percentage: chargeLevel, fullyCharged: fullyCharged) {
+                return (SMC.chteInhibitHex, SMC.chieNormalHex)
+            }
             if dischargeEnabled {
                 // Gate on activeDischarging alone — see comment in
                 // healthCheckAutoMode for the boundary-window rationale.
@@ -1606,9 +1522,7 @@ final class BatteryMonitor: ObservableObject {
                     return (SMC.chteAllowHex, SMC.chieNormalHex)
                 }
             } else {
-                if chargeLevel >= upperBound {
-                    return (SMC.chteInhibitHex, SMC.chieNormalHex)
-                } else if chargeLevel >= lowerBound {
+                if chargeLevel >= lowerBound {
                     if chargeToUpperBound {
                         return (SMC.chteAllowHex, SMC.chieNormalHex)
                     } else {
@@ -1687,8 +1601,9 @@ final class BatteryMonitor: ObservableObject {
     }
 
     func refresh() {
+        guard !preparingForSleep, !terminating else { return }
         refreshCount += 1
-        var battery = Self.readBattery()
+        var battery = self.io.battery()
         // Publish unconditionally on every refresh — early returns below
         // dispatch SMC actions and exit, and on failure the dispatch's
         // callback intentionally does NOT recurse into refresh(). Without
@@ -1767,8 +1682,9 @@ final class BatteryMonitor: ObservableObject {
 
         // Auto-discharge: start when above upper bound, stop when reached
         if autoManageEnabled, autoDischargeEnabled, !autoManageInFlight, let b = battery, b.adapterConnected {
-            if !activeDischarging && b.percentage > chargeUpperBound {
+            if (!activeDischarging || wakeReassertPending) && b.percentage > chargeUpperBound {
                 autoManageInFlight = true
+                wakeReassertPending = false
                 // Capture pct/upper at dispatch time so the log can't lie if
                 // the user changes the upper bound while the SMC write is in
                 // flight — matches the state-machine dispatch's pattern.
@@ -1777,17 +1693,6 @@ final class BatteryMonitor: ObservableObject {
                 smcQueue.async { [weak self] in
                     guard let self = self else { return }
                     let ok = self.runSMCWrite(.discharge)
-                    if !ok {
-                        // startDischarge killed the existing watchdog before
-                        // running discharge:PID; if that step failed, no new
-                        // watchdog was spawned. Respawn so crash safety isn't
-                        // lost until next refresh tick.
-                        let pid = ProcessInfo.processInfo.processIdentifier
-                        let okWatchdog = self.runSMCWriteViaSudo("spawn-watchdog:\(pid)")
-                        if !okWatchdog {
-                            NSLog("Ampere: Watchdog respawn after failed auto-discharge start also failed")
-                        }
-                    }
                     DispatchQueue.main.async {
                         self.autoManageInFlight = false
                         if ok {
@@ -1823,6 +1728,34 @@ final class BatteryMonitor: ObservableObject {
             }
         }
 
+        if let pause = requestedChargingPaused, !autoManageInFlight, !activeDischarging {
+            autoManageInFlight = true
+            // This write also satisfies any pending wake re-assertion.
+            // Consume it now so a failed request cannot retry in a loop.
+            wakeReassertPending = false
+            smcQueue.async { [weak self] in
+                guard let self else { return }
+                let ok = self.runSMCWrite(pause ? .inhibit : .allow)
+                DispatchQueue.main.async {
+                    self.autoManageInFlight = false
+                    let requestChanged = self.requestedChargingPaused != pause
+                    if ok {
+                        self.chargingPaused = pause
+                        if self.requestedChargingPaused == pause { self.requestedChargingPaused = nil }
+                        self.lastError = nil
+                    } else {
+                        // One attempt per request. Retrying every poll would
+                        // spawn a failing sudo per tick and keep pre-empting
+                        // the state machine and health check all session.
+                        if self.requestedChargingPaused == pause { self.requestedChargingPaused = nil }
+                        self.lastError = "Charge control failed — revoke and re-grant admin access"
+                    }
+                    if ok || requestChanged || self.wakeReassertPending { self.refresh() }
+                }
+            }
+            return
+        }
+
         // Auto-manage state machine — delegated to the pure decision function
         // so behavior can be exercised by unit tests. This block handles rules
         // 1/2/3: below-lower → charge-to-upper, disconnect-above-lower → clear
@@ -1842,7 +1775,7 @@ final class BatteryMonitor: ObservableObject {
                 lowerBound: chargeLowerBound,
                 upperBound: chargeUpperBound,
                 fullyCharged: b.fullyCharged,
-                lidClosed: Self.readClamshellClosed()
+                lidClosed: self.io.lidClosed()
             )
             let decision = BatteryMonitor.evaluateAutoManageStep(
                 state: priorState, inputs: stepInputs
@@ -1899,7 +1832,7 @@ final class BatteryMonitor: ObservableObject {
             // external holder that justified restoring "1" is evidently
             // gone).
             if sleepHoldActive, decision.newState.sleepHold, !activeDischarging,
-               !readSleepDisabledFlag() {
+               !io.sleepDisabled() {
                 sleepHoldActive = false
                 NSLog("Ampere: Sleep hold cleared externally at %d%% — re-arming", b.percentage)
             }
@@ -1914,8 +1847,11 @@ final class BatteryMonitor: ObservableObject {
             // release is a clean no-op.
             let holdOpNeeded = !activeDischarging
                 && decision.newState.sleepHold != sleepHoldActive
-            if (decision.action != .none || holdOpNeeded), !autoManageInFlight {
+            if (decision.action != .none || holdOpNeeded || wakeReassertPending), !autoManageInFlight {
                 autoManageInFlight = true
+                let reassert = wakeReassertPending
+                wakeReassertPending = false
+                let revision = controlRevision
                 let pct = b.percentage
                 // Log the target the machine actually decided on — 100 while
                 // charge-to-full survives this step, else the configured bound.
@@ -1924,7 +1860,7 @@ final class BatteryMonitor: ObservableObject {
                 switch decision.action {
                 case .allow:   op = .allow
                 case .inhibit: op = .inhibit
-                case .none:    op = nil
+                case .none:    op = reassert ? (decision.newState.chargingPaused ? .inhibit : .allow) : nil
                 }
                 let next = decision.newState
                 smcQueue.async { [weak self] in
@@ -1940,6 +1876,7 @@ final class BatteryMonitor: ObservableObject {
                     }
                     DispatchQueue.main.async {
                         self.autoManageInFlight = false
+                        let intentChanged = self.controlRevision != revision
                         if holdApplied {
                             self.sleepHoldActive = next.sleepHold
                             NSLog("Ampere: Sleep hold %@ at %d%%",
@@ -1947,9 +1884,14 @@ final class BatteryMonitor: ObservableObject {
                         }
                         if ok {
                             self.chargingPaused = next.chargingPaused
-                            self.chargeToUpperBound = next.chargeToUpperBound
-                            self.chargeToFull = next.chargeToFull
-                            self.sleepHoldIntent = next.sleepHold
+                            // The hardware operation completed even if the
+                            // user changed their mind. Preserve newer intent
+                            // and let refresh reconcile it against that fact.
+                            if !intentChanged {
+                                self.chargeToUpperBound = next.chargeToUpperBound
+                                self.chargeToFull = next.chargeToFull
+                                self.sleepHoldIntent = next.sleepHold
+                            }
                             switch decision.action {
                             case .inhibit:
                                 NSLog("Ampere: Inhibited charging at %d%%", pct)
@@ -1964,7 +1906,7 @@ final class BatteryMonitor: ObservableObject {
                         // next timer tick — the decision inputs are
                         // unchanged, so an immediate refresh would re-issue
                         // the same op and tight-loop.
-                        if ok, !holdOpNeeded || holdApplied {
+                        if (ok && (!holdOpNeeded || holdApplied)) || intentChanged || self.wakeReassertPending {
                             self.refresh()
                         }
                     }
@@ -2016,6 +1958,7 @@ final class BatteryMonitor: ObservableObject {
                         self.autoManageInFlight = false
                         if okAllow { self.chargingPaused = false }
                         if okNoDischarge { self.activeDischarging = false }
+                        if (okAllow && okNoDischarge) || self.wakeReassertPending { self.refresh() }
                     }
                 }
             }
@@ -2037,8 +1980,8 @@ final class BatteryMonitor: ObservableObject {
     }
 
     private func performHealthCheck(battery: BatteryState) {
-        guard let chteBytes = Self.smcReadKey(SMC.keyChargeTerminate), chteBytes.count == 4,
-              let chieBytes = Self.smcReadKey(SMC.keyChargeInhibit), chieBytes.count == 1 else {
+        guard let chteBytes = io.readKey(SMC.keyChargeTerminate), chteBytes.count == 4,
+              let chieBytes = io.readKey(SMC.keyChargeInhibit), chieBytes.count == 1 else {
             // Cannot read SMC — preserve any existing warning rather than
             // clearing it. Log it: without this the check silently never
             // completes and About shows "pending" with no clue why.
@@ -2065,7 +2008,7 @@ final class BatteryMonitor: ObservableObject {
                 dischargeEnabled: autoDischargeEnabled,
                 activeDischarging: activeDischarging,
                 chargeToUpperBound: chargeToUpperBound || chargeToFull,
-                chie: chie, chte: chte
+                chie: chie, chte: chte, fullyCharged: battery.fullyCharged
             )
         } else {
             healthy = Self.healthCheckManualMode(
@@ -2096,7 +2039,8 @@ final class BatteryMonitor: ObservableObject {
                 upperBound: effectiveUpperBound,
                 dischargeEnabled: autoDischargeEnabled,
                 activeDischarging: activeDischarging,
-                chargeToUpperBound: chargeToUpperBound || chargeToFull
+                chargeToUpperBound: chargeToUpperBound || chargeToFull,
+                fullyCharged: battery.fullyCharged
             )
             newExpected = "\(SMC.keyChargeTerminate)=\(expected.chte)\n\(SMC.keyChargeInhibit)=\(expected.chie)"
             newCHTEMatch = chteHex == expected.chte
@@ -2121,6 +2065,7 @@ final class BatteryMonitor: ObservableObject {
                 chteRepairAttempted = true
                 autoManageInFlight = true
                 let pct = battery.percentage
+                let revision = controlRevision
                 smcQueue.async { [weak self] in
                     guard let self else { return }
                     let ok = self.runSMCWrite(op)
@@ -2129,6 +2074,9 @@ final class BatteryMonitor: ObservableObject {
                         NSLog("Ampere: Health check CHTE repair (%@) at %d%% %@",
                               op == .inhibit ? "inhibit" : "allow", pct,
                               ok ? "applied" : "failed")
+                        if self.controlRevision != revision || self.wakeReassertPending {
+                            self.refresh()
+                        }
                     }
                 }
             } else {
@@ -2163,7 +2111,7 @@ final class BatteryMonitor: ObservableObject {
 
     /// Re-run the health check immediately (e.g. after revoke/re-grant admin).
     private func recheckHealth() {
-        guard let battery = Self.readBattery() else { return }
+        guard let battery = self.io.battery() else { return }
         performHealthCheck(battery: battery)
     }
 
@@ -2396,6 +2344,7 @@ final class BatteryMonitor: ObservableObject {
     func setChargeToFull(_ on: Bool) {
         if on {
             if autoDischargeEnabled { autoDischargeEnabled = false }
+            requestedChargingPaused = nil
             chargeToFull = true
             refresh()
         } else {
@@ -2404,68 +2353,28 @@ final class BatteryMonitor: ObservableObject {
         }
     }
 
-    /// Re-inhibit charging (e.g. when user toggles off "Charge to Upper Bound" mid-charge).
+    /// Explicit cancellation is queued even while an earlier allow is in
+    /// flight. The shared dispatcher applies it after that write completes.
     func inhibitCharging() {
-        guard !chargingPaused else { return }
-        smcQueue.async { [weak self] in
-            guard let self = self else { return }
-            // Use runSMCWrite (not runSMCWriteViaSudo) so the missing-helper
-            // case logs a clearer message and matches the pattern used by
-            // toggleCharging / refresh / wake observer.
-            let ok = self.runSMCWrite(.inhibit)
-            DispatchQueue.main.async {
-                if ok {
-                    self.chargingPaused = true
-                    NSLog("Ampere: Re-inhibited charging")
-                    self.refresh()
-                } else {
-                    // Surface the failure so the user notices instead of
-                    // silently observing charging continuing after they
-                    // toggled charge-to-upper off.
-                    self.lastError = "Failed to inhibit charging — revoke and re-grant admin access"
-                }
-                // On failure: don't refresh. The state-machine would just
-                // re-dispatch the same inhibit and tight-loop. Next timer
-                // tick will reconcile.
-            }
-        }
+        requestedChargingPaused = true
+        refresh()
     }
 
     func toggleCharging() {
-        let shouldPause = !chargingPaused
+        let shouldPause = !(requestedChargingPaused ?? chargingPaused)
         if shouldPause {
-            // Fresh read rather than the published `state`: with the popover
-            // closed the snapshot can be a full slow-poll interval (60s) old
-            // and miss a just-unplugged adapter. Fall back to the snapshot
-            // if the fresh read fails.
-            guard let battery = Self.readBattery() ?? state, battery.adapterConnected else {
+            guard let battery = io.battery() ?? state, battery.adapterConnected else {
                 lastError = Self.noAdapterError
                 return
             }
         }
-
-        // Ensure sudo helper is installed first (one-time admin prompt)
         ensureSudoInstalled { [weak self] ok in
-            guard let self = self, ok else {
+            guard let self, ok else {
                 self?.lastError = "Admin access required to control charging"
                 return
             }
-            self.smcQueue.async {
-                let op: SMCWriteOp = shouldPause ? .inhibit : .allow
-                let ok = self.runSMCWrite(op)
-                DispatchQueue.main.async {
-                    if ok {
-                        self.chargingPaused = shouldPause
-                        self.lastError = nil
-                        NSLog("Ampere: Charging %@", shouldPause ? "paused" : "resumed")
-                    } else {
-                        self.lastError = "Charge control failed — revoke and re-grant admin access"
-                    }
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
-                        self.refresh()
-                    }
-                }
-            }
+            self.requestedChargingPaused = shouldPause
+            self.refresh()
         }
     }
 }

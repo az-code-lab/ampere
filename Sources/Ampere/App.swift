@@ -1150,9 +1150,6 @@ struct ContentView: View {
                         // from a failed prior enable) is no longer relevant
                         // once the user has disabled auto-manage.
                         monitor.lastError = nil
-                        if monitor.chargingPaused {
-                            monitor.toggleCharging()
-                        }
                         // If a discharge is active, refresh()'s
                         // "!autoManageEnabled" branch stops it (CHIE + sleep
                         // restore) immediately rather than on the next tick —
