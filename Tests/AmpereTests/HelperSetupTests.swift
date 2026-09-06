@@ -109,15 +109,19 @@ final class HelperSetupTests: XCTestCase {
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: fixture.paths.directory), [])
     }
 
-    func testFailedRestoreKeepsLegacyInstallAndStartsRecoveryFromNewHelper() throws {
+    /// The rule must land even when cleanup fails: without it every later
+    /// launch would prompt, fail the same way, and quit. The saved settings
+    /// stay for the launch cleanup and the new watchdog to retry.
+    func testFailedRestoreStillInstallsRuleAndStartsRecoveryFromNewHelper() throws {
         let fixture = try Fixture()
         try Data().write(to: fixture.failRestore)
         let result = try run(fixture.install())
-        XCTAssertNotEqual(result.status, 0)
-        XCTAssertEqual(fixture.calls, ["restore", "spawn-watchdog:123"])
+        XCTAssertEqual(result.status, 0, result.output)
+        XCTAssertEqual(fixture.calls, ["restore", "remove-legacy", "spawn-watchdog:123"])
         XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.paths.helper))
-        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.paths.legacy))
-        XCTAssertEqual(try String(contentsOfFile: fixture.paths.sudoers), "old sudoers")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.paths.legacy))
+        XCTAssertEqual(try String(contentsOfFile: fixture.paths.sudoers),
+                       "test_user ALL=(root) NOPASSWD: sha256:\(fixture.digest) \(fixture.paths.helper)\n")
         XCTAssertEqual(try String(contentsOf: fixture.marker), "17 29")
     }
 

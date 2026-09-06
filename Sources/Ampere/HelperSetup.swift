@@ -50,9 +50,13 @@ enum HelperSetup {
         /usr/sbin/visudo -cf "$stage/sudoers"
         /bin/mv -f "$stage/helper" "$helper"
         installed=1
-        "$helper" restore
         /bin/mkdir -p \(quote((paths.sudoers as NSString).deletingLastPathComponent))
         /bin/mv -f "$stage/sudoers" \(quote(paths.sudoers))
+        # Best effort: the launch cleanup and the watchdog spawned on exit
+        # retry a failed restore. Failing the install instead would leave
+        # the new helper without its rule, and every later launch would
+        # prompt, fail the same way, and quit.
+        "$helper" restore || true
         "$helper" remove-legacy
         """
     }

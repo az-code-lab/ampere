@@ -49,11 +49,11 @@ Download the latest `.dmg` from the [GitHub Releases](https://github.com/az-code
 
 Pausing/resuming charging requires root access to write to the SMC. Ampere handles this as follows:
 
-1. **On launch** - the app installs (or updates) its helper binary. If the helper is missing, outdated, or not authorized for the current account, macOS prompts for your admin password. If cancelled, the app exits.
+1. **On launch** - the app installs (or updates) its helper binary. If the helper is missing, outdated, or not authorized for the current account, macOS prompts for your admin password. If cancelled, the app exits. If the helper cannot be installed at all, for example because the helper directory is writable by other users, the alert explains why instead of asking for a password.
 2. **Setup** - a compiled helper binary (`SMCWriter`) is installed at `/Library/PrivilegedHelperTools/az-ampere-smc` (owned by root), along with a sudoers rule at `/etc/sudoers.d/az-ampere` that allows passwordless execution of the helper. The rule is pinned to the helper's SHA-256 digest. The helper and every directory leading to it are checked for root ownership, write permissions, ACLs, and symlinks, preventing replacement by an ordinary app.
 3. **Subsequent launches** - the helper and the current account's passwordless authorization are verified at startup. If both are current, no password is needed. After a Homebrew upgrade, the new helper is installed automatically (one password prompt).
 
-Upgrading from the former `/usr/local/bin/az-ampere-smc` location migrates the helper during that same administrator prompt. The replacement is verified before installation, restores the previous session's charging and sleep state, and retires the old helper and watchdogs. Preferences, charge bounds, and registration stay intact; no manual migration is needed.
+Upgrading from the former `/usr/local/bin/az-ampere-smc` location migrates the helper during that same administrator prompt. The replacement is verified before installation, restores the previous session's charging and sleep state, and retires the old helper and watchdogs. A restore failure does not block the installation; the app's launch cleanup and the watchdog retry it. Preferences, charge bounds, and registration stay intact; no manual migration is needed.
 
 > **Note:** Admin access is granted per macOS user account — the sudoers rule names the account that installed it. If another account on the same Mac grants access, the rule is rewritten for that account, and the first account will be prompted for its password again on its next launch.
 

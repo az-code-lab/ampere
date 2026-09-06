@@ -290,20 +290,40 @@ func setDischargeSleepPrevention(enabled: Bool) -> Bool {
         return runPmset(["-a", "sleep", "0", "disablesleep", "1", "displaysleep", "0"])
     }
 
-    // Restore the original values per profile, then put SleepDisabled back
-    // to its captured pre-override value instead of forcing 0 — forcing 0
-    // cancels any OTHER keep-awake tool (e.g. Lidless) whose hold predates
-    // ours, putting a lid-closed Mac to sleep out from under it. The saved
-    // "1" is honored only while the flag still reads 1 (see
-    // restoreSleepDisabled); a missing marker restores 0, matching builds
-    // that predate the marker.
-    let sleep = restoredPmsetValues(savedSleepPaths)
-    let display = restoredPmsetValues(savedDisplaySleepPaths)
+    return restoreSleepSettings(readSavedSleepSettings())
+}
+
+/// The pre-override values as read from the markers. Captured up front by
+/// every restore that delays before applying: the crash watchdog and a
+/// relaunch's cleanup can both pass the marker check, and whichever
+/// finishes first consumes the markers. Re-reading them after the delay
+/// would stamp the 10/10 fallback over the real values the other restore
+/// just put back, while applying the same snapshot twice is harmless.
+struct SavedSleepSettings {
+    let sleep: PmsetProfileValues
+    let display: PmsetProfileValues
+    let disabledMarker: Bool?
+}
+
+func readSavedSleepSettings() -> SavedSleepSettings {
+    SavedSleepSettings(
+        sleep: restoredPmsetValues(savedSleepPaths),
+        display: restoredPmsetValues(savedDisplaySleepPaths),
+        disabledMarker: PmsetState.parseFlagMarker(readMarker(savedSleepDisabledPaths)))
+}
+
+/// Restore the original values per profile, then put SleepDisabled back
+/// to its captured pre-override value instead of forcing 0 — forcing 0
+/// cancels any OTHER keep-awake tool (e.g. Lidless) whose hold predates
+/// ours, putting a lid-closed Mac to sleep out from under it. The saved
+/// "1" is honored only while the flag still reads 1 (see
+/// restoreSleepDisabled); a missing marker restores 0, matching builds
+/// that predate the marker.
+func restoreSleepSettings(_ saved: SavedSleepSettings) -> Bool {
     let disabled = PmsetState.restoreSleepDisabled(
-        marker: PmsetState.parseFlagMarker(readMarker(savedSleepDisabledPaths)),
-        current: readSleepDisabledFlag())
-    let okBattery = runPmset(["-b", "sleep", "\(sleep.battery)", "displaysleep", "\(display.battery)"])
-    let okAC = runPmset(["-c", "sleep", "\(sleep.ac)", "displaysleep", "\(display.ac)"])
+        marker: saved.disabledMarker, current: readSleepDisabledFlag())
+    let okBattery = runPmset(["-b", "sleep", "\(saved.sleep.battery)", "displaysleep", "\(saved.display.battery)"])
+    let okAC = runPmset(["-c", "sleep", "\(saved.sleep.ac)", "displaysleep", "\(saved.display.ac)"])
     let okDisable = runPmset(["-a", "disablesleep", disabled ? "1" : "0"])
     guard okBattery && okAC && okDisable else { return false }
     // Markers are consumed only after every pmset call succeeds — a failed
@@ -341,11 +361,13 @@ if action == "remove-legacy" {
 }
 
 /// Restore only settings we actually overrode. Delay after a CHIE write
-/// before re-enabling clamshell sleep so USB-C PD has time to settle.
+/// before re-enabling clamshell sleep so USB-C PD has time to settle. The
+/// values are read before the delay (see SavedSleepSettings).
 func restoreSavedSleep() -> Bool {
     guard markerExists(savedSleepPaths) else { return true }
+    let saved = readSavedSleepSettings()
     sleep(3)
-    return setDischargeSleepPrevention(enabled: false)
+    return restoreSleepSettings(saved)
 }
 
 /// Retire both generations during migration. Called only after cleanup

@@ -64,6 +64,7 @@ final class BatteryMonitor: ObservableObject {
         var helperAuthorized: () -> Bool = BatteryMonitor.checkHelperAuthorization
         var helperStale: () -> Bool = BatteryMonitor.helperNeedsUpdate
         var installHelper: () -> Bool = BatteryMonitor.installSudo
+        var setupRefusal: () -> String? = BatteryMonitor.helperSetupRefusal
         var runAsAdmin: (String) -> Bool = BatteryMonitor.runAsAdmin
     }
 
@@ -190,9 +191,14 @@ final class BatteryMonitor: ObservableObject {
             if oldValue && !autoManageEnabled {
                 chargeToUpperBound = false
                 chargeToFull = false
-                // Queue a resume even if an in-flight inhibit has not yet
-                // updated chargingPaused. refresh() serializes the request.
-                requestedChargingPaused = false
+                // Resume a paused charge, including one whose inhibit is
+                // still in flight and has not updated chargingPaused yet;
+                // refresh() serializes the request. Nothing is queued
+                // otherwise: the rollback after a cancelled admin prompt
+                // must not leave behind a request that can never succeed.
+                if chargingPaused || autoManageInFlight {
+                    requestedChargingPaused = false
+                }
             }
             defaults.set(autoManageEnabled, forKey: "autoManageEnabled")
         }
@@ -488,10 +494,18 @@ final class BatteryMonitor: ObservableObject {
             NSLog("Ampere: Helper needs installation, update, or authorization")
             if !io.installHelper() {
                 NSLog("Ampere: Helper install failed or cancelled, quitting")
+                // A refusal never showed a prompt, so do not send the user
+                // back to enter a password; say what blocks the install.
+                let refusal = io.setupRefusal()
                 DispatchQueue.main.async {
                     let alert = NSAlert()
-                    alert.messageText = "Admin Access Required"
-                    alert.informativeText = "Ampere needs admin access to install its helper tool. Please relaunch and enter your admin password."
+                    if let refusal {
+                        alert.messageText = "Helper Setup Failed"
+                        alert.informativeText = refusal
+                    } else {
+                        alert.messageText = "Admin Access Required"
+                        alert.informativeText = "Ampere needs admin access to install its helper tool. Please relaunch and enter your admin password."
+                    }
                     alert.alertStyle = .critical
                     alert.runModal()
                     NSApp.terminate(nil)
@@ -898,14 +912,32 @@ final class BatteryMonitor: ObservableObject {
         return (mainBinary as NSString).deletingLastPathComponent + "/SMCWriter"
     }
 
+    /// Why the helper cannot be installed at all, or nil when it can.
+    /// Checked before the administrator prompt; init shows the reason
+    /// instead of asking for a password that was never requested.
+    static func helperSetupRefusal() -> String? {
+        if !HelperSecurity.canInstall(in: AppConstants.helperDirectory) {
+            return "\(AppConstants.helperDirectory), or a directory above it, is not owned by root or can be modified by other users, so a root helper cannot be installed there safely. Fix its ownership and permissions, then relaunch Ampere."
+        }
+        if NSUserName().range(of: #"^[A-Za-z0-9_][A-Za-z0-9_.-]*$"#,
+                              options: .regularExpression) == nil {
+            return "The account name \"\(NSUserName())\" cannot be written into a sudoers rule. Charge control needs an account whose short name contains only letters, digits, periods, underscores, and hyphens."
+        }
+        if !FileManager.default.isReadableFile(atPath: smcWriterPath) {
+            return "The bundled helper is missing from Ampere.app. Reinstall Ampere."
+        }
+        return nil
+    }
+
     /// Install into the protected directory and migrate the old helper in
     /// the same administrator prompt used for every normal helper update.
     private static func installSudo() -> Bool {
-        guard HelperSecurity.canInstall(in: AppConstants.helperDirectory),
-              NSUserName().range(of: #"^[A-Za-z0-9_][A-Za-z0-9_.-]*$"#,
-                                 options: .regularExpression) != nil,
-              let helperData = try? Data(contentsOf: URL(fileURLWithPath: smcWriterPath)) else {
-            NSLog("Ampere: Helper setup refused — destination is not protected or bundled helper is unavailable")
+        if let refusal = helperSetupRefusal() {
+            NSLog("Ampere: Helper setup refused: %@", refusal)
+            return false
+        }
+        guard let helperData = try? Data(contentsOf: URL(fileURLWithPath: smcWriterPath)) else {
+            NSLog("Ampere: bundled SMCWriter unreadable at %@", smcWriterPath)
             return false
         }
         let digest = SHA256.hash(data: helperData).map { String(format: "%02x", $0) }.joined()
@@ -1712,6 +1744,10 @@ final class BatteryMonitor: ObservableObject {
                         if self.requestedChargingPaused == pause { self.requestedChargingPaused = nil }
                         self.lastError = nil
                     } else {
+                        // One attempt per request. Retrying every poll would
+                        // spawn a failing sudo per tick and keep pre-empting
+                        // the state machine and health check all session.
+                        if self.requestedChargingPaused == pause { self.requestedChargingPaused = nil }
                         self.lastError = "Charge control failed — revoke and re-grant admin access"
                     }
                     if ok || requestChanged || self.wakeReassertPending { self.refresh() }

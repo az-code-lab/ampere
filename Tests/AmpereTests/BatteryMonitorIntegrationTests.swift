@@ -114,6 +114,7 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
                 return true
             }
             io.runAsAdmin = { _ in XCTFail("Unexpected administrator command"); return false }
+            io.setupRefusal = { nil }
             return BatteryMonitor(chargeBoundsLocked: locked, defaults: preferences,
                                   io: io, startMonitoring: startMonitoring)
         }
@@ -296,9 +297,41 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         monitor.resumeAfterWake()
         awaitCondition { hw.writes.count >= 3 }
         drainCallbacks()
-        XCTAssertEqual(hw.writes, ["inhibit", "inhibit", "inhibit"],
-                       "One attempt for the request, sleep, and wake; no continuous retries")
+        XCTAssertEqual(hw.writes, ["inhibit", "inhibit", "allow"],
+                       "One attempt for the request and one pre-sleep pause; the failed request is dropped, so wake re-asserts the unpaused state")
         XCTAssertNotNil(monitor.lastError)
+        XCTAssertFalse(monitor.chargingPaused)
+    }
+
+    func testFailedManualRequestIsNotRetriedOnLaterPolls() {
+        let hw = Hardware()
+        hw.preferences.values["autoManageEnabled"] = false
+        let monitor = hw.monitor()
+        monitor.toggleCharging()
+        awaitCondition { monitor.chargingPaused }
+        hw.fail("allow")
+        monitor.toggleCharging()
+        awaitCondition { monitor.lastError != nil }
+        for _ in 0..<3 { monitor.refresh() }
+        drainCallbacks()
+        XCTAssertEqual(hw.writes, ["inhibit", "allow"])
+        XCTAssertTrue(monitor.chargingPaused)
+    }
+
+    /// The Auto Charge toggle's rollback after a cancelled admin prompt
+    /// turns auto-manage off with no usable helper. That must not queue a
+    /// resume: it could never succeed, and each attempt would replace the
+    /// accurate error with advice to revoke access the app does not have.
+    func testCancelledAdminPromptDuringEnableQueuesNoResume() {
+        let hw = Hardware()
+        hw.installed = false
+        let monitor = hw.monitor()
+        monitor.autoManageEnabled = false
+        monitor.lastError = "Admin access required for auto charge"
+        for _ in 0..<3 { monitor.refresh() }
+        drainCallbacks()
+        XCTAssertEqual(hw.writes, [])
+        XCTAssertEqual(monitor.lastError, "Admin access required for auto charge")
     }
 
     func testWakeDuringHealthRepairStillReassertsAfterSleep() {
