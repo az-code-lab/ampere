@@ -754,7 +754,13 @@ final class BatteryMonitor: ObservableObject {
     }
 
     private func checkForUpdate(manual: Bool = false) {
-        let task = URLSession.shared.dataTask(with: Self.caskURL) { [weak self] data, _, error in
+        // A clicked check must not be answered from the app's own URL cache:
+        // the cask is served with a five minute lifetime, so a copy cached
+        // just before a release would report "Up to Date" for that long.
+        // The daily check keeps the default policy; its runs are a day apart.
+        var request = URLRequest(url: Self.caskURL)
+        if manual { request.cachePolicy = .reloadIgnoringLocalCacheData }
+        let task = URLSession.shared.dataTask(with: request) { [weak self] data, _, error in
             guard let self else { return }
             guard error == nil,
                   let data, let content = String(data: data, encoding: .utf8),
