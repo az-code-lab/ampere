@@ -24,6 +24,12 @@ public enum AppConstants {
     /// these so an upgrade with a marker still outstanding restores correctly.
     public static let legacySavedSleepPath = "/tmp/.\(appPrefix)-saved-sleep"
     public static let legacySavedDisplaySleepPath = "/tmp/.\(appPrefix)-saved-sleep-display"
+    /// The app's bundle identifier, as release.sh writes it into Info.plist.
+    public static let appBundleIdentifier = "com.az-code-lab.ampere"
+    /// Root launchd job that uninstalls the helper once the app bundle is
+    /// gone (see CleanupDaemon). Its plist must live outside the bundle.
+    public static let cleanupDaemonLabel = "\(appBundleIdentifier).cleanup"
+    public static let cleanupDaemonPlistPath = "/Library/LaunchDaemons/\(cleanupDaemonLabel).plist"
 }
 
 /// Pack a 4-character SMC key (e.g. "CHTE") into a UInt32 in big-endian

@@ -52,6 +52,7 @@ Pausing/resuming charging requires root access to write to the SMC. Ampere handl
 1. **On launch** - the app installs (or updates) its helper binary. If the helper is missing, outdated, or not authorized for the current account, macOS prompts for your admin password. If cancelled, the app exits. If the helper cannot be installed at all, for example because the helper directory is writable by other users, the alert explains why instead of asking for a password.
 2. **Setup** - a compiled helper binary (`SMCWriter`) is installed at `/Library/PrivilegedHelperTools/az-ampere-smc` (owned by root), along with a sudoers rule at `/etc/sudoers.d/az-ampere` that allows passwordless execution of the helper. The rule is pinned to the helper's SHA-256 digest. The helper and every directory leading to it are checked for root ownership, write permissions, ACLs, and symlinks, preventing replacement by an ordinary app.
 3. **Subsequent launches** - the helper and the current account's passwordless authorization are verified at startup. If both are current, no password is needed. After a Homebrew upgrade, the new helper is installed automatically (one password prompt).
+4. **Cleanup job** - once this account can run the helper, the app registers a root launchd job (`/Library/LaunchDaemons/com.az-code-lab.ampere.cleanup.plist`) that watches the installed `Ampere.app`. Registration goes through the same passwordless rule, so it never prompts. If the bundle stays gone for two minutes and no copy of Ampere is running, the job has the helper restore charging and sleep settings and remove the helper, the sudoers rule, the state directory, the job itself, and every account's preferences, caches, and saved window state, so dragging the app to the Trash or `brew uninstall` leaves nothing behind (see Uninstall). macOS shows a one-time "Background Items Added" notice when the job is first registered and lists it under Ampere in System Settings > General > Login Items & Extensions. Moving `Ampere.app` re-registers the job at the next launch; if the old location stays empty for two minutes before that launch, the helper is uninstalled and the next launch asks for the password again.
 
 Upgrading from the former `/usr/local/bin/az-ampere-smc` location migrates the helper during that same administrator prompt. The replacement is verified before installation, restores the previous session's charging and sleep state, and retires the old helper and watchdogs. A restore failure does not block the installation; the app's launch cleanup and the watchdog retry it. Preferences, charge bounds, and registration stay intact; no manual migration is needed.
 
@@ -192,33 +193,33 @@ swift build -c debug
 
 ## Uninstall
 
-### Remove the app
+Delete `Ampere.app` from Applications, or:
 
 ```bash
 brew uninstall ampere
 ```
 
-Or delete `Ampere.app` from Applications.
-
-### Remove SMCWriter and admin access
-
-Charge control installs privileged files that persist after the app is deleted:
+Quit Ampere first if it is running (Finder refuses to trash a running app; Homebrew quits it). Quitting restores charging and sleep settings. Two minutes after the bundle is gone, the cleanup job removes everything else, so the Mac ends up as if Ampere had never been installed:
 
 - `/Library/PrivilegedHelperTools/az-ampere-smc` - the SMCWriter helper binary (runs as root to write SMC keys)
 - `/etc/sudoers.d/az-ampere` - the sudoers rule that allows passwordless execution of the helper
 - `/Library/Application Support/az-ampere/` - state directory for the saved-sleep markers (only exists if discharge or the mid-charge sleep hold was ever used)
+- `/Library/LaunchDaemons/com.az-code-lab.ampere.cleanup.plist` - the cleanup job itself
+- `~/Library/Preferences/com.az-code-lab.ampere.plist`, `~/Library/Caches/com.az-code-lab.ampere`, `~/Library/HTTPStorages/com.az-code-lab.ampere`, and `~/Library/Saved Application State/com.az-code-lab.ampere.savedState` - preferences (including the registration), the update check's cache, and window state, for every account on the Mac
 
-**From the UI:** Click **Settings** in the panel footer, then **Revoke** on the Admin Access row. This restores charging and sleep settings, then removes your account's sudoers line and, once no other account is authorized, the helper binary and state directory (one administrator prompt). If restoration fails, the files and recovery watchdog remain available and the app reports the failure.
+The job exists once the app has run from that location with admin access granted, and only runs while it is allowed under System Settings > General > Login Items & Extensions. If a restore fails, it keeps everything in place for the watchdog to retry and tries again at the next boot. There is no `zap` stanza; `brew uninstall ampere` alone is the complete removal. Two things stay: the copy of `Ampere.app` in the Trash until you empty it, and the Open at Login entry if you had enabled it, which macOS manages. Switch launch at login off in Settings before uninstalling, or remove the entry under Login Items & Extensions.
 
-**From the command line:** Quit Ampere first, then restore before deleting. This removes access for every account. The `&&` operators stop removal if cleanup fails.
+### Remove everything now
+
+Quit Ampere first. The helper restores charging and sleep settings, then removes every file above and unloads the job; nothing is removed if the restore fails.
 
 ```bash
-sudo /Library/PrivilegedHelperTools/az-ampere-smc restore &&
-sudo /Library/PrivilegedHelperTools/az-ampere-smc remove-legacy &&
-sudo rm -f /Library/PrivilegedHelperTools/az-ampere-smc \
-    /etc/sudoers.d/az-ampere &&
-sudo rm -rf '/Library/Application Support/az-ampere'
+sudo /Library/PrivilegedHelperTools/az-ampere-smc purge
 ```
+
+### Keep the app, drop the admin access
+
+Click **Settings** in the panel footer, then **Revoke** on the Admin Access row. This restores charging and sleep settings, then removes your account's sudoers line and, once no other account is authorized, the helper binary, the state directory, and the cleanup job (one administrator prompt). Preferences stay, since the app does. If restoration fails, the files and recovery watchdog remain available and the app reports the failure. `sudo /Library/PrivilegedHelperTools/az-ampere-smc uninstall` does the same for every account at once and also keeps preferences.
 
 ## Troubleshooting
 
@@ -320,9 +321,19 @@ The watchdog must be spawned with `posix_spawn` (not `fork`) because the Swift/O
 
 On app launch, CHIE and saved sleep settings are restored before existing watchdogs are retired. CHTE is set to inhibit when auto charge is enabled, the battery is at or above the lower bound (or the BMS reports a full battery for a 100% target), and no valid charge-to-upper or charge-to-full session is being resumed; otherwise CHTE is cleared. A fresh watchdog is then spawned. Normal quit uses a single `restore` command that restores both SMC keys and sleep before retiring the watchdog. If cleanup fails, the watchdog remains alive to retry after the app exits.
 
+### Cleanup Job
+
+Nothing runs when `Ampere.app` is dragged to the Trash, and Homebrew's `uninstall` stanza runs during `brew upgrade` as well, so removing the helper there would cost an administrator prompt on every upgrade and removing preferences there would wipe the settings on every upgrade. That is also why the cask has no `zap` stanza. Instead the app registers a root launchd job, `/Library/LaunchDaemons/com.az-code-lab.ampere.cleanup.plist`, that runs the installed helper with `uninstall-if-missing:<bundle path>` at boot (`RunAtLoad`) and whenever the bundle path changes (`WatchPaths`). `AssociatedBundleIdentifiers` lists the job under Ampere in System Settings > General > Login Items & Extensions.
+
+Registration is the `register-daemon:<path>` helper command, run over the account's passwordless rule after the launch cleanup and after a re-grant from the UI, whenever the installed plist does not match the running copy's path. Root accepts only a real copy of the app (`Contents/Info.plist` must carry Ampere's bundle identifier), so an account with helper access cannot make root watch other paths. The app skips registration for a bare debug executable and for a quarantined copy running from macOS's randomized App Translocation mount, whose path would vanish at every quit.
+
+When the job runs it sleeps two minutes, then uninstalls only if the bundle is still missing, its parent directory exists (an unmounted volume proves nothing), and no process named Ampere is running (a running copy was moved, not removed; it re-registers on relaunch). The grace period is what keeps `brew upgrade`, `brew reinstall`, and the in-app updater from triggering it: all three remove and re-create the bundle within seconds.
+
+The helper's `uninstall` command, used by Revoke once no account remains, runs `restore` first and stops there if it fails (exit 2), keeping the helper, the saved settings, and the watchdog. Otherwise it removes the sudoers file, the helper, the pre-0.0.60 helper, the state directory, and the job's plist, then unloads the job. `purge`, which the job runs and which is the manual complete removal, additionally removes each local account's preferences, caches, HTTP storage, and saved window state (accounts from uid 500 up, as the directory service lists them); Revoke never does, because the app stays installed. Run as the job, the helper hands the unload to a detached shell and exits first, since unloading a job terminates its process.
+
 ### Process Architecture
 
-The app cannot write to the SMC directly — it requires root privileges. Instead, it spawns short-lived root processes (`sudo SMCWriter`) for each SMC operation, plus a long-lived watchdog daemon as a safety net that cleans up if the app dies unexpectedly.
+The app cannot write to the SMC directly — it requires root privileges. Instead, it spawns short-lived root processes (`sudo SMCWriter`) for each SMC operation, plus a long-lived watchdog daemon as a safety net that cleans up if the app dies unexpectedly, and a launchd job that uninstalls the helper once the app itself is gone.
 
 ```
 Ampere (GUI, user)
@@ -367,6 +378,18 @@ Ampere (GUI, user)
   |     |-- posix_spawn SMCWriter watchdog   spawn safety net daemon
   |     \-- exit(0)
   |
+  |-- sudo SMCWriter register-daemon:<app>   (one-shot, root)
+  |     |-- write LaunchDaemons plist        watch the installed bundle
+  |     |-- launchctl bootstrap              load the cleanup job
+  |     \-- exit(0)
+  |
+  |-- sudo SMCWriter uninstall | purge       (revoke / manual)
+  |     |-- restore                          as above; failure removes nothing
+  |     |-- rm sudoers, helper, state dir    and the cleanup job's plist
+  |     |-- purge: rm each account's prefs   caches, HTTP storage, saved state
+  |     |-- launchctl bootout                unload the cleanup job
+  |     \-- exit(0)
+  |
   \-- SMCWriter watchdog:<app-pid>           (daemon, root, detached)
         |-- sleep(2) loop                    poll every 2 seconds
         |-- if app PID gone:
@@ -375,6 +398,14 @@ Ampere (GUI, user)
         |     |-- pmset restore sleep        only if save-sleep file exists
         |     \-- exit(0)                    retry on failure
         \-- (runs until app dies)
+
+launchd (root)
+  \-- SMCWriter uninstall-if-missing:<app>   (cleanup job: at boot, on bundle change)
+        |-- sleep(120)                       grace period for upgrades
+        |-- if bundle gone, parent present,  a running copy was only moved
+        |   and no Ampere process running:
+        |     \-- purge                      as above
+        \-- exit(0)
 ```
 
 ## License

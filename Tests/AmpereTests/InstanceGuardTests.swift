@@ -1,5 +1,5 @@
 import XCTest
-@testable import Ampere
+import Shared
 
 final class InstanceGuardTests: XCTestCase {
     func testFindsProcessesByNameWithOwnerAndStartTime() {

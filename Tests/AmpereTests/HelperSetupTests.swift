@@ -41,6 +41,11 @@ final class HelperSetupTests: XCTestCase {
             if [ "$1" = remove-legacy ]; then
                 /bin/rm -f \(HelperSetup.quote(paths.legacy))
             fi
+            if [ "$1" = uninstall ]; then
+                if [ -f \(HelperSetup.quote(failRestore.path)) ]; then exit 2; fi
+                /bin/rm -f \(HelperSetup.quote(marker.path)) \(HelperSetup.quote(paths.helper)) \(HelperSetup.quote(paths.legacy)) \(HelperSetup.quote(paths.sudoers))
+                /bin/rm -rf \(HelperSetup.quote(state.path))
+            fi
             """
             let data = Data(contents.utf8)
             digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
@@ -66,8 +71,7 @@ final class HelperSetupTests: XCTestCase {
 
         func removal() throws -> String {
             try FileManager.default.copyItem(at: writer, to: URL(fileURLWithPath: paths.helper))
-            return HelperSetup.removalScript(username: "test_user", paths: paths,
-                                             stateDirectory: state.path, legacyMarkers: [])
+            return HelperSetup.removalScript(username: "test_user", paths: paths)
                 .replacingOccurrences(of: "/usr/sbin/chown root:wheel", with: "/usr/bin/true")
         }
 
@@ -188,17 +192,20 @@ final class HelperSetupTests: XCTestCase {
         try Data().write(to: fixture.failRestore)
         let result = try run(fixture.removal())
         XCTAssertNotEqual(result.status, 0)
-        XCTAssertEqual(fixture.calls, ["restore"])
+        XCTAssertEqual(fixture.calls, ["uninstall"])
         for path in [fixture.paths.helper, fixture.paths.legacy, fixture.paths.sudoers, fixture.marker.path] {
             XCTAssertTrue(FileManager.default.fileExists(atPath: path), path)
         }
     }
 
-    func testRevokeSuccessRestoresBeforeRemovingPrivilegedFiles() throws {
+    /// The helper's `uninstall` restores before it removes anything (see
+    /// HelperUninstallTests); the last account's Revoke delegates to it so
+    /// the artifact list lives in one place.
+    func testRevokeOfTheLastAccountHandsRemovalToTheHelper() throws {
         let fixture = try Fixture()
         let result = try run(fixture.removal())
         XCTAssertEqual(result.status, 0, result.output)
-        XCTAssertEqual(fixture.calls, ["restore", "remove-legacy"])
+        XCTAssertEqual(fixture.calls, ["uninstall"])
         for path in [fixture.paths.helper, fixture.paths.legacy, fixture.paths.sudoers, fixture.state.path] {
             XCTAssertFalse(FileManager.default.fileExists(atPath: path), path)
         }

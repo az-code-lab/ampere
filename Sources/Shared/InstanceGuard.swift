@@ -7,15 +7,25 @@ import Darwin
 /// would fight: each launch cleanup retires the other's watchdog and rewrites
 /// the charging key, and both keep enforcing their own bounds. The process
 /// that started first keeps control; a later one stands by until it is gone.
-enum InstanceGuard {
-    struct Instance: Equatable {
-        let pid: pid_t
-        let uid: uid_t
-        let startSeconds: Int
-        let startMicroseconds: Int32
+///
+/// Shared with the helper, whose cleanup job must not uninstall anything
+/// while a copy of the app is still running.
+public enum InstanceGuard {
+    public struct Instance: Equatable {
+        public let pid: pid_t
+        public let uid: uid_t
+        public let startSeconds: Int
+        public let startMicroseconds: Int32
+
+        public init(pid: pid_t, uid: uid_t, startSeconds: Int, startMicroseconds: Int32) {
+            self.pid = pid
+            self.uid = uid
+            self.startSeconds = startSeconds
+            self.startMicroseconds = startMicroseconds
+        }
 
         /// Earlier start wins; the PID breaks ties deterministically.
-        func startedBefore(_ other: Instance) -> Bool {
+        public func startedBefore(_ other: Instance) -> Bool {
             if startSeconds != other.startSeconds { return startSeconds < other.startSeconds }
             if startMicroseconds != other.startMicroseconds {
                 return startMicroseconds < other.startMicroseconds
@@ -24,7 +34,7 @@ enum InstanceGuard {
         }
 
         /// How the panel names the process that holds charge control.
-        var owner: String {
+        public var owner: String {
             if uid == getuid() { return "another copy of Ampere in this account" }
             if let entry = getpwuid(uid) {
                 return "Ampere running as \(String(cString: entry.pointee.pw_name))"
@@ -35,10 +45,10 @@ enum InstanceGuard {
 
     /// The process name as the kernel reports it: the executable's file
     /// name, truncated to 16 characters.
-    static let processName = "Ampere"
+    public static let processName = "Ampere"
 
     /// Every process on this Mac with the app's name, for every user.
-    static func runningInstances(named name: String = processName) -> [Instance] {
+    public static func runningInstances(named name: String = processName) -> [Instance] {
         var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0]
         var size = 0
         guard sysctl(&mib, UInt32(mib.count), nil, &size, nil, 0) == 0, size > 0 else { return [] }
@@ -63,7 +73,7 @@ enum InstanceGuard {
     /// The running instance that outranks this process, or nil when this
     /// process should manage charge control. A process that cannot find
     /// itself in the table (a test host, for instance) never stands by.
-    static func competingInstance() -> Instance? {
+    public static func competingInstance() -> Instance? {
         let instances = runningInstances()
         let me = getpid()
         guard let mine = instances.first(where: { $0.pid == me }) else { return nil }

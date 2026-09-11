@@ -338,8 +338,10 @@ func restoreSleepSettings(_ saved: SavedSleepSettings) -> Bool {
 
 // MARK: - Main
 
+let usage = "Usage: smc-writer check|restore|remove-legacy|inhibit|allow|discharge:pid|nodischarge|hold-sleep|release-sleep-hold|spawn-watchdog:pid|watchdog:pid|register-daemon:path|uninstall|purge|uninstall-if-missing:path\n"
+
 guard CommandLine.arguments.count == 2 else {
-    fputs("Usage: smc-writer check|restore|remove-legacy|inhibit|allow|discharge:pid|nodischarge|hold-sleep|release-sleep-hold|spawn-watchdog:pid|watchdog:pid\n", stderr)
+    fputs(usage, stderr)
     exit(1)
 }
 
@@ -391,6 +393,34 @@ func stopWatchdogs() -> Bool {
     }
 }
 
+/// Start `path` with `arguments` in its own session, detached from this
+/// process and from any terminal, with the standard streams on /dev/null.
+/// Returns the posix_spawn error code, 0 on success.
+func spawnDetached(_ path: String, arguments: [String]) -> Int32 {
+    var spawnPid: pid_t = 0
+    var fileActions: posix_spawn_file_actions_t?
+    posix_spawn_file_actions_init(&fileActions)
+    posix_spawn_file_actions_addopen(&fileActions, STDIN_FILENO, "/dev/null", O_RDONLY, 0)
+    posix_spawn_file_actions_addopen(&fileActions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0)
+    posix_spawn_file_actions_addopen(&fileActions, STDERR_FILENO, "/dev/null", O_WRONLY, 0)
+
+    // Detach into its own session (setsid): otherwise the child inherits
+    // the app's process group, and a terminal Ctrl+C (dev runs via run.sh)
+    // delivers SIGINT to the whole foreground group — killing a watchdog
+    // at the same instant as the app it exists to clean up after.
+    var spawnAttrs: posix_spawnattr_t?
+    posix_spawnattr_init(&spawnAttrs)
+    posix_spawnattr_setflags(&spawnAttrs, Int16(POSIX_SPAWN_SETSID))
+
+    let argv = ([path] + arguments).map { strdup($0) }
+    var args: [UnsafeMutablePointer<CChar>?] = argv + [nil]
+    let result = posix_spawn(&spawnPid, path, &fileActions, &spawnAttrs, &args, nil)
+    posix_spawnattr_destroy(&spawnAttrs)
+    posix_spawn_file_actions_destroy(&fileActions)
+    for pointer in argv { free(pointer) }
+    return result
+}
+
 /// Spawn a detached watchdog daemon that monitors the given app PID.
 /// When the app dies, the watchdog clears CHTE, CHIE, and restores sleep.
 func spawnWatchdog(appPID: Int32) -> Bool {
@@ -401,30 +431,7 @@ func spawnWatchdog(appPID: Int32) -> Bool {
         fputs("ERROR: watchdog executable is not protected\n", stderr)
         return false
     }
-    var spawnPid: pid_t = 0
-    var fileActions: posix_spawn_file_actions_t?
-    posix_spawn_file_actions_init(&fileActions)
-    posix_spawn_file_actions_addopen(&fileActions, STDIN_FILENO, "/dev/null", O_RDONLY, 0)
-    posix_spawn_file_actions_addopen(&fileActions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0)
-    posix_spawn_file_actions_addopen(&fileActions, STDERR_FILENO, "/dev/null", O_WRONLY, 0)
-
-    // Detach into its own session (setsid): otherwise the watchdog inherits
-    // the app's process group, and a terminal Ctrl+C (dev runs via run.sh)
-    // delivers SIGINT to the whole foreground group — killing the watchdog
-    // at the same instant as the app it exists to clean up after.
-    var spawnAttrs: posix_spawnattr_t?
-    posix_spawnattr_init(&spawnAttrs)
-    posix_spawnattr_setflags(&spawnAttrs, Int16(POSIX_SPAWN_SETSID))
-
-    let arg0 = strdup(execPath)!
-    let arg1 = strdup("watchdog:\(appPID)")!
-    var args: [UnsafeMutablePointer<CChar>?] = [arg0, arg1, nil]
-    let result = posix_spawn(&spawnPid, execPath, &fileActions, &spawnAttrs, &args, nil)
-    posix_spawnattr_destroy(&spawnAttrs)
-    posix_spawn_file_actions_destroy(&fileActions)
-    free(arg0)
-    free(arg1)
-
+    let result = spawnDetached(execPath, arguments: ["watchdog:\(appPID)"])
     if result != 0 {
         fputs("WARNING: Failed to spawn watchdog (errno \(result))\n", stderr)
         return false
@@ -572,10 +579,144 @@ if action.hasPrefix("watchdog:") {
     }
 }
 
+// MARK: - Uninstall and the cleanup job
+
+/// Run launchctl, discarding output. Returns success.
+func runLaunchctl(_ arguments: [String]) -> Bool {
+    let task = Process()
+    task.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+    task.arguments = arguments
+    task.standardInput = FileHandle.nullDevice
+    task.standardOutput = FileHandle.nullDevice
+    task.standardError = FileHandle.nullDevice
+    do {
+        try task.run()
+        task.waitUntilExit()
+        return task.terminationStatus == 0
+    } catch {
+        return false
+    }
+}
+
+let cleanupJobTarget = "system/\(AppConstants.cleanupDaemonLabel)"
+
+/// Restore, then remove every privileged artifact: the sudoers file, the
+/// helper itself, the pre-0.0.60 helper, the state directory, and the
+/// cleanup job. With `userData`, every local account's preferences,
+/// caches, and saved state go too: that is `purge` and the cleanup job,
+/// where the app is gone for good. `uninstall` (Revoke's last account, a
+/// helper removal that keeps the app) leaves them. Unloading the job from
+/// inside the job terminates this process, so the job hands that step to
+/// a detached shell and exits on its own terms first.
+func performUninstall(asCleanupJob: Bool, userData: Bool) -> Int32 {
+    let status = HelperUninstall.run(
+        restore: {
+            guard let conn = smcOpen() else { return false }
+            defer { IOServiceClose(conn) }
+            return HelperRecovery.restore(
+                clearDischarge: { smcWriteKey(conn, SMC.keyChargeInhibit, SMC.chieNormal) },
+                allowCharging: { smcWriteKey(conn, SMC.keyChargeTerminate, SMC.chteAllow) },
+                restoreSleep: restoreSavedSleep,
+                stopWatchdogs: stopWatchdogs)
+        },
+        removeArtifacts: {
+            let privileged = HelperUninstall.removeArtifacts(.installed)
+            let personal = !userData
+                || HelperUninstall.removeUserData(homes: HelperUninstall.localHomeDirectories())
+            return privileged && personal
+        },
+        unloadDaemon: {
+            if asCleanupJob {
+                _ = spawnDetached("/bin/sh", arguments: ["-c", "sleep 1; /bin/launchctl bootout \(cleanupJobTarget)"])
+            } else {
+                _ = runLaunchctl(["bootout", cleanupJobTarget])
+            }
+        })
+    switch status {
+    case 0: print(userData ? "OK: purged" : "OK: uninstalled")
+    case 2: fputs("ERROR: cleanup incomplete — retaining helper, recovery state, and watchdogs\n", stderr)
+    default: fputs("ERROR: some files could not be removed\n", stderr)
+    }
+    return status
+}
+
+// "register-daemon:PATH" — install (or move) the cleanup job so it watches
+// the bundle at PATH. Idempotent: an identical, loaded job is left alone.
+// Only a real copy of the app is accepted, so an account with helper
+// access cannot make root watch arbitrary paths.
+if action.hasPrefix("register-daemon:") {
+    let bundlePath = String(action.dropFirst("register-daemon:".count))
+    guard CleanupDaemon.isValidBundlePath(bundlePath), CleanupDaemon.isAppBundle(at: bundlePath) else {
+        fputs("ERROR: not an installed Ampere bundle: \(bundlePath)\n", stderr)
+        exit(1)
+    }
+    let plistPath = AppConstants.cleanupDaemonPlistPath
+    let plist = CleanupDaemon.plist(bundlePath: bundlePath)
+    if (try? Data(contentsOf: URL(fileURLWithPath: plistPath))) == plist,
+       runLaunchctl(["print", cleanupJobTarget]) {
+        print("OK: cleanup job already registered")
+        exit(0)
+    }
+    do {
+        try plist.write(to: URL(fileURLWithPath: plistPath), options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: plistPath)
+    } catch {
+        fputs("ERROR: cannot write \(plistPath): \(error.localizedDescription)\n", stderr)
+        exit(2)
+    }
+    _ = runLaunchctl(["bootout", cleanupJobTarget])
+    guard runLaunchctl(["bootstrap", "system", plistPath]) else {
+        fputs("ERROR: launchctl could not load the cleanup job\n", stderr)
+        exit(3)
+    }
+    print("OK: cleanup job registered")
+    exit(0)
+}
+
+// "uninstall" — restore, then remove every privileged artifact. "purge"
+// also removes each account's preferences, caches, and saved state.
+if action == "uninstall" || action == "purge" {
+    guard geteuid() == 0 else {
+        fputs("ERROR: \(action) must run as root\n", stderr)
+        exit(1)
+    }
+    exit(performUninstall(asCleanupJob: false, userData: action == "purge"))
+}
+
+// "uninstall-if-missing:PATH" — the cleanup job's entry point, run by
+// launchd at boot and whenever PATH changes. Wait out the grace period,
+// then uninstall only if the bundle is really gone (see
+// CleanupDaemon.shouldUninstall). stderr goes nowhere under launchd, so
+// outcomes go to the unified log.
+if action.hasPrefix("uninstall-if-missing:") {
+    let bundlePath = String(action.dropFirst("uninstall-if-missing:".count))
+    guard CleanupDaemon.isValidBundlePath(bundlePath) else {
+        NSLog("Ampere cleanup: invalid bundle path %@", bundlePath)
+        exit(1)
+    }
+    sleep(CleanupDaemon.gracePeriodSeconds)
+    let fileManager = FileManager.default
+    let bundleExists = fileManager.fileExists(atPath: bundlePath)
+    let parentExists = fileManager.fileExists(atPath: (bundlePath as NSString).deletingLastPathComponent)
+    let appRunning = !InstanceGuard.runningInstances().isEmpty
+    guard CleanupDaemon.shouldUninstall(bundleExists: bundleExists, parentExists: parentExists,
+                                        appRunning: appRunning) else {
+        if !bundleExists {
+            NSLog("Ampere cleanup: %@ is missing but %@; leaving the helper installed", bundlePath,
+                  parentExists ? "a copy of Ampere is running" : "its volume is not mounted")
+        }
+        exit(0)
+    }
+    NSLog("Ampere cleanup: %@ is gone; restoring the system and removing the helper", bundlePath)
+    let status = performUninstall(asCleanupJob: true, userData: true)
+    NSLog("Ampere cleanup: uninstall exited with status %d", status)
+    exit(status)
+}
+
 // One-shot commands
 let validActions: Set<String> = ["inhibit", "allow", "nodischarge", "restore"]
 guard validActions.contains(action) else {
-    fputs("Usage: smc-writer check|restore|remove-legacy|inhibit|allow|discharge:pid|nodischarge|hold-sleep|release-sleep-hold|spawn-watchdog:pid|watchdog:pid\n", stderr)
+    fputs(usage, stderr)
     exit(1)
 }
 

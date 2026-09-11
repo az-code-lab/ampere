@@ -69,6 +69,13 @@ final class BatteryMonitor: ObservableObject {
         /// how to name the earlier instance that holds it (InstanceGuard).
         var competingInstance: () -> String? = { InstanceGuard.competingInstance()?.owner }
         var runAsAdmin: (String) -> Bool = BatteryMonitor.runAsAdmin
+        /// Where this copy of the app is installed, or nil when the cleanup
+        /// job must not watch it (see CleanupDaemon.eligibleBundlePath).
+        var cleanupDaemonBundlePath: () -> String? = {
+            CleanupDaemon.eligibleBundlePath(bundleURL: Bundle.main.bundleURL,
+                                             bundleIdentifier: Bundle.main.bundleIdentifier)
+        }
+        var cleanupDaemonRegistered: (String) -> Bool = { CleanupDaemon.isRegistered(bundlePath: $0) }
     }
 
     private let defaults: BatteryPreferences
@@ -685,8 +692,22 @@ final class BatteryMonitor: ObservableObject {
             if !okWatchdog {
                 NSLog("Ampere: Watchdog spawn failed at launch — crash safety net not installed")
             }
+            registerCleanupDaemonIfNeeded()
         }
         return true
+    }
+
+    /// Point the root cleanup job at this copy of the app, over the
+    /// passwordless rule, when no job is installed or it watches another
+    /// path (the app was moved). A failure only costs the automatic
+    /// cleanup after an uninstall; Revoke and the cask still remove
+    /// everything, so it is logged and nothing else.
+    private func registerCleanupDaemonIfNeeded() {
+        guard let bundlePath = io.cleanupDaemonBundlePath(),
+              !io.cleanupDaemonRegistered(bundlePath) else { return }
+        if !runSMCWriteViaSudo("register-daemon:\(bundlePath)") {
+            NSLog("Ampere: cleanup job registration failed for %@", bundlePath)
+        }
     }
 
     func restoreBeforeTermination() {
@@ -1043,6 +1064,7 @@ final class BatteryMonitor: ObservableObject {
         smcQueue.async { [weak self] in
             let ok = self?.io.installHelper() ?? false
             // The setup transaction already installed a fresh watchdog.
+            if ok { self?.registerCleanupDaemonIfNeeded() }
             DispatchQueue.main.async {
                 // Optional chaining: NSApp is nil under the test host.
                 NSApp?.activate(ignoringOtherApps: true)

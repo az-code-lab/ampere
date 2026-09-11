@@ -29,6 +29,9 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         var installSucceeds = true
         /// Non-nil: an earlier Ampere process holds charge control.
         var competing: String?
+        /// Non-nil: an installed copy the cleanup job should watch.
+        var bundlePath: String?
+        var daemonRegistered = false
         let preferences = MemoryBatteryPreferences()
         private let lock = NSLock()
         private var commands: [String] = []
@@ -81,6 +84,7 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
             case "release-sleep-hold": held = false
             default:
                 if command.hasPrefix("discharge:") { chie = 8; held = true }
+                if command.hasPrefix("register-daemon:") { daemonRegistered = true }
             }
             return true
         }
@@ -121,6 +125,8 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
             io.runAsAdmin = { _ in XCTFail("Unexpected administrator command"); return false }
             io.setupRefusal = { nil }
             io.competingInstance = { self.competing }
+            io.cleanupDaemonBundlePath = { self.bundlePath }
+            io.cleanupDaemonRegistered = { _ in self.daemonRegistered }
             return BatteryMonitor(chargeBoundsLocked: locked, defaults: preferences,
                                   io: io, startMonitoring: startMonitoring)
         }
@@ -464,6 +470,53 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         XCTAssertEqual(monitor.lastError, "Charge control is in use by Ampere running as alice; revoke from that account")
         monitor.restoreBeforeTermination()
         XCTAssertEqual(hw.writes, [])
+    }
+
+    func testLaunchRegistersTheCleanupJobForAnInstalledCopy() {
+        let hw = Hardware()
+        hw.bundlePath = "/Applications/Ampere.app"
+        let monitor = hw.monitor(startMonitoring: true)
+        let pid = ProcessInfo.processInfo.processIdentifier
+        XCTAssertEqual(Array(hw.writes.prefix(4)), ["nodischarge", "inhibit", "spawn-watchdog:\(pid)",
+                                                     "register-daemon:/Applications/Ampere.app"],
+                       "registered over the passwordless rule, after the launch cleanup")
+        XCTAssertTrue(hw.daemonRegistered)
+        XCTAssertTrue(monitor.accountAuthorized)
+    }
+
+    func testLaunchLeavesARegisteredCleanupJobAlone() {
+        let hw = Hardware()
+        hw.bundlePath = "/Applications/Ampere.app"
+        hw.daemonRegistered = true
+        _ = hw.monitor(startMonitoring: true)
+        XCTAssertFalse(hw.writes.contains { $0.hasPrefix("register-daemon:") })
+    }
+
+    func testADebugBuildOrTranslocatedCopyRegistersNoCleanupJob() {
+        let hw = Hardware()
+        XCTAssertNil(hw.bundlePath)
+        _ = hw.monitor(startMonitoring: true)
+        XCTAssertFalse(hw.writes.contains { $0.hasPrefix("register-daemon:") })
+    }
+
+    func testGrantingAccessAgainRegistersTheCleanupJob() {
+        let hw = Hardware()
+        hw.bundlePath = "/Applications/Ampere.app"
+        hw.competing = "Ampere running as alice"
+        hw.authorized = false
+        hw.installSucceeds = false
+        let monitor = hw.monitor(startMonitoring: true)
+        hw.competing = nil
+        monitor.refresh()
+        drainCallbacks()
+        XCTAssertEqual(monitor.chargeControlHold, .accessDeclined)
+        XCTAssertFalse(hw.daemonRegistered, "a declined prompt registers nothing")
+
+        hw.installSucceeds = true
+        monitor.toggleCharging()
+        awaitCondition { monitor.chargingPaused }
+        XCTAssertTrue(hw.daemonRegistered)
+        XCTAssertEqual(hw.writes, ["register-daemon:/Applications/Ampere.app", "inhibit"])
     }
 
     func testLaunchWithFullBatteryBelowLowerBoundDoesNotAllowCharging() {

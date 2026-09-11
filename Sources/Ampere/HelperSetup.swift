@@ -82,27 +82,24 @@ enum HelperSetup {
         """
     }
 
-    static func removalScript(username: String, paths: Paths = Paths(),
-                              stateDirectory: String = AppConstants.stateDirPath,
-                              legacyMarkers: [String] = [AppConstants.legacySavedSleepPath,
-                                                         AppConstants.legacySavedDisplaySleepPath]) -> String {
+    static func removalScript(username: String, paths: Paths = Paths()) -> String {
         let sudoersDirectory = (paths.sudoers as NSString).deletingLastPathComponent
         return """
         set -eu
         umask 022
         helper=\(quote(paths.helper))
         sudoers=\(quote(paths.sudoers))
-        # A restore failure stops here, keeping the executable, the saved
-        # settings, and the still-running watchdog for a retry.
-        "$helper" restore
-        "$helper" remove-legacy
         remaining=''
         if [ -f "$sudoers" ]; then
             remaining=$(/usr/bin/awk -v user=\(quote(username)) -v helper="$helper" -v legacy=\(quote(paths.legacy)) '\(otherAccountRules) { print }' "$sudoers")
         fi
         if [ -n "$remaining" ]; then
-            # Other accounts still use the helper: drop only this account's
-            # line. sudo ignores the dotted staging name until it is moved.
+            # Other accounts still use the helper: restore, then drop only
+            # this account's line. A restore failure stops here, keeping the
+            # saved settings and the still-running watchdog for a retry.
+            # sudo ignores the dotted staging name until it is moved.
+            "$helper" restore
+            "$helper" remove-legacy
             stage=$(/usr/bin/mktemp \(quote(sudoersDirectory + "/.az-ampere.XXXXXX")))
             trap '/bin/rm -f "$stage"' EXIT
             /usr/bin/printf '%s\\n' "$remaining" > "$stage"
@@ -111,8 +108,10 @@ enum HelperSetup {
             /usr/sbin/visudo -cf "$stage"
             /bin/mv -f "$stage" "$sudoers"
         else
-            /bin/rm -f "$sudoers" "$helper"\(legacyMarkers.map { " " + quote($0) }.joined())
-            /bin/rm -rf \(quote(stateDirectory))
+            # The last account: the helper restores, then removes the rule,
+            # the state directory, the cleanup job, and itself. Nothing is
+            # removed if the restore fails.
+            "$helper" uninstall
         fi
         """
     }
