@@ -42,6 +42,13 @@ public enum HelperUninstall {
     /// update check leaves behind, and saved window state. `purge` and the
     /// cleanup job remove them so an uninstall leaves nothing behind;
     /// `uninstall` and Revoke never do, because the app stays installed.
+    ///
+    /// The preferences plist must be removed through the account's `cfprefsd`
+    /// (see clearPreferencesCommand), not just unlinked: a logged-in user's
+    /// `cfprefsd` caches the domain in memory and rewrites the file, so a
+    /// reinstall would read the old registration back. The direct unlink
+    /// here still covers accounts that are not logged in, plus the cache,
+    /// HTTP storage, and saved-state directories, which no daemon caches.
     public static let userDataPaths = [
         "Library/Preferences/\(AppConstants.appBundleIdentifier).plist",
         "Library/Caches/\(AppConstants.appBundleIdentifier)",
@@ -49,19 +56,53 @@ public enum HelperUninstall {
         "Library/Saved Application State/\(AppConstants.appBundleIdentifier).savedState",
     ]
 
-    /// Home directories of the Mac's own accounts (uid 500 and up), as
-    /// the directory service lists them.
-    public static func localHomeDirectories() -> [String] {
-        var homes: [String] = []
+    /// One of the Mac's own accounts (uid 500 and up), as the directory
+    /// service lists it.
+    public struct Account: Equatable {
+        public let uid: uid_t
+        public let name: String
+        public let home: String
+
+        public init(uid: uid_t, name: String, home: String) {
+            self.uid = uid
+            self.name = name
+            self.home = home
+        }
+    }
+
+    /// The Mac's own accounts: their uid, short name, and home directory.
+    /// System accounts (uid below 500) and the placeholder `/var/empty`
+    /// homes of disabled accounts are skipped.
+    public static func localAccounts() -> [Account] {
+        var accounts: [Account] = []
         setpwent()
         defer { endpwent() }
         while let entry = getpwent() {
-            guard entry.pointee.pw_uid >= 500, let directory = entry.pointee.pw_dir else { continue }
-            let home = String(cString: directory)
-            guard home.hasPrefix("/"), home != "/var/empty", !homes.contains(home) else { continue }
-            homes.append(home)
+            let uid = entry.pointee.pw_uid
+            guard uid >= 500, let namePtr = entry.pointee.pw_name,
+                  let dirPtr = entry.pointee.pw_dir else { continue }
+            let home = String(cString: dirPtr)
+            guard home.hasPrefix("/"), home != "/var/empty",
+                  !accounts.contains(where: { $0.uid == uid }) else { continue }
+            accounts.append(Account(uid: uid, name: String(cString: namePtr), home: home))
         }
-        return homes
+        return accounts
+    }
+
+    /// The command that clears one account's cached preferences domain, and
+    /// its backing file, through that account's `cfprefsd`. `launchctl
+    /// asuser` enters the user's GUI bootstrap namespace, where `cfprefsd`
+    /// lives; `sudo -n -u` then drops to that user so `cfprefsd` serves
+    /// their domain (root never needs a password to switch user, and `-n`
+    /// keeps it from ever blocking on a prompt). It reaches only a
+    /// logged-in account; for the rest `launchctl` fails harmlessly, and
+    /// removeUserData's unlink covers them since no `cfprefsd` is caching.
+    public static func clearPreferencesCommand(uid: uid_t, username: String,
+                                               domain: String = AppConstants.appBundleIdentifier)
+        -> (launchPath: String, arguments: [String]) {
+        ("/bin/launchctl",
+         ["asuser", String(uid), "/usr/bin/sudo", "-n", "-u", username,
+          "/usr/bin/defaults", "delete", domain])
     }
 
     /// Missing items are fine; a symlink is removed, never followed.

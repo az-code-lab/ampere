@@ -329,7 +329,7 @@ Registration is the `register-daemon:<path>` helper command, run over the accoun
 
 When the job runs it sleeps two minutes, then uninstalls only if the bundle is still missing, its parent directory exists (an unmounted volume proves nothing), and no process named Ampere is running (a running copy was moved, not removed; it re-registers on relaunch). The grace period is what keeps `brew upgrade`, `brew reinstall`, and the in-app updater from triggering it: all three remove and re-create the bundle within seconds.
 
-The helper's `uninstall` command, used by Revoke once no account remains, runs `restore` first and stops there if it fails (exit 2), keeping the helper, the saved settings, and the watchdog. Otherwise it removes the sudoers file, the helper, the pre-0.0.60 helper, the state directory, and the job's plist, then unloads the job. `purge`, which the job runs and which is the manual complete removal, additionally removes each local account's preferences, caches, HTTP storage, and saved window state (accounts from uid 500 up, as the directory service lists them); Revoke never does, because the app stays installed. Run as the job, the helper hands the unload to a detached shell and exits first, since unloading a job terminates its process.
+The helper's `uninstall` command, used by Revoke once no account remains, runs `restore` first and stops there if it fails (exit 2), keeping the helper, the saved settings, and the watchdog. Otherwise it removes the sudoers file, the helper, the pre-0.0.60 helper, the state directory, and the job's plist, then unloads the job. `purge`, which the job runs and which is the manual complete removal, additionally removes each local account's preferences, caches, HTTP storage, and saved window state (accounts from uid 500 up, as the directory service lists them); Revoke never does, because the app stays installed. For a logged-in account the preferences are cleared through that user's `cfprefsd` first (`launchctl asuser <uid> sudo -n -u <user> defaults delete com.az-code-lab.ampere`), then the file is unlinked. Deleting the plist alone would not work: the running `cfprefsd` keeps the domain in memory and rewrites the file, so a reinstall would read the old registration back. Accounts that are not logged in have no `cfprefsd` to reach, so the direct unlink is enough. Run as the job, the helper hands the unload to a detached shell and exits first, since unloading a job terminates its process.
 
 ### Process Architecture
 
@@ -386,7 +386,8 @@ Ampere (GUI, user)
   |-- sudo SMCWriter uninstall | purge       (revoke / manual)
   |     |-- restore                          as above; failure removes nothing
   |     |-- rm sudoers, helper, state dir    and the cleanup job's plist
-  |     |-- purge: rm each account's prefs   caches, HTTP storage, saved state
+  |     |-- purge: clear each account's      prefs via cfprefsd (logged-in),
+  |     |     then rm prefs, caches,          HTTP storage, saved state
   |     |-- launchctl bootout                unload the cleanup job
   |     \-- exit(0)
   |

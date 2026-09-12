@@ -581,10 +581,10 @@ if action.hasPrefix("watchdog:") {
 
 // MARK: - Uninstall and the cleanup job
 
-/// Run launchctl, discarding output. Returns success.
-func runLaunchctl(_ arguments: [String]) -> Bool {
+/// Run a tool to completion, discarding output. Returns success.
+func runTool(_ launchPath: String, _ arguments: [String]) -> Bool {
     let task = Process()
-    task.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+    task.executableURL = URL(fileURLWithPath: launchPath)
     task.arguments = arguments
     task.standardInput = FileHandle.nullDevice
     task.standardOutput = FileHandle.nullDevice
@@ -595,6 +595,27 @@ func runLaunchctl(_ arguments: [String]) -> Bool {
         return task.terminationStatus == 0
     } catch {
         return false
+    }
+}
+
+/// Run launchctl, discarding output. Returns success.
+func runLaunchctl(_ arguments: [String]) -> Bool {
+    runTool("/bin/launchctl", arguments)
+}
+
+/// Clear every local account's cached preferences domain through its
+/// cfprefsd, so a reinstall does not read the old registration back from a
+/// running daemon. Best effort: the call fails for accounts that are not
+/// logged in (no cfprefsd to reach), which is expected and harmless — their
+/// plist is unlinked directly by removeUserData. removeUserData is the
+/// authoritative removal that gates success; this only forgets the memory
+/// copy an active session would otherwise rewrite.
+func clearPreferencesCaches(_ accounts: [HelperUninstall.Account]) {
+    for account in accounts {
+        let command = HelperUninstall.clearPreferencesCommand(uid: account.uid, username: account.name)
+        if !runTool(command.launchPath, command.arguments) {
+            NSLog("Ampere: could not clear preferences cache for %@ (likely not logged in)", account.name)
+        }
     }
 }
 
@@ -621,8 +642,13 @@ func performUninstall(asCleanupJob: Bool, userData: Bool) -> Int32 {
         },
         removeArtifacts: {
             let privileged = HelperUninstall.removeArtifacts(.installed)
-            let personal = !userData
-                || HelperUninstall.removeUserData(homes: HelperUninstall.localHomeDirectories())
+            guard userData else { return privileged }
+            // Clear each logged-in account's cfprefsd cache first, then
+            // unlink whatever files remain (accounts not logged in, plus
+            // the cache/HTTP-storage/saved-state directories).
+            let accounts = HelperUninstall.localAccounts()
+            clearPreferencesCaches(accounts)
+            let personal = HelperUninstall.removeUserData(homes: accounts.map(\.home))
             return privileged && personal
         },
         unloadDaemon: {

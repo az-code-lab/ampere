@@ -122,11 +122,23 @@ final class HelperUninstallTests: XCTestCase {
         XCTAssertFalse(present(carol), "a home with nothing of ours is not created")
     }
 
-    func testLocalHomesListTheMacsOwnAccounts() {
-        let homes = HelperUninstall.localHomeDirectories()
-        XCTAssertTrue(homes.contains(NSHomeDirectory()), "\(homes)")
-        XCTAssertFalse(homes.contains("/var/root"), "system accounts are skipped")
-        XCTAssertFalse(homes.contains("/var/empty"))
+    func testLocalAccountsListTheMacsOwnAccounts() {
+        let accounts = HelperUninstall.localAccounts()
+        let me = accounts.first { $0.uid == getuid() }
+        XCTAssertNotNil(me, "\(accounts)")
+        XCTAssertEqual(me?.home, NSHomeDirectory())
+        XCTAssertEqual(me?.name, NSUserName())
+        XCTAssertFalse(accounts.contains { $0.uid == 0 }, "root and system accounts are skipped")
+        XCTAssertFalse(accounts.contains { $0.home == "/var/empty" })
+    }
+
+    func testClearPreferencesCommandGoesThroughTheUsersCfprefsd() {
+        let command = HelperUninstall.clearPreferencesCommand(uid: 501, username: "alice")
+        XCTAssertEqual(command.launchPath, "/bin/launchctl")
+        XCTAssertEqual(command.arguments,
+                       ["asuser", "501", "/usr/bin/sudo", "-n", "-u", "alice",
+                        "/usr/bin/defaults", "delete", "com.az-code-lab.ampere"],
+                       "asuser enters the user's bootstrap; sudo -n -u reaches their cfprefsd without a prompt")
     }
 
     func testInstalledArtifactsCoverEveryPrivilegedFile() {
