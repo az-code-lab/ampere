@@ -1,4 +1,5 @@
 import Foundation
+import Shared
 import SwiftUI
 
 // Refuse to run a second instance — two instances fight over SMC state, and
@@ -10,7 +11,7 @@ let myPID = ProcessInfo.processInfo.processIdentifier
 if NSWorkspace.shared.runningApplications.contains(where: {
     $0.processIdentifier != myPID && $0.executableURL?.lastPathComponent == "Ampere"
 }) {
-    NSLog("Ampere: another instance is already running — exiting")
+    AmpereLog.app("Ampere: another instance is already running — exiting")
     exit(0)
 }
 

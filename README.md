@@ -17,6 +17,7 @@ A lightweight macOS menu bar app for monitoring battery status and controlling c
 - **Charge to full** - one-shot full charge without touching the configured bounds; normal management resumes when full
 - **Discharge to upper bound** - optionally drain the battery to the target level while on AC power
 - **Health check** - periodically verifies SMC state matches expected values, and re-applies the expected charging state if it drifted
+- **macOS 27 support** - on firmware that no longer exposes the charge-inhibit key, the app holds the battery through macOS's own charge limit instead, with the same bounds and toggles (see Firmware without CHTE below)
 - **In-app updates** - checks the Homebrew cask for new versions about once a day; a small blue badge dot on the menu bar icon signals a pending update, and clicking **Update to X** in the panel downloads, verifies, installs, and relaunches
 - **Menu bar icon** - battery shape with live charge level and animated fill when charging or discharging; hovering it shows the current charge and status (e.g. "85% — Charging — 32m to 80%"); the percent readout beside it can be hidden (Settings → Percent in Menu Bar) for a narrower menu bar footprint
 - **Pinnable popover** - pin the panel to keep it open while you work
@@ -140,16 +141,20 @@ Unlike the charge sleep hold and the discharge override (which use the system-wi
 | **Charge to Full** is ON (one-shot full charge in progress) | Charging continues through sleep — the ceiling is 100%, so there is nothing to overshoot, and the pre-sleep pause deliberately skips this state. The wake handler re-runs the state machine, which keeps CHTE in "allow" until the battery is full. Toggle stays ON until full. | **Charging resumes automatically.** The toggle is persisted; on launch the app skips the between-bounds inhibit and leaves CHTE in "allow", so the full charge continues (even past the configured upper bound) until full, where the toggle clears itself. A launch that finds the flag set but the Mac on battery clears it, because the one-shot is tied to the AC session it was started in. |
 | **Discharge to Upper Bound** is ON (discharging above upper bound) | Discharging continues. System sleep is prevented during discharge, so normal sleep should not occur. If forced (e.g. lid close), the wake handler re-asserts the discharge SMC state. Toggle stays ON. | **Discharging resumes automatically.** The "Discharge to Upper Bound" toggle is persisted. On restart, the app clears stale SMC state, then the first refresh cycle detects the battery is still above the upper bound and restarts discharge. Toggle stays ON. |
 
+On firmware without CHTE all three rows collapse into one behavior: the macOS charge limit holds the target on its own through sleep and across a restart, and the first poll after a relaunch simply hands it the current target again. See Firmware without CHTE below.
+
 ### Settings and Safety
 
 - **Settings persist across restarts** - auto charge, discharge toggle, charge bounds (an unregistered copy always relaunches with the default 40 to 60%), and keep awake (including a mid-session deadline) are saved and restored when the app relaunches.
-- **Quitting the app restores system defaults** - all SMC overrides (charging inhibit, discharge) and power management changes (sleep settings) are cleared when the app exits. Your Mac returns to its normal charging and sleep behavior. If the app crashes or is force-killed, a watchdog daemon cleans up automatically within a few seconds.
+- **Quitting the app restores system defaults** - all SMC overrides (charging inhibit, discharge) and power management changes (sleep settings) are cleared when the app exits, and on firmware without CHTE the macOS charge limit is put back to whatever it was before. Your Mac returns to its normal charging and sleep behavior. If the app crashes or is force-killed, a watchdog daemon cleans up automatically within a few seconds.
 
 ### Health Check
 
 The app periodically verifies that the actual SMC key values (`CHTE` and `CHIE`) match the expected state. A `CHTE` mismatch is repaired, not just reported: firmware or a USB-C PD renegotiation can silently reset the key (observed across sleep/wake), and the state machine is edge-triggered — it never re-issues a write for a state it believes is already in force, so a drifted key would otherwise stay drifted until the next sleep/wake while the battery charges past the bound (or refuses to finish a charge). The health check re-writes the expected value and re-verifies on the next cycle. The first repair attempt is silent; only a mismatch that survives a repair shows the warning in the popover and turns the menu bar battery icon orange — at that point the helper itself is suspect, and the warning's advice (revoke & re-grant admin) is appropriate. `CHIE` mismatches are reported but never auto-repaired: starting or stopping a discharge belongs to the state machine, with its sleep override and watchdog attached.
 
 Health checks only run while a power adapter is connected — on battery the app is not managing charging, so there is no expected SMC state to verify. Until the first check of a session has run, the About panel shows the check as **waiting for power adapter** (on battery) or **pending** (plugged in, during the warm-up below).
+
+On firmware without CHTE (see Firmware without CHTE below) the check compares the target powerd is enforcing (`pmset -g battlimit`) with the one the app last handed to the macOS charge limit, plus `CHIE`, which must be clear since nothing writes it in that mode. The agent applies a new target at its next once-a-minute evaluation (82 seconds observed on macOS 27.0), so a mismatch inside a 150-second settle window after a write is not reported; past it the target is re-issued, silently the first time, and only a mismatch that survives that shows the warning. The About panel names the mechanism in force.
 
 #### Polling and Health Check Timing
 
@@ -165,6 +170,16 @@ The app polls battery state on a timer. Power-source changes (plug/unplug, charg
 \* The cycle counter is global and does not reset when switching between fast and slow polling. If the app has already been running, the first health check after opening the popover depends on the current cycle count.
 
 Health checks also run immediately after revoking admin access, and after re-granting it from inside the app (when enabling a charge-control feature reinstalls the helper), so the warning clears (or appears) without waiting for the next scheduled check. After an app relaunch — including the revoke → relaunch → re-grant flow — the first check follows the normal warm-up schedule above.
+
+#### Diagnostics
+
+Every line the app, the helper, and the watchdog log goes to the unified log under the subsystem `com.az-code-lab.ampere` (categories `app` and `helper`), with the message marked public:
+
+```
+log show --last 1h --predicate 'subsystem == "com.az-code-lab.ampere"'
+```
+
+NSLog is not used anymore: from macOS 27 its messages show up in `log show` only as `<private>`, which made the app's own diagnostics unreadable exactly when they were needed. The watchdog logs one line when a restore starts failing and one when it succeeds, so a crash whose cleanup never completes is visible there too.
 
 ### Updates
 
@@ -190,6 +205,8 @@ Or manually:
 swift build -c debug
 .build/debug/Ampere
 ```
+
+`run.sh` and `release.sh` pass the linker the SDK explicitly (`SDK_FLAGS` in both scripts). Under Xcode 27's toolchain a bare `swift build` produces a binary stamped as built against the macOS 14 SDK: SwiftPM's Swift Build engine runs `swiftc` without `SDKROOT`, and `clang` then records the deployment target instead of the SDK version. AppKit and SwiftUI run such a binary in macOS 14 compatibility mode on every later macOS; on macOS 27 that showed an empty "Ampere Settings" window at launch. Check a build with `otool -l .build/debug/Ampere | grep -A4 LC_BUILD_VERSION`; the `sdk` line must show the current SDK, not `14.0`.
 
 ## Uninstall
 
@@ -270,6 +287,35 @@ While **Charge to Full** is active, this table applies with the upper bound read
 
 Both keys are written via IOKit's `IOConnectCallStructMethod` (selector 2) to the `AppleSMCKeysEndpoint` service (falling back to `AppleSMC`). Writing requires root privileges. Reading does not require root.
 
+### Firmware without CHTE (macOS 27)
+
+The firmware that ships with macOS 27, and with the macOS 26.7 update, no longer has a `CHTE` key: the SMC reports it as not found, and every helper write of `inhibit` or `allow` fails. Apple's replacement, a firmware charge-limit interface (`bfD0`/`bfE0`/`bfF0`), exists in the key table but refuses every call from a process without the private `com.apple.private.iokit.soc-limit` entitlement, root included. `CHIE` still works. Without the inhibit key the previous design could not hold a level at all: a discharge that reached the upper bound resumed charging at full current within seconds, and the health check never ran because its first read failed.
+
+On such firmware the app takes a different path, decided when it takes charge control (`readKey(CHTE)` fails): it holds the battery through macOS's own **Manual Charge Limit**, the feature behind System Settings > Battery > Charge Limit. PowerUIAgent (root) keeps that feature's switch and target in its preference domain, `com.apple.smartcharging.topoffprotection` under `/var/root/Library/Preferences`, as `MCLFeatureState` (1 = on) and `mclLimitValue` (percent). The agent registers the target with powerd and the firmware enforces it: charging stops at the target, including during sleep and across a reboot, and a battery above the target is drained down to it by the firmware itself (at about 2 A; the firmware decides when to begin, observed anywhere from one to eight minutes after the target was set). The agent's own request interface refuses targets below the range its slider offers, so the helper writes the two keys directly (`native-limit:<percent>`, valid 1 to 100) and posts the Darwin notification `com.apple.smartcharging.defaultschanged`, which the agent reloads its settings on. The agent applies a new target at its next once-a-minute evaluation (56 and 82 seconds observed). Nothing is written to `CHTE` or `CHIE` in this mode, and no `pmset` override is needed, because the firmware, not a poll, does the enforcing.
+
+The app maps its existing state machine onto one number. The machine still decides the intents exactly as before (rules 1 to 3, the charge-to-full session, the unplug edge); what changes is what each outcome writes:
+
+| State machine outcome | Target handed to macOS |
+|---|---|
+| Charge to Full | 100 |
+| Charge to Upper Bound (explicit, or rule 1 below the lower bound) | the upper bound |
+| Above the upper bound with Discharge to Upper Bound on | the upper bound (the firmware drains to it) |
+| Any other paused state (between bounds, at the bound, above it with discharge off) | the current level (a hold) |
+| Manual mode, paused on AC | the current level |
+| Manual mode, resumed | released: the user's own setting is back |
+
+A hold is sticky: its level is fixed when the hold begins and kept while the firmware settles, so a percentage that ticks up in the minute before the target applies is drained back rather than chased. Off AC the intent is written ahead of the next plug-in: an armed charge starts the moment the adapter connects, and a hold follows the falling level down so a reconnect never charges toward a stale level. Reaching a bound turns the charge target into a hold at the same number without another write. Because the agent needs up to a minute to act, a level can overshoot a fresh hold by a percent or two before it settles; the firmware then drains it back. Sleep holds and the pre-sleep pause do not arm in this mode, and the wake handler re-asserts nothing.
+
+Before the first override the helper saves the agent's original switch and target to `/Library/Application Support/az-ampere/saved-native-limit` (`"<state> <limit>"`, `-` for an absent key). Every restore path, `restore` at quit, the launch cleanup, the crash watchdog, `uninstall`, and the cleanup job, runs `native-limit-release`: it asks the agent to switch the feature off through its own client interface (the private PowerUI framework, resolved at runtime), which is the only path on which the agent clears the limit it registered with powerd; a preference write turning the feature off leaves that registration in place. If the user had a limit of their own, it is switched back on with their value. The marker is consumed only after every step succeeds, so a later restore can retry with the same originals. `nodischarge` does not release the limit; it only ends a discharge. A change the user makes in System Settings while the app is managing is overwritten by the app's next target, and the pre-session value is what gets restored.
+
+The restore paths also treat a missing `CHTE` as nothing to restore. Without that, `restore` failed at the `allow` write on this firmware and the watchdog it was meant to retire retried every two seconds for as long as the Mac stayed up.
+
+Everything above is bypassed while `CHTE` exists: on earlier firmware the helper, the state machine, the sleep handling, and the health check run exactly as they always did.
+
+#### Other macOS 27 changes
+
+The battery registry entry lost its top-level `DesignCapacity`, `AppleRawMaxCapacity`, `AppleRawCurrentCapacity`, `Temperature`, and `LifetimeData` keys. The capacities are read from the `BatteryData` dictionary (`DesignCapacity`, `FullChargeCapacity`, `RemainingCapacity`) when the top-level keys are absent, and the temperature from the SMC's `TB0T` sensor, so Health, Raw Charge, and Temperature keep reporting. Battery age still has no source there and shows a dash.
+
 The helper binary (`SMCWriter`) is a minimal executable with no AppKit/SwiftUI dependencies. Its installation at `/Library/PrivilegedHelperTools/az-ampere-smc` is root-owned, and the complete path must prevent writes or replacement by ordinary users. The watchdog always starts from this checked installation path.
 
 ### Clamshell Mode and the Black Screen Problem
@@ -315,6 +361,7 @@ A **watchdog daemon** is always running while the app is active. It is spawned v
    - Clears `CHTE = 0x00` (allows charging)
    - Clears `CHIE = 0x00` (stops discharge)
    - Restores sleep settings via `pmset` — only if the save-sleep marker file exists (i.e. discharge or the mid-charge sleep hold had overridden pmset); otherwise leaves the user's sleep settings untouched
+   - Puts the macOS charge limit back to the saved original — only if the `saved-native-limit` marker exists (firmware without CHTE)
    - Exits after successful recovery; if an SMC or pmset operation fails, retries on the next poll and retains any sleep settings still needing restoration
 
 The watchdog must be spawned with `posix_spawn` (not `fork`) because the Swift/ObjC runtime is not fork-safe — forked children crash when using Foundation, IOKit, or Objective-C APIs. Similarly, signal handlers (`SIGTERM`/`SIGHUP`) cannot be used for cleanup because they can only call async-signal-safe C functions, not Swift/Foundation/IOKit APIs. It is spawned with `POSIX_SPAWN_SETSID` so it runs in its own session: without that it would share the app's foreground process group, and a terminal Ctrl+C (dev runs via `run.sh`) would SIGINT the watchdog at the same instant as the app it exists to clean up after.

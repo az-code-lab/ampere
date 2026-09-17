@@ -3,6 +3,7 @@
 
 import Foundation
 import IOKit
+import ObjectiveC
 import Shared
 
 // SMCKeyData, SMCCmd command codes, and smcFourCharCode live in the Shared
@@ -63,6 +64,29 @@ func smcWriteKey(_ conn: io_connect_t, _ key: String, _ bytes: [UInt8]) -> Bool 
     result = IOConnectCallStructMethod(conn, SMCCmd.userClientSelector,
         &inputStruct, inputSize, &outputStruct, &outputSize)
     return result == kIOReturnSuccess
+}
+
+/// True when the SMC exposes `key` at all. macOS 27's firmware dropped
+/// CHTE, so the restore paths must treat "nothing to write" as success
+/// there instead of failing forever and pinning a watchdog that retries
+/// every two seconds.
+func smcKeyExists(_ conn: io_connect_t, _ key: String) -> Bool {
+    var inputStruct = SMCKeyData()
+    var outputStruct = SMCKeyData()
+    inputStruct.key = smcFourCharCode(key)
+    inputStruct.data8 = SMCCmd.readKeyInfo
+    let inputSize = MemoryLayout<SMCKeyData>.size
+    var outputSize = MemoryLayout<SMCKeyData>.size
+    let result = IOConnectCallStructMethod(conn, SMCCmd.userClientSelector,
+        &inputStruct, inputSize, &outputStruct, &outputSize)
+    return result == kIOReturnSuccess && outputStruct.result == 0 && outputStruct.keyInfo.dataSize > 0
+}
+
+/// CHTE=allow where the key exists; success where it does not (see
+/// smcKeyExists). Every restore path shares this so their behavior on
+/// CHTE-less firmware cannot drift.
+func allowChargingIfSupported(_ conn: io_connect_t) -> Bool {
+    !smcKeyExists(conn, SMC.keyChargeTerminate) || smcWriteKey(conn, SMC.keyChargeTerminate, SMC.chteAllow)
 }
 
 // (No smcReadKey here: the helper only writes. Reads live in the app,
@@ -336,9 +360,140 @@ func restoreSleepSettings(_ saved: SavedSleepSettings) -> Bool {
     return true
 }
 
+// MARK: - Native charge limit (firmware without CHTE)
+//
+// See NativeChargeLimit in Shared for the mechanism. Engaging writes the
+// agent's feature switch and target and posts its reload notification; the
+// agent applies the target at its next evaluation, within about a minute.
+// Releasing goes through the agent's own client interface, because a
+// preference write that turns the feature off leaves the registered limit
+// in place with powerd (observed on macOS 27.0). The originals are saved
+// to a marker before the first override so every restore path, including
+// the crash watchdog, can put the user's own setting back.
+
+let savedNativeLimitPaths = [AppConstants.savedNativeLimitPath]
+let nativeLimitDomain = NativeChargeLimit.preferencesDomain as CFString
+
+func nativeLimitPreference(_ key: String) -> Int? {
+    let value = CFPreferencesCopyValue(key as CFString, nativeLimitDomain,
+                                       kCFPreferencesCurrentUser, kCFPreferencesAnyHost)
+    return (value as? NSNumber)?.intValue
+}
+
+/// Write the given keys in the agent's domain (root's, since this process
+/// is root) and flush them to disk.
+func writeNativeLimitPreferences(_ values: [(key: String, value: Int)]) -> Bool {
+    for entry in values {
+        CFPreferencesSetValue(entry.key as CFString, NSNumber(value: entry.value), nativeLimitDomain,
+                              kCFPreferencesCurrentUser, kCFPreferencesAnyHost)
+    }
+    return CFPreferencesSynchronize(nativeLimitDomain, kCFPreferencesCurrentUser, kCFPreferencesAnyHost)
+}
+
+/// Post the Darwin notification the agent reloads its preferences on.
+/// Resolved at runtime: the notify API has no Swift module of its own.
+func postNativeLimitReload() -> Bool {
+    typealias NotifyPost = @convention(c) (UnsafePointer<CChar>) -> UInt32
+    guard let symbol = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "notify_post") else { return false }
+    return unsafeBitCast(symbol, to: NotifyPost.self)(NativeChargeLimit.reloadNotification) == 0
+}
+
+/// Ask PowerUIAgent to switch the manual charge limit off through its own
+/// client interface (the private PowerUI framework, resolved at runtime).
+/// This is the only path on which the agent clears the limit it registered
+/// with powerd. The agent ignores the request while it believes the
+/// feature is off, so a registration left behind by an earlier preference
+/// write is cleared by switching the feature on first.
+func nativeLimitDisableViaAgent() -> Bool {
+    typealias AllocFn = @convention(c) (AnyClass, Selector) -> Unmanaged<AnyObject>
+    typealias InitFn = @convention(c) (AnyObject, Selector, NSString) -> Unmanaged<AnyObject>?
+    typealias BoolErrFn = @convention(c) (AnyObject, Selector, UnsafeMutablePointer<Unmanaged<NSError>?>) -> Bool
+    typealias U64ErrFn = @convention(c) (AnyObject, Selector, UnsafeMutablePointer<Unmanaged<NSError>?>) -> UInt64
+    guard let msgSend = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "objc_msgSend"),
+          dlopen("/System/Library/PrivateFrameworks/PowerUI.framework/Versions/A/PowerUI", RTLD_NOW) != nil,
+          let cls: AnyClass = NSClassFromString("PowerUISmartChargeClient") else {
+        fputs("ERROR: PowerUI charge-limit client is unavailable\n", stderr)
+        return false
+    }
+    let instance = unsafeBitCast(msgSend, to: AllocFn.self)(cls, sel_registerName("alloc")).takeUnretainedValue()
+    let requiredSelectors: [String] = ["isMCLCurrentlyEnabled:", "enableMCL:", "disableMCL:"]
+    guard let client = unsafeBitCast(msgSend, to: InitFn.self)(
+            instance, sel_registerName("initWithClientName:"), "az-ampere")?.takeUnretainedValue(),
+          let object = client as? NSObjectProtocol,
+          requiredSelectors.allSatisfy({ object.responds(to: NSSelectorFromString($0)) })
+    else {
+        fputs("ERROR: PowerUI charge-limit client changed shape\n", stderr)
+        return false
+    }
+    var error: Unmanaged<NSError>? = nil
+    return withUnsafeMutablePointer(to: &error) { errorPointer -> Bool in
+        let enabled = unsafeBitCast(msgSend, to: U64ErrFn.self)(client, sel_registerName("isMCLCurrentlyEnabled:"), errorPointer)
+        if enabled == 0 {
+            errorPointer.pointee = nil
+            _ = unsafeBitCast(msgSend, to: BoolErrFn.self)(client, sel_registerName("enableMCL:"), errorPointer)
+        }
+        errorPointer.pointee = nil
+        let ok = unsafeBitCast(msgSend, to: BoolErrFn.self)(client, sel_registerName("disableMCL:"), errorPointer)
+        if !ok {
+            let reason = errorPointer.pointee.map { $0.takeUnretainedValue().localizedDescription } ?? "unknown error"
+            fputs("ERROR: PowerUIAgent refused to disable the charge limit: \(reason)\n", stderr)
+        }
+        return ok
+    }
+}
+
+/// Override the agent's target with `percent`, saving the originals first.
+func engageNativeLimit(_ percent: Int) -> Bool {
+    if !markerExists(savedNativeLimitPaths) {
+        let originals = NativeChargeLimit.Originals(
+            featureState: nativeLimitPreference(NativeChargeLimit.featureStateKey),
+            limit: nativeLimitPreference(NativeChargeLimit.limitValueKey))
+        guard writeMarker(NativeChargeLimit.markerString(originals), to: savedNativeLimitPaths) else {
+            fputs("ERROR: cannot save the original charge limit — refusing to override it\n", stderr)
+            return false
+        }
+    }
+    guard writeNativeLimitPreferences([(NativeChargeLimit.featureStateKey, 1),
+                                       (NativeChargeLimit.limitValueKey, percent)]) else {
+        fputs("ERROR: charge-limit preference write failed\n", stderr)
+        return false
+    }
+    guard postNativeLimitReload() else {
+        fputs("ERROR: could not notify PowerUIAgent\n", stderr)
+        return false
+    }
+    return true
+}
+
+/// Put the user's own charge-limit setting back. Success with no marker:
+/// nothing of ours is in force. The marker is consumed only after every
+/// step succeeds, so a later restore can retry with the same originals.
+func releaseNativeLimit() -> Bool {
+    guard markerExists(savedNativeLimitPaths) else { return true }
+    let originals = readMarker(savedNativeLimitPaths).flatMap(NativeChargeLimit.parseMarker)
+        ?? NativeChargeLimit.Originals(featureState: nil, limit: nil)
+    guard nativeLimitDisableViaAgent() else { return false }
+    if originals.featureWasOn {
+        // The user had a limit of their own: switch it back on with their
+        // value, exactly as the engage path did for ours.
+        var values = [(key: NativeChargeLimit.featureStateKey, value: 1)]
+        if let limit = originals.limit { values.append((NativeChargeLimit.limitValueKey, limit)) }
+        guard writeNativeLimitPreferences(values), postNativeLimitReload() else {
+            fputs("ERROR: could not restore the original charge limit\n", stderr)
+            return false
+        }
+    } else if let limit = originals.limit {
+        // Feature stays off (the agent switched it off itself); only the
+        // stored target is put back so the file reads as it did before.
+        _ = writeNativeLimitPreferences([(NativeChargeLimit.limitValueKey, limit)])
+    }
+    removeMarkers(savedNativeLimitPaths)
+    return true
+}
+
 // MARK: - Main
 
-let usage = "Usage: smc-writer check|restore|remove-legacy|inhibit|allow|discharge:pid|nodischarge|hold-sleep|release-sleep-hold|spawn-watchdog:pid|watchdog:pid|register-daemon:path|uninstall|purge|uninstall-if-missing:path\n"
+let usage = "Usage: smc-writer check|restore|remove-legacy|inhibit|allow|discharge:pid|nodischarge|hold-sleep|release-sleep-hold|native-limit:percent|native-limit-release|spawn-watchdog:pid|watchdog:pid|register-daemon:path|uninstall|purge|uninstall-if-missing:path\n"
 
 guard CommandLine.arguments.count == 2 else {
     fputs(usage, stderr)
@@ -437,6 +592,26 @@ func spawnWatchdog(appPID: Int32) -> Bool {
         return false
     }
     return true
+}
+
+// "native-limit:PERCENT" — hold the battery at PERCENT through macOS's own
+// charge limit (firmware without CHTE). "native-limit-release" puts the
+// user's setting back. Neither touches the SMC.
+if action.hasPrefix("native-limit:") {
+    guard let percent = Int(action.dropFirst("native-limit:".count)),
+          NativeChargeLimit.validLimit(percent) else {
+        fputs("ERROR: invalid charge limit\n", stderr)
+        exit(1)
+    }
+    guard engageNativeLimit(percent) else { exit(2) }
+    print("OK: macOS charge limit set to \(percent)%")
+    exit(0)
+}
+
+if action == "native-limit-release" {
+    guard releaseNativeLimit() else { exit(2) }
+    print("OK: macOS charge limit released")
+    exit(0)
 }
 
 // "spawn-watchdog:PID" — spawn a watchdog daemon and exit immediately.
@@ -560,20 +735,33 @@ if action.hasPrefix("watchdog:") {
         _exit(1)
     }
 
-    // Poll every 2s
+    // Poll every 2s. The daemon has no stderr reader, so the unified log
+    // is its only channel: one line when the restore starts failing (not
+    // one per retry), one when it finally succeeds.
+    var reportedFailure = false
     while true {
         sleep(2)
         if kill(appPID, 0) != 0 {
             // Retry on the next tick until both SMC keys and pmset are
             // restored. Exiting after a failed attempt abandons the only
             // remaining recovery path when the app has already died.
+            var restored = false
             if let conn = smcOpen() {
-                let restored = HelperRecovery.restore(
+                restored = HelperRecovery.restore(
                     clearDischarge: { smcWriteKey(conn, SMC.keyChargeInhibit, SMC.chieNormal) },
-                    allowCharging: { smcWriteKey(conn, SMC.keyChargeTerminate, SMC.chteAllow) },
-                    restoreSleep: restoreSavedSleep)
+                    allowCharging: { allowChargingIfSupported(conn) },
+                    restoreSleep: restoreSavedSleep,
+                    releaseNativeLimit: releaseNativeLimit)
                 IOServiceClose(conn)
-                if restored { _exit(0) }
+            }
+            if restored {
+                AmpereLog.helper("Ampere: watchdog restored system defaults after app %d exited%@",
+                                 appPID, reportedFailure ? " (after retries)" : "")
+                _exit(0)
+            }
+            if !reportedFailure {
+                AmpereLog.helper("Ampere: watchdog could not restore system defaults after app %d exited; retrying every 2s", appPID)
+                reportedFailure = true
             }
         }
     }
@@ -614,7 +802,7 @@ func clearPreferencesCaches(_ accounts: [HelperUninstall.Account]) {
     for account in accounts {
         let command = HelperUninstall.clearPreferencesCommand(uid: account.uid, username: account.name)
         if !runTool(command.launchPath, command.arguments) {
-            NSLog("Ampere: could not clear preferences cache for %@ (likely not logged in)", account.name)
+            AmpereLog.helper("Ampere: could not clear preferences cache for %@ (likely not logged in)", account.name)
         }
     }
 }
@@ -636,8 +824,9 @@ func performUninstall(asCleanupJob: Bool, userData: Bool) -> Int32 {
             defer { IOServiceClose(conn) }
             return HelperRecovery.restore(
                 clearDischarge: { smcWriteKey(conn, SMC.keyChargeInhibit, SMC.chieNormal) },
-                allowCharging: { smcWriteKey(conn, SMC.keyChargeTerminate, SMC.chteAllow) },
+                allowCharging: { allowChargingIfSupported(conn) },
                 restoreSleep: restoreSavedSleep,
+                releaseNativeLimit: releaseNativeLimit,
                 stopWatchdogs: stopWatchdogs)
         },
         removeArtifacts: {
@@ -717,7 +906,7 @@ if action == "uninstall" || action == "purge" {
 if action.hasPrefix("uninstall-if-missing:") {
     let bundlePath = String(action.dropFirst("uninstall-if-missing:".count))
     guard CleanupDaemon.isValidBundlePath(bundlePath) else {
-        NSLog("Ampere cleanup: invalid bundle path %@", bundlePath)
+        AmpereLog.helper("Ampere cleanup: invalid bundle path %@", bundlePath)
         exit(1)
     }
     sleep(CleanupDaemon.gracePeriodSeconds)
@@ -728,14 +917,14 @@ if action.hasPrefix("uninstall-if-missing:") {
     guard CleanupDaemon.shouldUninstall(bundleExists: bundleExists, parentExists: parentExists,
                                         appRunning: appRunning) else {
         if !bundleExists {
-            NSLog("Ampere cleanup: %@ is missing but %@; leaving the helper installed", bundlePath,
+            AmpereLog.helper("Ampere cleanup: %@ is missing but %@; leaving the helper installed", bundlePath,
                   parentExists ? "a copy of Ampere is running" : "its volume is not mounted")
         }
         exit(0)
     }
-    NSLog("Ampere cleanup: %@ is gone; restoring the system and removing the helper", bundlePath)
+    AmpereLog.helper("Ampere cleanup: %@ is gone; restoring the system and removing the helper", bundlePath)
     let status = performUninstall(asCleanupJob: true, userData: true)
-    NSLog("Ampere cleanup: uninstall exited with status %d", status)
+    AmpereLog.helper("Ampere cleanup: uninstall exited with status %d", status)
     exit(status)
 }
 
@@ -774,10 +963,10 @@ case "allow":
 case "nodischarge", "restore":
     let restored = HelperRecovery.restore(
         clearDischarge: { smcWriteKey(conn, SMC.keyChargeInhibit, SMC.chieNormal) },
-        allowCharging: {
-            action != "restore" || smcWriteKey(conn, SMC.keyChargeTerminate, SMC.chteAllow)
-        },
+        allowCharging: { action != "restore" || allowChargingIfSupported(conn) },
         restoreSleep: restoreSavedSleep,
+        // nodischarge only ends a discharge; the charge limit stays in force.
+        releaseNativeLimit: { action != "restore" || releaseNativeLimit() },
         stopWatchdogs: stopWatchdogs)
     guard restored else {
         fputs("ERROR: cleanup incomplete — retaining recovery state and watchdogs\n", stderr)

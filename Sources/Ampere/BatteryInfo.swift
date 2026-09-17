@@ -56,6 +56,14 @@ final class BatteryMonitor: ObservableObject {
         var lidClosed: () -> Bool = BatteryMonitor.readClamshellClosed
         var sleepDisabled: () -> Bool = readSleepDisabledFlag
         var readKey: (String) -> [UInt8]? = BatteryMonitor.smcReadKey
+        /// False on firmware without the CHTE key (macOS 27, and the same
+        /// firmware in macOS 26.7): charge control then goes through
+        /// macOS's own charge limit (see NativeChargeLimit).
+        var chargeTerminateAvailable: () -> Bool = { BatteryMonitor.smcReadKey(SMC.keyChargeTerminate) != nil }
+        /// The targets powerd currently enforces (`pmset -g battlimit`);
+        /// nil when the tool could not be run.
+        var registeredNativeLimits: () -> [Int]? = BatteryMonitor.readRegisteredNativeLimits
+        var now: () -> Date = Date.init
         var writeHelper: (String) -> Bool = BatteryMonitor.executeHelper
         var helperInstalled: () -> Bool = {
             FileManager.default.fileExists(atPath: AppConstants.sudoersPath)
@@ -358,6 +366,26 @@ final class BatteryMonitor: ObservableObject {
     /// mismatch that survives a repair attempt surfaces it, where "revoke &
     /// re-grant admin" is plausible advice again.
     private var chteRepairAttempted = false
+    /// True when the SMC has no CHTE key, so charging is held through
+    /// macOS's own charge limit instead of the inhibit key. Decided when
+    /// this instance takes charge control; everything below that reads
+    /// CHTE or CHIE for control is bypassed while it is set, and the
+    /// firmware, not a poll, stops the charge at the target.
+    @Published private(set) var nativeLimitMode = false
+    /// The target last handed to the helper in native mode; nil once
+    /// released (the user's own macOS setting is back in force).
+    private var nativeLimitWritten: Int?
+    /// What that target was for, so a hold keeps its level across polls
+    /// instead of chasing the percentage upward while the firmware settles.
+    private var nativeLimitIntent: NativeLimitIntent?
+    /// When the last native write landed. The agent applies a target at its
+    /// next once-a-minute evaluation (82 seconds observed on macOS 27.0), so
+    /// the health check treats a mismatch inside that window as settling,
+    /// not failure.
+    private var nativeLimitWrittenAt: Date?
+    private var nativeRepairAttempted = false
+    /// Grace period after a native write before a mismatch counts.
+    private static let nativeLimitSettleSeconds: TimeInterval = 150
     /// Sleep-hold intent from the state machine, persisted so a crash or
     /// in-app upgrade mid-hold re-arms after relaunch (launch cleanup always
     /// restores pmset via nodischarge, so without the persisted intent a
@@ -526,7 +554,7 @@ final class BatteryMonitor: ObservableObject {
         // other quits; refresh() takes over from there.
         if let other = io.competingInstance() {
             chargeControlHold = .otherInstance(other)
-            NSLog("Ampere: Charge control is in use by %@; this instance stands by", other)
+            AmpereLog.app("Ampere: Charge control is in use by %@; this instance stands by", other)
         } else if !activateChargeControl(atLaunch: true) {
             return
         }
@@ -553,7 +581,7 @@ final class BatteryMonitor: ObservableObject {
             CFRunLoopAddSource(CFRunLoopGetMain(), source, .defaultMode)
             powerSourceRunLoopSource = source
         } else {
-            NSLog("Ampere: IOPS notification source unavailable — timer-only polling")
+            AmpereLog.app("Ampere: IOPS notification source unavailable — timer-only polling")
         }
         // Check for updates: 5 minutes after launch, then once daily at a random interval
         updateCheckTimer = Timer.scheduledTimer(withTimeInterval: 300, repeats: false) { [weak self] _ in
@@ -596,14 +624,14 @@ final class BatteryMonitor: ObservableObject {
         // would have a different helper binary. The install prompts for
         // admin via osascript; cancellation terminates the app.
         if !isSudoRuleInstalled || io.helperStale() || !io.helperAuthorized() {
-            NSLog("Ampere: Helper needs installation, update, or authorization")
+            AmpereLog.app("Ampere: Helper needs installation, update, or authorization")
             if !io.installHelper() {
                 guard atLaunch else {
-                    NSLog("Ampere: Helper install failed or cancelled; charge control stays on hold")
+                    AmpereLog.app("Ampere: Helper install failed or cancelled; charge control stays on hold")
                     chargeControlHold = .accessDeclined
                     return true
                 }
-                NSLog("Ampere: Helper install failed or cancelled, quitting")
+                AmpereLog.app("Ampere: Helper install failed or cancelled, quitting")
                 // A refusal never showed a prompt, so do not send the user
                 // back to enter a password; say what blocks the install.
                 let refusal = io.setupRefusal()
@@ -680,17 +708,25 @@ final class BatteryMonitor: ObservableObject {
             // expected state by the time refresh() starts dispatching
             // auto-manage actions — otherwise refresh's state machine
             // could race against an in-flight cleanup write.
+            nativeLimitMode = !io.chargeTerminateAvailable()
+            nativeLimitWritten = nil
+            nativeLimitIntent = nil
             let okDischarge = runSMCWriteViaSudo("nodischarge")
-            let okChte = runSMCWriteViaSudo(shouldInhibit ? "inhibit" : "allow")
+            // Native mode has no inhibit key to write. A limit a crashed
+            // session left behind (its watchdog's restore failed) is put
+            // back to the user's own setting here, and the first refresh
+            // then hands the macOS charge limit the current target; with no
+            // marker outstanding the release is a no-op.
+            let okChte = runSMCWriteViaSudo(nativeLimitMode ? "native-limit-release" : (shouldInhibit ? "inhibit" : "allow"))
             let pid = ProcessInfo.processInfo.processIdentifier
             let okWatchdog = runSMCWriteViaSudo("spawn-watchdog:\(pid)")
             if okDischarge && okChte {
-                NSLog("Ampere: Launch cleanup done (inhibit=%d)", shouldInhibit)
+                AmpereLog.app("Ampere: Launch cleanup done (inhibit=%d, nativeLimit=%d)", shouldInhibit, nativeLimitMode)
             } else {
-                NSLog("Ampere: Launch cleanup failed (nodischarge=%d, chte=%d)", okDischarge, okChte)
+                AmpereLog.app("Ampere: Launch cleanup failed (nodischarge=%d, chte=%d)", okDischarge, okChte)
             }
             if !okWatchdog {
-                NSLog("Ampere: Watchdog spawn failed at launch — crash safety net not installed")
+                AmpereLog.app("Ampere: Watchdog spawn failed at launch — crash safety net not installed")
             }
             registerCleanupDaemonIfNeeded()
         }
@@ -706,7 +742,7 @@ final class BatteryMonitor: ObservableObject {
         guard let bundlePath = io.cleanupDaemonBundlePath(),
               !io.cleanupDaemonRegistered(bundlePath) else { return }
         if !runSMCWriteViaSudo("register-daemon:\(bundlePath)") {
-            NSLog("Ampere: cleanup job registration failed for %@", bundlePath)
+            AmpereLog.app("Ampere: cleanup job registration failed for %@", bundlePath)
         }
     }
 
@@ -733,7 +769,9 @@ final class BatteryMonitor: ObservableObject {
     /// full-charge or manual-resume request whose callback is still pending.
     func prepareForSleep() {
         preparingForSleep = true
-        guard chargeControlHold == nil else { return }
+        // The firmware keeps enforcing the macOS charge limit through
+        // sleep; there is no inhibit key to write ahead of it.
+        guard chargeControlHold == nil, !nativeLimitMode else { return }
         smcQueue.sync {}
         guard isSudoRuleInstalled, let battery = io.battery(), battery.adapterConnected else { return }
         let pause: Bool
@@ -749,7 +787,7 @@ final class BatteryMonitor: ObservableObject {
             return
         }
         let ok = smcQueue.sync { runSMCWrite(pause ? .inhibit : .allow) }
-        NSLog("Ampere: Pre-sleep %@ at %d%% %@", pause ? "pause" : "resume",
+        AmpereLog.app("Ampere: Pre-sleep %@ at %d%% %@", pause ? "pause" : "resume",
               battery.percentage, ok ? "applied" : "failed")
     }
 
@@ -757,7 +795,8 @@ final class BatteryMonitor: ObservableObject {
         preparingForSleep = false
         // Keep this pending if another callback still owns the in-flight
         // token. Its completion refresh will perform the re-assertion.
-        wakeReassertPending = true
+        // Native mode has nothing to re-assert: the target survived sleep.
+        if !nativeLimitMode { wakeReassertPending = true }
         refresh()
     }
 
@@ -868,7 +907,7 @@ final class BatteryMonitor: ObservableObject {
                         // A .failed from an older offer doesn't apply to this
                         // one; keep it only while the same update is retried.
                         self.updateState = .idle
-                        NSLog("Ampere: Update available: %@ → %@", current, update.version)
+                        AmpereLog.app("Ampere: Update available: %@ → %@", current, update.version)
                     }
                     // The update row appearing is the answer; no text needed.
                     if manual { self.finishManualCheck(.none) }
@@ -923,7 +962,7 @@ final class BatteryMonitor: ObservableObject {
             return false
         }
         guard let bundled = try? Data(contentsOf: URL(fileURLWithPath: smcWriterPath)) else {
-            NSLog("Ampere: bundled SMCWriter unreadable at %@ — cannot check staleness", smcWriterPath)
+            AmpereLog.app("Ampere: bundled SMCWriter unreadable at %@ — cannot check staleness", smcWriterPath)
             return false
         }
         return installed != bundled
@@ -963,6 +1002,8 @@ final class BatteryMonitor: ObservableObject {
                     self.activeDischarging = false
                     self.sleepHoldActive = false
                     self.sleepHoldIntent = false
+                    self.nativeLimitWritten = nil
+                    self.nativeLimitIntent = nil
                     self.lastError = nil
                     self.healthWarning = nil
                 } else {
@@ -1027,11 +1068,11 @@ final class BatteryMonitor: ObservableObject {
     /// the same administrator prompt used for every normal helper update.
     private static func installSudo() -> Bool {
         if let refusal = helperSetupRefusal() {
-            NSLog("Ampere: Helper setup refused: %@", refusal)
+            AmpereLog.app("Ampere: Helper setup refused: %@", refusal)
             return false
         }
         guard let helperData = try? Data(contentsOf: URL(fileURLWithPath: smcWriterPath)) else {
-            NSLog("Ampere: bundled SMCWriter unreadable at %@", smcWriterPath)
+            AmpereLog.app("Ampere: bundled SMCWriter unreadable at %@", smcWriterPath)
             return false
         }
         let digest = SHA256.hash(data: helperData).map { String(format: "%02x", $0) }.joined()
@@ -1070,6 +1111,12 @@ final class BatteryMonitor: ObservableObject {
                 NSApp?.activate(ignoringOtherApps: true)
                 if ok {
                     self?.grantAccess()
+                    // The install script's restore released any macOS
+                    // charge limit of ours; forget the target so the next
+                    // poll hands it over again instead of waiting for the
+                    // health check to notice.
+                    self?.nativeLimitWritten = nil
+                    self?.nativeLimitIntent = nil
                     self?.recheckHealth()
                 }
                 completion(ok)
@@ -1097,11 +1144,11 @@ final class BatteryMonitor: ObservableObject {
 
         let ok = runSMCWriteViaSudo("discharge:\(ProcessInfo.processInfo.processIdentifier)")
         if ok {
-            NSLog("Ampere: discharge daemon started")
+            AmpereLog.app("Ampere: discharge daemon started")
         } else if !runSMCWriteViaSudo("spawn-watchdog:\(ProcessInfo.processInfo.processIdentifier)") {
             // The successful nodischarge retired the previous watchdog.
             // Restore crash recovery even if discharge could not start.
-            NSLog("Ampere: Watchdog respawn after failed discharge start also failed")
+            AmpereLog.app("Ampere: Watchdog respawn after failed discharge start also failed")
         }
         return ok
     }
@@ -1115,9 +1162,9 @@ final class BatteryMonitor: ObservableObject {
         guard runSMCWriteViaSudo("nodischarge") else { return false }
         let watchdogOk = runSMCWriteViaSudo("spawn-watchdog:\(ProcessInfo.processInfo.processIdentifier)")
         if !watchdogOk {
-            NSLog("Ampere: nodischarge succeeded but watchdog respawn failed — CHTE protection on crash may be lost")
+            AmpereLog.app("Ampere: nodischarge succeeded but watchdog respawn failed — CHTE protection on crash may be lost")
         }
-        NSLog("Ampere: discharge stopped")
+        AmpereLog.app("Ampere: discharge stopped")
         return true
     }
 
@@ -1126,7 +1173,7 @@ final class BatteryMonitor: ObservableObject {
     @discardableResult
     private func runSMCWrite(_ op: SMCWriteOp) -> Bool {
         guard isSudoRuleInstalled else {
-            NSLog("Ampere: sudo helper not installed, cannot write SMC")
+            AmpereLog.app("Ampere: sudo helper not installed, cannot write SMC")
             return false
         }
         switch op {
@@ -1167,10 +1214,10 @@ final class BatteryMonitor: ObservableObject {
             let errMsg = String(data: errorData, encoding: .utf8) ?? ""
             // Include the helper arg and exit status — the previous log
             // ("sudo failed: %@") swallowed both when stderr was empty.
-            NSLog("Ampere: sudo failed (arg=%@ status=%d): %@", arg, task.terminationStatus, errMsg)
+            AmpereLog.app("Ampere: sudo failed (arg=%@ status=%d): %@", arg, task.terminationStatus, errMsg)
             return false
         } catch {
-            NSLog("Ampere: failed to run sudo (arg=%@): %@", arg, error.localizedDescription)
+            AmpereLog.app("Ampere: failed to run sudo (arg=%@): %@", arg, error.localizedDescription)
             return false
         }
     }
@@ -1216,6 +1263,18 @@ final class BatteryMonitor: ObservableObject {
 
         var raw = output.bytes
         return withUnsafeBytes(of: &raw) { Array($0.prefix(Int(dataSize))) }
+    }
+
+    /// Battery temperature from the SMC's TB0T sensor, a little-endian
+    /// float in °C, for macOS versions whose battery registry entry no
+    /// longer carries a Temperature key (macOS 27). Nil when the key is
+    /// unreadable or the value is outside any plausible battery range, so
+    /// a garbage read never lands on the dashboard as a number.
+    private static func smcBatteryTemperature() -> Double? {
+        guard let bytes = smcReadKey("TB0T"), bytes.count == 4 else { return nil }
+        let value = bytes.withUnsafeBytes { $0.loadUnaligned(as: Float.self) }
+        guard value.isFinite, value > -40, value < 120 else { return nil }
+        return Double(value)
     }
 
     // MARK: - Keep awake (idle-sleep assertion)
@@ -1315,7 +1374,7 @@ final class BatteryMonitor: ObservableObject {
         if keepAwakeEnabled, let deadline = keepAwakeDeadline, deadline <= now {
             keepAwakeEnabled = false
             setKeepAwakeDeadline(nil)
-            NSLog("Ampere: Keep-awake session expired")
+            AmpereLog.app("Ampere: Keep-awake session expired")
         }
         // Launch case: a deadline restored by init has no timer yet
         // (timers can't be scheduled mid-init).
@@ -1335,9 +1394,9 @@ final class BatteryMonitor: ObservableObject {
             if rc == kIOReturnSuccess {
                 keepAwakeAssertionID = id
                 keepAwakeAssertionHeld = true
-                NSLog("Ampere: Keep-awake assertion acquired")
+                AmpereLog.app("Ampere: Keep-awake assertion acquired")
             } else {
-                NSLog("Ampere: Keep-awake assertion create failed (0x%08x)", UInt32(bitPattern: rc))
+                AmpereLog.app("Ampere: Keep-awake assertion create failed (0x%08x)", UInt32(bitPattern: rc))
             }
         } else {
             // Release cannot meaningfully fail (the ID is one we created);
@@ -1345,7 +1404,7 @@ final class BatteryMonitor: ObservableObject {
             IOPMAssertionRelease(keepAwakeAssertionID)
             keepAwakeAssertionID = 0
             keepAwakeAssertionHeld = false
-            NSLog("Ampere: Keep-awake assertion released")
+            AmpereLog.app("Ampere: Keep-awake assertion released")
         }
     }
 
@@ -1735,17 +1794,24 @@ final class BatteryMonitor: ObservableObject {
         if let other = io.competingInstance() {
             if chargeControlHold != .otherInstance(other) {
                 chargeControlHold = .otherInstance(other)
-                NSLog("Ampere: Charge control is in use by %@; standing by", other)
+                AmpereLog.app("Ampere: Charge control is in use by %@; standing by", other)
             }
             return
         }
         if standingBy {
             chargeControlHold = nil
-            NSLog("Ampere: Taking over charge control")
+            AmpereLog.app("Ampere: Taking over charge control")
             activateChargeControl(atLaunch: false)
         }
         // A declined takeover prompt: read-only until access is granted.
         if chargeControlHold != nil { return }
+
+        // Firmware without CHTE: the macOS charge limit does the holding.
+        // Everything from here down writes CHTE or CHIE, so it is bypassed.
+        if nativeLimitMode {
+            nativeRefresh(battery)
+            return
+        }
 
         // Stop discharge if the adapter disconnected mid-discharge. Gated
         // separately from the chargingPaused synthesize branch because the
@@ -1768,13 +1834,13 @@ final class BatteryMonitor: ObservableObject {
                 guard let self = self else { return }
                 let ok = self.runSMCWrite(.nodischarge)
                 if ok, !self.runSMCWrite(reassert) {
-                    NSLog("Ampere: CHTE re-assert after discharge stop failed")
+                    AmpereLog.app("Ampere: CHTE re-assert after discharge stop failed")
                 }
                 DispatchQueue.main.async {
                     self.autoManageInFlight = false
                     if ok {
                         self.activeDischarging = false
-                        NSLog("Ampere: Discharge stopped — adapter disconnected")
+                        AmpereLog.app("Ampere: Discharge stopped — adapter disconnected")
                         self.refresh()
                     }
                 }
@@ -1792,13 +1858,13 @@ final class BatteryMonitor: ObservableObject {
                 guard let self = self else { return }
                 let ok = self.runSMCWrite(.nodischarge)
                 if ok, !self.runSMCWrite(reassert) {
-                    NSLog("Ampere: CHTE re-assert after discharge stop failed")
+                    AmpereLog.app("Ampere: CHTE re-assert after discharge stop failed")
                 }
                 DispatchQueue.main.async {
                     self.autoManageInFlight = false
                     if ok {
                         self.activeDischarging = false
-                        NSLog("Ampere: Auto-discharge toggled off")
+                        AmpereLog.app("Ampere: Auto-discharge toggled off")
                         self.refresh()
                     }
                     // On failure: don't re-refresh immediately. The condition is
@@ -1826,7 +1892,7 @@ final class BatteryMonitor: ObservableObject {
                         self.autoManageInFlight = false
                         if ok {
                             self.activeDischarging = true
-                            NSLog("Ampere: Auto-discharge started at %d%%, target %d%%", pct, upper)
+                            AmpereLog.app("Ampere: Auto-discharge started at %d%%, target %d%%", pct, upper)
                             self.refresh()
                         }
                     }
@@ -1842,13 +1908,13 @@ final class BatteryMonitor: ObservableObject {
                     guard let self = self else { return }
                     let ok = self.runSMCWrite(.nodischarge)
                     if ok, !self.runSMCWrite(reassert) {
-                        NSLog("Ampere: CHTE re-assert after discharge stop failed")
+                        AmpereLog.app("Ampere: CHTE re-assert after discharge stop failed")
                     }
                     DispatchQueue.main.async {
                         self.autoManageInFlight = false
                         if ok {
                             self.activeDischarging = false
-                            NSLog("Ampere: Auto-discharge reached target %d%%", upper)
+                            AmpereLog.app("Ampere: Auto-discharge reached target %d%%", upper)
                             self.refresh()
                         }
                     }
@@ -1919,14 +1985,14 @@ final class BatteryMonitor: ObservableObject {
                 // lower) and the at/above-upper staleness repair clear it;
                 // the charge-to-full disconnect downgrade and the rule-1 arm
                 // (below lower on AC while unpaused) set it.
-                NSLog("Ampere: %@ chargeToUpperBound at %d%%",
+                AmpereLog.app("Ampere: %@ chargeToUpperBound at %d%%",
                       decision.newState.chargeToUpperBound ? "Set" : "Cleared", b.percentage)
             }
             if chargeToFull != decision.newState.chargeToFull, decision.action == .none {
                 chargeToFull = decision.newState.chargeToFull
                 // Pure-clear only (the machine never sets it): AC disconnect
                 // or the at-100% staleness repair while already paused.
-                NSLog("Ampere: Cleared chargeToFull at %d%%", b.percentage)
+                AmpereLog.app("Ampere: Cleared chargeToFull at %d%%", b.percentage)
             }
             if sleepHoldIntent != decision.newState.sleepHold, decision.action == .none {
                 // Pure intent transitions: the below-lower arm rides an
@@ -1935,7 +2001,7 @@ final class BatteryMonitor: ObservableObject {
                 // pmset side is reconciled by the dispatch below against
                 // sleepHoldActive.
                 sleepHoldIntent = decision.newState.sleepHold
-                NSLog("Ampere: Sleep-hold intent %@ at %d%%",
+                AmpereLog.app("Ampere: Sleep-hold intent %@ at %d%%",
                       decision.newState.sleepHold ? "armed" : "cleared", b.percentage)
             }
 
@@ -1963,7 +2029,7 @@ final class BatteryMonitor: ObservableObject {
             if sleepHoldActive, decision.newState.sleepHold, !activeDischarging,
                !io.sleepDisabled() {
                 sleepHoldActive = false
-                NSLog("Ampere: Sleep hold cleared externally at %d%% — re-arming", b.percentage)
+                AmpereLog.app("Ampere: Sleep hold cleared externally at %d%% — re-arming", b.percentage)
             }
 
             // SMC action dispatch, plus pmset reconciliation for the sleep
@@ -2008,7 +2074,7 @@ final class BatteryMonitor: ObservableObject {
                         let intentChanged = self.controlRevision != revision
                         if holdApplied {
                             self.sleepHoldActive = next.sleepHold
-                            NSLog("Ampere: Sleep hold %@ at %d%%",
+                            AmpereLog.app("Ampere: Sleep hold %@ at %d%%",
                                   next.sleepHold ? "engaged" : "released", pct)
                         }
                         if ok {
@@ -2023,9 +2089,9 @@ final class BatteryMonitor: ObservableObject {
                             }
                             switch decision.action {
                             case .inhibit:
-                                NSLog("Ampere: Inhibited charging at %d%%", pct)
+                                AmpereLog.app("Ampere: Inhibited charging at %d%%", pct)
                             case .allow:
-                                NSLog("Ampere: Charging from %d%% to %d%%", pct, upper)
+                                AmpereLog.app("Ampere: Charging from %d%% to %d%%", pct, upper)
                             case .none:
                                 break
                             }
@@ -2103,6 +2169,253 @@ final class BatteryMonitor: ObservableObject {
         }
     }
 
+    // MARK: - Native charge limit (firmware without CHTE)
+
+    /// What the app asks the firmware to do through the macOS charge limit.
+    enum NativeLimitIntent: Equatable {
+        /// Nothing of ours: the user's own macOS setting is in force.
+        case release
+        /// Stop charging where the battery is now, and stay there.
+        case hold
+        /// Charge up to the target (the upper bound, or 100 for a full charge).
+        case chargeTo(Int)
+        /// Let the firmware drain the battery down to the upper bound.
+        case drainTo(Int)
+    }
+
+    /// The intent for the current state. Auto mode maps the state
+    /// machine's outcome directly: an armed charge-to-upper or
+    /// charge-to-full is a charge target, an above-upper level with the
+    /// discharge preference on is a drain target, and every other paused
+    /// state is a hold at the current level. Off AC the intent is kept
+    /// ahead of the next plug-in: an armed charge starts at once, and a
+    /// hold that tracks the falling level keeps a reconnect from charging
+    /// while the app's first poll is still on its way. Manual mode holds
+    /// while paused on AC and otherwise leaves the macOS setting alone.
+    static func nativeLimitIntent(
+        autoManageEnabled: Bool, adapterConnected: Bool, percentage: Int, upperBound: Int,
+        chargingPaused: Bool, chargeToUpperBound: Bool, chargeToFull: Bool, dischargeEnabled: Bool
+    ) -> NativeLimitIntent {
+        guard autoManageEnabled else {
+            return chargingPaused && adapterConnected ? .hold : .release
+        }
+        guard adapterConnected else {
+            return chargeToUpperBound ? .chargeTo(upperBound) : .hold
+        }
+        if chargeToFull { return .chargeTo(100) }
+        if chargeToUpperBound { return .chargeTo(upperBound) }
+        if percentage > upperBound, dischargeEnabled { return .drainTo(upperBound) }
+        return .hold
+    }
+
+    /// The target to hand the helper for `intent`, given what was written
+    /// last. A hold is sticky: the level is fixed when the hold begins and
+    /// kept while the firmware settles, so a percentage that ticks up in
+    /// the minute before the agent applies the target is drained back
+    /// rather than chased upward. Off AC the hold follows the level down,
+    /// so a reconnect never charges toward a stale level. Nil releases.
+    static func nativeLimitTarget(
+        intent: NativeLimitIntent, percentage: Int, adapterConnected: Bool,
+        previousIntent: NativeLimitIntent?, previousTarget: Int?
+    ) -> Int? {
+        switch intent {
+        case .release: return nil
+        case .chargeTo(let target), .drainTo(let target): return target
+        case .hold:
+            guard previousIntent == .hold, let previous = previousTarget else { return percentage }
+            return adapterConnected ? previous : min(previous, percentage)
+        }
+    }
+
+    /// refresh() for native mode. The shared pure state machine still
+    /// decides the intents (rules 1-3, the charge-to-full session, the
+    /// unplug edge); its `chargingPaused` outcome becomes "hold". No SMC
+    /// write confirms a transition, so the state is applied directly and
+    /// the one helper call per change carries the target. Sleep holds
+    /// never arm: the firmware enforces the target through sleep.
+    private func nativeRefresh(_ battery: BatteryState?) {
+        guard let b = battery else { return }
+        // Explicit requests (manual Pause/Resume, cancelling a full charge)
+        // apply immediately; the machine below then evaluates against them.
+        if let pause = requestedChargingPaused {
+            chargingPaused = pause
+            requestedChargingPaused = nil
+            lastError = nil
+        }
+        let priorState = AutoManageState(
+            chargingPaused: chargingPaused,
+            chargeToUpperBound: chargeToUpperBound,
+            chargeToFull: chargeToFull,
+            lastAdapterConnected: lastAdapterConnected,
+            sleepHold: false
+        )
+        let inputs = AutoManageInputs(
+            autoManageEnabled: autoManageEnabled,
+            adapterConnected: b.adapterConnected,
+            percentage: b.percentage,
+            lowerBound: chargeLowerBound,
+            upperBound: chargeUpperBound,
+            fullyCharged: b.fullyCharged,
+            lidClosed: false
+        )
+        let next = BatteryMonitor.evaluateAutoManageStep(state: priorState, inputs: inputs).newState
+        lastAdapterConnected = next.lastAdapterConnected
+        if chargeToUpperBound != next.chargeToUpperBound {
+            chargeToUpperBound = next.chargeToUpperBound
+            AmpereLog.app("Ampere: %@ chargeToUpperBound at %d%%", next.chargeToUpperBound ? "Set" : "Cleared", b.percentage)
+        }
+        if chargeToFull != next.chargeToFull {
+            chargeToFull = next.chargeToFull
+            AmpereLog.app("Ampere: Cleared chargeToFull at %d%%", b.percentage)
+        }
+        if chargingPaused != next.chargingPaused {
+            chargingPaused = next.chargingPaused
+            AmpereLog.app("Ampere: %@ at %d%%", next.chargingPaused ? "Holding" : "Charging", b.percentage)
+        }
+        // Manual mode mirrors the inhibit path: an unplug ends a pause so
+        // the next plug-in charges normally.
+        if !autoManageEnabled, !b.adapterConnected, chargingPaused { chargingPaused = false }
+        if sleepHoldIntent { sleepHoldIntent = false }
+        if autoManageEnabled, b.adapterConnected, lastError != nil { lastError = nil }
+        if !autoManageEnabled, b.adapterConnected, lastError == Self.noAdapterError { lastError = nil }
+
+        let intent = Self.nativeLimitIntent(
+            autoManageEnabled: autoManageEnabled, adapterConnected: b.adapterConnected,
+            percentage: b.percentage, upperBound: chargeUpperBound,
+            chargingPaused: chargingPaused, chargeToUpperBound: chargeToUpperBound,
+            chargeToFull: chargeToFull, dischargeEnabled: autoDischargeEnabled)
+        let target = Self.nativeLimitTarget(
+            intent: intent, percentage: b.percentage, adapterConnected: b.adapterConnected,
+            previousIntent: nativeLimitIntent, previousTarget: nativeLimitWritten)
+        // The status line's "discharging" is the firmware draining to the
+        // bound; nothing is written to CHIE in this mode.
+        let draining: Bool
+        if case .drainTo = intent { draining = b.adapterConnected && b.percentage > chargeUpperBound } else { draining = false }
+        if activeDischarging != draining { activeDischarging = draining }
+
+        if target == nativeLimitWritten {
+            // Same target for a new reason (a charge that reached the bound
+            // becomes a hold there): no write needed, but the intent must
+            // follow so the hold stays sticky from here on.
+            nativeLimitIntent = intent
+        } else if !autoManageInFlight {
+            autoManageInFlight = true
+            let command = target.map { "native-limit:\($0)" } ?? "native-limit-release"
+            let pct = b.percentage
+            smcQueue.async { [weak self] in
+                guard let self else { return }
+                let ok = self.runSMCWriteViaSudo(command)
+                DispatchQueue.main.async {
+                    self.autoManageInFlight = false
+                    if ok {
+                        self.nativeLimitWritten = target
+                        self.nativeLimitIntent = intent
+                        self.nativeLimitWrittenAt = self.io.now()
+                        self.nativeRepairAttempted = false
+                        self.lastError = nil
+                        if let target {
+                            AmpereLog.app("Ampere: macOS charge limit set to %d%% at %d%%", target, pct)
+                        } else {
+                            AmpereLog.app("Ampere: macOS charge limit released at %d%%", pct)
+                        }
+                    } else {
+                        // One attempt per change; the next tick retries.
+                        self.lastError = "Charge control failed — revoke and re-grant admin access"
+                        AmpereLog.app("Ampere: %@ failed at %d%%", command, pct)
+                    }
+                }
+            }
+            return
+        }
+
+        if refreshCount > Self.healthCheckSettleRefreshes,
+           !autoManageInFlight, isSudoRuleInstalled, b.adapterConnected {
+            performNativeHealthCheck(battery: b)
+        }
+    }
+
+    /// Health check for native mode: the target powerd enforces (read
+    /// through `pmset -g battlimit`) must be the one last written, and
+    /// CHIE must be clear, since nothing writes it in this mode. The
+    /// agent applies a target at its next evaluation, so a mismatch inside
+    /// the settle window is left unreported rather than flagged. A
+    /// mismatch past it is repaired by re-issuing the write (silently the
+    /// first time); one that survives a repair shows the warning, the same
+    /// contract as the CHTE repair.
+    private func performNativeHealthCheck(battery: BatteryState) {
+        guard let registered = io.registeredNativeLimits(),
+              let chieBytes = io.readKey(SMC.keyChargeInhibit), chieBytes.count == 1 else {
+            AmpereLog.app("Ampere: Health check skipped — charge limit or CHIE read failed")
+            return
+        }
+        let chie = Int(chieBytes[0])
+        let chieHex = Self.formatHex(chieBytes)
+        let actualLimit = registered.first.map { "\($0)%" } ?? "none"
+        let expectedLimit = nativeLimitWritten.map { "\($0)%" }
+        let limitMatch = nativeLimitWritten.map { registered.contains($0) } ?? true
+        let chieMatch = chie == SMC.chieNormalInt
+        let settling = nativeLimitWrittenAt.map { io.now().timeIntervalSince($0) < Self.nativeLimitSettleSeconds } ?? false
+        if !limitMatch && settling { return }
+
+        let newSMC = "macOS limit=\(actualLimit)\n\(SMC.keyChargeInhibit)=\(chieHex)"
+        let newStatus: String
+        var newExpected = ""
+        var newWarning: String?
+        if limitMatch && chieMatch {
+            newStatus = "pass"
+            nativeRepairAttempted = false
+        } else {
+            newStatus = "FAIL"
+            newExpected = "macOS limit=\(expectedLimit ?? "none")\n\(SMC.keyChargeInhibit)=\(SMC.chieNormalHex)"
+            AmpereLog.app("Ampere: Health check failed — macOS limit=%@ expected=%@ CHIE=%d charge=%d%%",
+                  actualLimit, expectedLimit ?? "none", chie, battery.percentage)
+            if !limitMatch {
+                // Re-issue the target on the next tick by forgetting what
+                // was written; the write path logs the outcome.
+                newWarning = nativeRepairAttempted ? Self.smcMismatchWarning : nil
+                nativeRepairAttempted = true
+                nativeLimitWritten = nil
+                nativeLimitIntent = nil
+            } else {
+                newWarning = Self.smcMismatchWarning
+            }
+        }
+        let changed = lastHealthCheckStatus != newStatus
+            || lastHealthCheckSMC != newSMC
+            || lastHealthCheckExpected != newExpected
+            || lastHealthCheckCHTEMatch != limitMatch
+            || lastHealthCheckCHIEMatch != chieMatch
+            || healthWarning != newWarning
+        guard isPopoverVisible || changed else { return }
+        lastHealthCheckTime = Date()
+        lastHealthCheckSMC = newSMC
+        lastHealthCheckStatus = newStatus
+        lastHealthCheckExpected = newExpected
+        lastHealthCheckCHTEMatch = limitMatch
+        lastHealthCheckCHIEMatch = chieMatch
+        healthWarning = newWarning
+    }
+
+    /// `pmset -g battlimit`, parsed. Nil when the tool could not be run.
+    private static func readRegisteredNativeLimits() -> [Int]? {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
+        task.arguments = ["-g", "battlimit"]
+        let pipe = Pipe()
+        task.standardInput = FileHandle.nullDevice
+        task.standardOutput = pipe
+        task.standardError = FileHandle.nullDevice
+        do {
+            try task.run()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            task.waitUntilExit()
+            guard task.terminationStatus == 0, let output = String(data: data, encoding: .utf8) else { return nil }
+            return NativeChargeLimit.registeredLimits(inBattlimitOutput: output)
+        } catch {
+            return nil
+        }
+    }
+
     /// Format raw SMC bytes as hex string, e.g. "0x01 00 00 00".
     private static func formatHex(_ bytes: [UInt8]) -> String {
         "0x" + bytes.map { String(format: "%02x", $0) }.joined(separator: " ")
@@ -2114,7 +2427,7 @@ final class BatteryMonitor: ObservableObject {
             // Cannot read SMC — preserve any existing warning rather than
             // clearing it. Log it: without this the check silently never
             // completes and About shows "pending" with no clue why.
-            NSLog("Ampere: Health check skipped — CHTE/CHIE read failed")
+            AmpereLog.app("Ampere: Health check skipped — CHTE/CHIE read failed")
             return
         }
 
@@ -2174,7 +2487,7 @@ final class BatteryMonitor: ObservableObject {
             newExpected = "\(SMC.keyChargeTerminate)=\(expected.chte)\n\(SMC.keyChargeInhibit)=\(expected.chie)"
             newCHTEMatch = chteHex == expected.chte
             newCHIEMatch = chieHex == expected.chie
-            NSLog("Ampere: Health check failed — CHTE=%d CHIE=%d charge=%d%% paused=%d auto=%d discharge=%d bounds=[%d,%d]",
+            AmpereLog.app("Ampere: Health check failed — CHTE=%d CHIE=%d charge=%d%% paused=%d auto=%d discharge=%d bounds=[%d,%d]",
                   chte, chie, battery.percentage, chargingPaused, autoManageEnabled, autoDischargeEnabled,
                   chargeLowerBound, chargeUpperBound)
 
@@ -2200,7 +2513,7 @@ final class BatteryMonitor: ObservableObject {
                     let ok = self.runSMCWrite(op)
                     DispatchQueue.main.async {
                         self.autoManageInFlight = false
-                        NSLog("Ampere: Health check CHTE repair (%@) at %d%% %@",
+                        AmpereLog.app("Ampere: Health check CHTE repair (%@) at %d%% %@",
                               op == .inhibit ? "inhibit" : "allow", pct,
                               ok ? "applied" : "failed")
                         if self.controlRevision != revision || self.wakeReassertPending {
@@ -2241,7 +2554,11 @@ final class BatteryMonitor: ObservableObject {
     /// Re-run the health check immediately (e.g. after revoke/re-grant admin).
     private func recheckHealth() {
         guard let battery = self.io.battery() else { return }
-        performHealthCheck(battery: battery)
+        if nativeLimitMode {
+            performNativeHealthCheck(battery: battery)
+        } else {
+            performHealthCheck(battery: battery)
+        }
     }
 
     /// Lid state (clamshell), read from IOPMrootDomain. Consulted only by
@@ -2297,6 +2614,7 @@ final class BatteryMonitor: ObservableObject {
         var amperage: Double?
         var voltage: Double?
         var temperature = 0.0
+        var temperatureRead = false
         var adapterWatts: Double?
         var adapterAmperage: Double?
         var adapterVoltage: Double?
@@ -2325,6 +2643,26 @@ final class BatteryMonitor: ObservableObject {
             }
             if let val = IORegistryEntryCreateCFProperty(service, "Temperature" as CFString, nil, 0)?.takeRetainedValue() as? Int {
                 temperature = Double(val) / 100.0
+                temperatureRead = true
+            }
+            // macOS 27 dropped the top-level capacity and temperature keys:
+            // DesignCapacity, AppleRawMaxCapacity and AppleRawCurrentCapacity
+            // now exist only inside the BatteryData dictionary (as
+            // DesignCapacity, FullChargeCapacity and RemainingCapacity), and
+            // Temperature left the registry entry altogether, leaving the
+            // SMC's battery sensor as the only source. Without these
+            // fallbacks the Health card showed the 100% default, Raw Charge
+            // collapsed to the plain percentage and Temperature read 0°C.
+            // Each fallback runs only when its top-level key is absent, so
+            // earlier macOS versions keep reading exactly what they did.
+            if designCap == 0 || maxCap == 0 || currentCap == 0,
+               let battData = IORegistryEntryCreateCFProperty(service, "BatteryData" as CFString, nil, 0)?.takeRetainedValue() as? [String: Any] {
+                if designCap == 0, let val = battData["DesignCapacity"] as? Int { designCap = val }
+                if maxCap == 0, let val = battData["FullChargeCapacity"] as? Int { maxCap = val }
+                if currentCap == 0, let val = battData["RemainingCapacity"] as? Int { currentCap = val }
+            }
+            if !temperatureRead, let val = smcBatteryTemperature() {
+                temperature = val
             }
             if let val = IORegistryEntryCreateCFProperty(service, "FullyCharged" as CFString, nil, 0)?.takeRetainedValue() as? Bool {
                 fullyCharged = val

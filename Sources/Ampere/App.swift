@@ -1,4 +1,5 @@
 import SwiftUI
+import Shared
 import AppKit
 import Combine
 import ServiceManagement
@@ -51,6 +52,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
             button.image = buildMenuBarIcon(percentage: 0, hasWarning: false)
+        }
+        // macOS lets the user hide any menu bar item (System Settings >
+        // Menu Bar) and remembers that per item across launches. The item
+        // is this app's only UI, so say so in the log: every "no icon"
+        // report starts here. Reopening the app shows it again (below).
+        if !statusItem.isVisible {
+            AmpereLog.app("Ampere: status item starts hidden by the macOS Menu Bar setting; reopen the app to show it")
         }
 
         // 2. Heavy init — blocks the main thread on sudo SMC writes. The
@@ -141,6 +149,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             guard let self, self.popover.isShown, self.popover.behavior == .transient else { return }
             self.popover.performClose(nil)
         }
+    }
+
+    /// Launching the app while it is already running is the user asking
+    /// for it, and the status item is the only thing they can be asking
+    /// for. Showing it again here is the standard recovery for a menu bar
+    /// item the user hid; a login launch is not a reopen, so a deliberate
+    /// hide still holds there.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if let statusItem, !statusItem.isVisible {
+            statusItem.isVisible = true
+            AmpereLog.app("Ampere: status item shown again on reopen")
+        }
+        return false
     }
 
     private var lastIconPct: Int = -1
@@ -802,6 +823,14 @@ struct ContentView: View {
                         : "Requires admin privileges for charge control.")
                         .font(.system(size: 12))
                         .foregroundColor(.secondary)
+                    // Which mechanism is holding the charge: the inhibit key
+                    // on firmware that still has it, otherwise the macOS
+                    // charge limit (see NativeChargeLimit).
+                    if monitor.nativeLimitMode {
+                        Text("Charge control: macOS charge limit (this firmware has no CHTE key).")
+                            .font(.system(size: 12))
+                            .foregroundColor(.secondary)
+                    }
                     HStack {
                         Spacer()
                         Button("OK") { showAbout = false }
@@ -896,6 +925,15 @@ struct ContentView: View {
         if let error = monitor.lastError { return error }
         if let warning = monitor.healthWarning { return warning }
         if monitor.activeDischarging {
+            // Native mode: the firmware drains to the bound on its own once
+            // the macOS charge limit applies (up to a minute after the
+            // target is set); sleep is never overridden there.
+            if monitor.nativeLimitMode {
+                if (state.amperage ?? 0) > 0 {
+                    return "Discharge starting: macOS charge limit set to \(monitor.chargeUpperBound)%"
+                }
+                return "Discharging to \(monitor.chargeUpperBound)% through the macOS charge limit"
+            }
             // SMC discharge has been requested but may not have engaged yet
             // (transient at startup or just after toggling the feature on).
             // Describe the *current* state — the battery is still gaining
@@ -923,8 +961,10 @@ struct ContentView: View {
             // "drains to X% under load" implies passive drain via the adapter
             // rail — only accurate on AC. On battery, the battery drains
             // directly regardless of CHTE, so fall through to the generic
-            // "holding" message which is still accurate.
-            if state.adapterConnected && state.percentage > monitor.chargeUpperBound {
+            // "holding" message which is still accurate. In native mode a
+            // hold pins the level exactly (the Mac runs from the adapter),
+            // so the generic message is the accurate one there too.
+            if !monitor.nativeLimitMode && state.adapterConnected && state.percentage > monitor.chargeUpperBound {
                 return "Auto: not charging — drains to \(monitor.chargeUpperBound)% under load"
             }
             return "Auto: holding — charges below \(monitor.chargeLowerBound)% or on demand"
@@ -1188,7 +1228,9 @@ struct ContentView: View {
         // State-dependent like the pin/settings tooltips: each side says what
         // is active now and what flipping the toggle switches to.
         .help(monitor.autoManageEnabled
-            ? "On: Ampere keeps the battery between the bounds; charging starts below the lower bound and stops at the upper bound. A below-lower charge keeps the Mac awake until it finishes; other charges pause during sleep and resume on wake. Turn off for standard macOS charging with manual Pause/Resume."
+            ? (monitor.nativeLimitMode
+                ? "On: Ampere keeps the battery between the bounds through the macOS charge limit; charging starts below the lower bound and stops at the upper bound, awake or asleep. Turn off for standard macOS charging with manual Pause/Resume."
+                : "On: Ampere keeps the battery between the bounds; charging starts below the lower bound and stops at the upper bound. A below-lower charge keeps the Mac awake until it finishes; other charges pause during sleep and resume on wake. Turn off for standard macOS charging with manual Pause/Resume.")
             : "Off: standard macOS charging to full, with manual Pause/Resume while on AC. Turn on to keep the battery between the lower and upper bounds automatically. Requires admin access.")
     }
 
@@ -1251,7 +1293,9 @@ struct ContentView: View {
                         .toggleStyle(.switch)
                         .controlSize(.small)
                     }
-                    .help("Actively drain the battery to the upper bound; sleep is disabled while discharging")
+                    .help(monitor.nativeLimitMode
+                        ? "Actively drain the battery to the upper bound through the macOS charge limit; the firmware does the draining, so sleep is unaffected"
+                        : "Actively drain the battery to the upper bound; sleep is disabled while discharging")
                 } else if state.percentage >= monitor.chargeLowerBound && state.percentage < monitor.chargeUpperBound {
                     HStack {
                         Image(systemName: "arrow.up.to.line")
@@ -1492,7 +1536,7 @@ struct ContentView: View {
                 try SMAppService.mainApp.unregister()
             }
         } catch {
-            NSLog("Ampere: Failed to \(enabled ? "enable" : "disable") launch at login: %@", error.localizedDescription)
+            AmpereLog.app("Ampere: Failed to \(enabled ? "enable" : "disable") launch at login: %@", error.localizedDescription)
             // Revert toggle on failure
             launchAtLogin = SMAppService.mainApp.status == .enabled
         }

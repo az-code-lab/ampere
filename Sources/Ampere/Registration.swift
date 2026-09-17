@@ -1,4 +1,5 @@
 import Foundation
+import Shared
 import Combine
 import IOKit
 
@@ -104,7 +105,7 @@ final class RegistrationManager: ObservableObject {
             case .success(let json):
                 self.setState(registered: true, email: email, key: key,
                               name: json["name"] as? String ?? "")
-                NSLog("Ampere: Registered to %@", email)
+                AmpereLog.app("Ampere: Registered to %@", email)
                 completion(true)
             case .failure(let message, _):
                 self.lastError = message
@@ -128,7 +129,7 @@ final class RegistrationManager: ObservableObject {
             switch result {
             case .success:
                 self.setState(registered: false)
-                NSLog("Ampere: Deregistered")
+                AmpereLog.app("Ampere: Deregistered")
                 completion(true)
             case .failure(_, let status) where status == 404:
                 // The server has no active registration for this Mac — the
@@ -154,7 +155,7 @@ final class RegistrationManager: ObservableObject {
             if case .success(let json) = result,
                let valid = json["valid"] as? Bool {
                 if !valid {
-                    NSLog("Ampere: Registration no longer valid, switching to unregistered")
+                    AmpereLog.app("Ampere: Registration no longer valid, switching to unregistered")
                     self.setState(registered: false)
                     self.lastError = "Registration is no longer valid for this Mac"
                 } else if let license = json["license"] as? [String: Any],

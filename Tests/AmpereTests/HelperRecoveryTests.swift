@@ -53,4 +53,26 @@ final class HelperRecoveryTests: XCTestCase {
         XCTAssertFalse(HelperRecovery.restore(clearDischarge: { true },
             restoreSleep: { true }, stopWatchdogs: { false }))
     }
+
+    func testFailedNativeLimitReleaseKeepsTheWatchdog() {
+        var stopped = false
+        let ok = HelperRecovery.restore(
+            clearDischarge: { true },
+            allowCharging: { true },
+            restoreSleep: { true },
+            releaseNativeLimit: { false },
+            stopWatchdogs: { stopped = true; return true })
+        XCTAssertFalse(ok)
+        XCTAssertFalse(stopped, "The macOS charge limit still needs restoring, so the watchdog stays")
+    }
+
+    func testNativeLimitReleaseDefaultsToNoOp() {
+        var stopped = false
+        let ok = HelperRecovery.restore(
+            clearDischarge: { true },
+            restoreSleep: { true },
+            stopWatchdogs: { stopped = true; return true })
+        XCTAssertTrue(ok)
+        XCTAssertTrue(stopped)
+    }
 }

@@ -20,6 +20,11 @@ public enum AppConstants {
     /// OTHER keep-awake tool (e.g. Lidless) that had raised the same flag.
     /// No legacy /tmp path: older builds never wrote this marker.
     public static let savedSleepDisabledPath = "\(stateDirPath)/saved-sleep-disabled"
+    /// Pre-override values of macOS's own charge-limit switch and target
+    /// (see NativeChargeLimit), saved before the helper first overrides
+    /// them on firmware without CHTE. Same persistence rationale as the
+    /// pmset markers: the override outlives a crash and a reboot.
+    public static let savedNativeLimitPath = "\(stateDirPath)/saved-native-limit"
     /// Legacy marker locations used by older builds. Readers fall back to
     /// these so an upgrade with a marker still outstanding restores correctly.
     public static let legacySavedSleepPath = "/tmp/.\(appPrefix)-saved-sleep"

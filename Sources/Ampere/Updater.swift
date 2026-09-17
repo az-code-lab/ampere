@@ -1,4 +1,5 @@
 import Foundation
+import Shared
 import AppKit
 import CryptoKit
 
@@ -76,7 +77,7 @@ extension BatteryMonitor {
         }
 
         updateState = .downloading(0)
-        NSLog("Ampere: Update %@ — downloading %@", update.version, update.dmgURL.absoluteString)
+        AmpereLog.app("Ampere: Update %@ — downloading %@", update.version, update.dmgURL.absoluteString)
         let task = URLSession.shared.downloadTask(with: update.dmgURL) { [weak self] tempURL, response, error in
             guard let self else { return }
             // URLSession deletes tempURL when this handler returns — claim
@@ -133,7 +134,7 @@ extension BatteryMonitor {
 
     private func failUpdate(_ error: Error) {
         let message = (error as? UpdateError)?.message ?? error.localizedDescription
-        NSLog("Ampere: Update failed: %@", message)
+        AmpereLog.app("Ampere: Update failed: %@", message)
         DispatchQueue.main.async { self.updateState = .failed(message) }
     }
 
@@ -196,7 +197,7 @@ extension BatteryMonitor {
             // 5. Hand off to a detached shell that waits for this process to
             //    exit, then opens the new copy.
             try Self.spawnRelauncher(appPath: appBundleURL.path)
-            NSLog("Ampere: Update %@ installed — relaunching", update.version)
+            AmpereLog.app("Ampere: Update %@ installed — relaunching", update.version)
             DispatchQueue.main.async { NSApp.terminate(nil) }
         } catch {
             failUpdate(error)

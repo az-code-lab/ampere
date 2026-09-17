@@ -32,6 +32,12 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         /// Non-nil: an installed copy the cleanup job should watch.
         var bundlePath: String?
         var daemonRegistered = false
+        /// True: the SMC has no CHTE key (macOS 27 firmware), so the
+        /// monitor takes the macOS charge-limit path.
+        var chteMissing = false
+        /// The targets "powerd" enforces, as the native commands leave them.
+        var registered: [Int] = []
+        var clock = Date()
         let preferences = MemoryBatteryPreferences()
         private let lock = NSLock()
         private var commands: [String] = []
@@ -63,6 +69,12 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
             chte = 0
         }
 
+        /// Someone else (System Settings, another tool) cleared the limit.
+        func clearRegisteredLimits() {
+            lock.lock(); defer { lock.unlock() }
+            registered = []
+        }
+
         func write(_ command: String) -> Bool {
             lock.lock()
             let waiting = gate?.0 == command ? gate?.1 : nil
@@ -79,12 +91,16 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
             case "inhibit": chte = 1
             case "allow": chte = 0
             case "nodischarge": chie = 0; held = false
-            case "restore": chte = 0; chie = 0; held = false
+            case "restore": chte = 0; chie = 0; held = false; registered = []
+            case "native-limit-release": registered = []
             case "hold-sleep": held = true
             case "release-sleep-hold": held = false
             default:
                 if command.hasPrefix("discharge:") { chie = 8; held = true }
                 if command.hasPrefix("register-daemon:") { daemonRegistered = true }
+                if command.hasPrefix("native-limit:"), let n = Int(command.dropFirst("native-limit:".count)) {
+                    registered = [n]
+                }
             }
             return true
         }
@@ -108,8 +124,15 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
             }
             io.readKey = { key in
                 self.lock.lock(); defer { self.lock.unlock() }
-                return key == SMC.keyChargeTerminate ? [self.chte, 0, 0, 0] : [self.chie]
+                if key == SMC.keyChargeTerminate { return self.chteMissing ? nil : [self.chte, 0, 0, 0] }
+                return [self.chie]
             }
+            io.chargeTerminateAvailable = { !self.chteMissing }
+            io.registeredNativeLimits = {
+                self.lock.lock(); defer { self.lock.unlock() }
+                return self.registered
+            }
+            io.now = { self.clock }
             io.writeHelper = write
             io.helperInstalled = { self.installed }
             io.helperAuthorized = { self.authorized }
@@ -545,5 +568,152 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         let monitor = hw.monitor(startMonitoring: true)
         XCTAssertEqual(hw.installs, 0)
         XCTAssertTrue(monitor.chargingPaused)
+    }
+
+    // MARK: - Native charge limit (firmware without CHTE)
+
+    private var pid: Int32 { ProcessInfo.processInfo.processIdentifier }
+
+    /// A monitor that took charge control on CHTE-less firmware: launch
+    /// cleanup skips the inhibit write and the first poll hands the macOS
+    /// charge limit its target.
+    private func nativeMonitor(_ hw: Hardware) -> BatteryMonitor {
+        hw.chteMissing = true
+        let monitor = hw.monitor(startMonitoring: true)
+        XCTAssertTrue(monitor.nativeLimitMode)
+        awaitCondition { hw.writes.count >= 4 }
+        return monitor
+    }
+
+    func testNativeMode_LaunchBetweenBoundsHoldsAtTheCurrentLevel() {
+        let hw = Hardware()
+        hw.percentage = 50
+        let monitor = nativeMonitor(hw)
+        XCTAssertEqual(hw.writes, ["nodischarge", "native-limit-release", "spawn-watchdog:\(pid)", "native-limit:50"],
+                       "Launch cleanup releases whatever a crashed session left, then the first poll sets the target")
+        XCTAssertTrue(monitor.chargingPaused)
+        // The firmware may let the level tick up before the target applies:
+        // the hold is not chased.
+        hw.percentage = 51
+        for _ in 0..<3 { monitor.refresh() }
+        drainCallbacks()
+        XCTAssertEqual(hw.writes.count, 4)
+        XCTAssertFalse(hw.writes.contains("inhibit"))
+        XCTAssertFalse(hw.writes.contains("allow"))
+    }
+
+    func testNativeMode_BelowLowerChargesToUpperThenHoldsThere() {
+        let hw = Hardware()
+        hw.percentage = 30
+        let monitor = nativeMonitor(hw)
+        XCTAssertEqual(hw.writes.last, "native-limit:60")
+        XCTAssertTrue(monitor.chargeToUpperBound)
+        XCTAssertFalse(monitor.chargingPaused)
+        hw.percentage = 60
+        monitor.refresh()
+        drainCallbacks()
+        XCTAssertTrue(monitor.chargingPaused)
+        XCTAssertFalse(monitor.chargeToUpperBound)
+        XCTAssertEqual(hw.writes.filter { $0.hasPrefix("native-limit:") }, ["native-limit:60"],
+                       "Reaching the bound turns the target into a hold without another write")
+    }
+
+    func testNativeMode_UnplugTracksTheLevelDownSoAReconnectDoesNotCharge() {
+        let hw = Hardware()
+        hw.percentage = 50
+        let monitor = nativeMonitor(hw)
+        hw.connected = false
+        hw.percentage = 45
+        monitor.refresh()
+        awaitCondition { hw.writes.last == "native-limit:45" }
+        hw.percentage = 44
+        monitor.refresh()
+        awaitCondition { hw.writes.last == "native-limit:44" }
+        hw.connected = true
+        for _ in 0..<2 { monitor.refresh() }
+        drainCallbacks()
+        XCTAssertEqual(hw.writes.last, "native-limit:44", "Reconnecting between the bounds parks at the current level")
+        XCTAssertTrue(monitor.chargingPaused)
+    }
+
+    func testNativeMode_DischargeToUpperIsTheFirmwareDrain() {
+        let hw = Hardware()
+        hw.percentage = 80
+        hw.preferences.values["autoDischargeEnabled"] = true
+        let monitor = nativeMonitor(hw)
+        XCTAssertEqual(hw.writes.last, "native-limit:60")
+        XCTAssertTrue(monitor.activeDischarging)
+        XCTAssertFalse(hw.writes.contains { $0.hasPrefix("discharge:") }, "CHIE is never written in native mode")
+        hw.percentage = 60
+        monitor.refresh()
+        drainCallbacks()
+        XCTAssertFalse(monitor.activeDischarging)
+        XCTAssertEqual(hw.writes.filter { $0.hasPrefix("native-limit:") }, ["native-limit:60"])
+    }
+
+    func testNativeMode_AboveUpperWithoutDischargeHoldsWhereItIs() {
+        let hw = Hardware()
+        hw.percentage = 80
+        let monitor = nativeMonitor(hw)
+        XCTAssertEqual(hw.writes.last, "native-limit:80")
+        XCTAssertFalse(monitor.activeDischarging)
+    }
+
+    func testNativeMode_ManualPauseHoldsAndResumeReleases() {
+        let hw = Hardware()
+        hw.preferences.values["autoManageEnabled"] = false
+        hw.percentage = 50
+        hw.chteMissing = true
+        let monitor = hw.monitor(startMonitoring: true)
+        drainCallbacks()
+        XCTAssertEqual(hw.writes, ["nodischarge", "native-limit-release", "spawn-watchdog:\(pid)"],
+                       "Manual mode leaves the macOS setting alone once launch cleanup has released any leftover")
+        monitor.toggleCharging()
+        awaitCondition { hw.writes.last == "native-limit:50" }
+        XCTAssertTrue(monitor.chargingPaused)
+        monitor.toggleCharging()
+        awaitCondition { hw.writes.last == "native-limit-release" }
+        XCTAssertFalse(monitor.chargingPaused)
+    }
+
+    func testNativeMode_HealthCheckPassesThenRepairsADriftedLimit() {
+        let hw = Hardware()
+        hw.percentage = 50
+        let monitor = nativeMonitor(hw)
+        for _ in 0..<5 { monitor.refresh() }
+        drainCallbacks()
+        XCTAssertEqual(monitor.lastHealthCheckStatus, "pass")
+        XCTAssertEqual(monitor.lastHealthCheckSMC, "macOS limit=50%\nCHIE=0x00")
+        // Someone else cleared the limit. Inside the settle window nothing is
+        // reported; past it the check fails silently and re-issues the target.
+        hw.clearRegisteredLimits()
+        monitor.refresh()
+        drainCallbacks()
+        XCTAssertEqual(monitor.lastHealthCheckStatus, "pass", "Still settling: no verdict yet")
+        hw.clock = hw.clock.addingTimeInterval(200)
+        monitor.refresh()
+        drainCallbacks()
+        XCTAssertEqual(monitor.lastHealthCheckStatus, "FAIL")
+        XCTAssertNil(monitor.healthWarning, "The first repair is silent")
+        monitor.refresh()
+        awaitCondition { hw.writes.filter { $0 == "native-limit:50" }.count == 2 }
+        hw.clock = hw.clock.addingTimeInterval(200)
+        for _ in 0..<2 { monitor.refresh() }
+        drainCallbacks()
+        XCTAssertEqual(monitor.lastHealthCheckStatus, "pass")
+        XCTAssertNil(monitor.healthWarning)
+    }
+
+    func testNativeMode_SleepHooksWriteNothingAndQuitRestores() {
+        let hw = Hardware()
+        hw.percentage = 50
+        let monitor = nativeMonitor(hw)
+        let before = hw.writes.count
+        monitor.prepareForSleep()
+        monitor.resumeAfterWake()
+        drainCallbacks()
+        XCTAssertEqual(hw.writes.count, before, "No pre-sleep pause and no wake re-assert: the firmware holds the target")
+        monitor.restoreBeforeTermination()
+        XCTAssertEqual(hw.writes.last, "restore")
     }
 }
