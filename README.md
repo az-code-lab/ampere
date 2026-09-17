@@ -27,9 +27,11 @@ A lightweight macOS menu bar app for monitoring battery status and controlling c
 
 ## Requirements
 
-- macOS 14 (Sonoma) or later
+- macOS 26 (Tahoe) or later
 - Apple Silicon Mac
 - Admin privileges (for charge control features)
+
+macOS 14 and 15 are not supported. Ampere is built and tested on macOS 26 and 27 only, and what it needs to control charging is not reliably there on the older systems: they have the `CHTE` key only with the firmware some of their security updates install, and the macOS charge limit that Ampere falls back on without `CHTE` arrived in macOS 26.4 (see Firmware without CHTE below). The app still opens on macOS 14 and 15, so an existing install there is not cut off, but it gets no further updates: the Homebrew cask requires macOS 26, and the in-app updater follows the cask (see Updates).
 
 ## Installation
 
@@ -72,6 +74,8 @@ When enabled, the app automatically manages charging between configurable bounds
 Custom charge bounds are the licensed feature. An unregistered copy runs the default 40 to 60% range: the slider still shows the bounds, but the draggers are locked (their tooltips say so), and a **Register to change** link beneath the slider opens the registration window. Everything else, including auto charge itself, micro-charge prevention, charge and discharge to upper bound, charge to full, and keep awake, works the same unregistered.
 
 Registering unlocks the draggers immediately. If the registration lapses (deregistered from the panel, the key registered on another Mac, or the daily verify reporting the license revoked), both bounds return to 40 to 60% at once and the draggers lock again; the state machine treats that like any other bound change, so a charge already past 60% is inhibited on the next poll. The reset is also applied at launch, so a custom range persisted by a lapsed registration never resurfaces after a restart. Network failures never lapse a registration, so an offline Mac keeps its custom bounds.
+
+Registering sends the email, the key, the Mac's device serial, the app version, and the macOS version to the license server; the daily verify sends the same without the key. The macOS version is there to show which systems registered Macs actually run, which is what decides the oldest macOS the app has to keep supporting. An unregistered copy sends none of this: it never contacts the license server, and its only network traffic is the update check against the public Homebrew cask, plus the download from GitHub Releases when you click Update.
 
 #### Micro-Charge Prevention
 
@@ -186,12 +190,16 @@ NSLog is not used anymore: from macOS 27 its messages show up in `log show` only
 The app checks the Homebrew cask for a newer version 5 minutes after launch and about once a day after that. When one is found, the menu bar battery icon gains a small blue badge dot (hover for the version; the dot renders alongside the orange health-warning tint when both apply) and the panel footer shows an **Update to X** button. Clicking it:
 
 1. Downloads the release DMG from GitHub Releases (progress shown in the footer, with a cancel button).
-2. Verifies the download: SHA-256 must match the cask, the code signature must be intact, and the Team ID must match the running app.
+2. Verifies the download: SHA-256 must match the cask, the code signature must be intact, the Team ID must match the running app, and the macOS the new bundle asks for (`LSMinimumSystemVersion`) must not be newer than the one this Mac runs.
 3. Swaps the new bundle into place (one atomic exchange; volumes without swap support fall back to two renames) and relaunches.
 
 The relaunch takes the normal quit → restart path: SMC overrides are restored on the way down, and persisted state (auto charge, bounds, an in-progress charge/discharge to upper bound) resumes in the new copy. If the bundled SMCWriter changed, the next launch asks for your admin password once to install the new helper — same as after a Homebrew upgrade.
 
 If any step fails (e.g. the install location isn't writable), the error is shown next to the button and nothing is changed; `brew upgrade --cask ampere` always works as a fallback. Updating in-app leaves Homebrew's recorded version behind until the next `brew upgrade`, which harmlessly reinstalls the current release.
+
+A release is offered only to a Mac that can run it. The cask's `depends_on macos:` line names the oldest macOS a release supports (Homebrew reads a bare release name such as `:tahoe` as "this or later"). When this Mac runs something older, no update is offered and the installed version stays; a clicked **Check for Updates** answers **Needs macOS N** instead of **Up to Date**. `brew upgrade` refuses the same release from the same line, so both channels agree. A release name newer than the running build knows is not treated as a refusal (it may be the very macOS the build runs on), which is why step 2 checks the downloaded bundle as well: that check needs no name table, and it is the one that keeps a working copy from being replaced by an app macOS will not open.
+
+The launch floor (`LSMinimumSystemVersion` and the deployment target in `Package.swift`, both 14.0) is deliberately lower than the supported floor above. Versions up to 0.0.64 install whatever the cask advertises without asking whether it can open here, so raising the launch floor now would let a Mac on macOS 14 or 15 swap a working copy for one that cannot launch. It can be raised once installs have moved through a version that makes the check; the macOS version registered copies report (see Charge Bounds and Registration) shows when that is.
 
 ## Build from Source
 

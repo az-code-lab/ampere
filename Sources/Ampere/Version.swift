@@ -33,3 +33,16 @@ enum AppVersion {
         return "dev"
     }()
 }
+
+enum SystemVersion {
+    /// The macOS version this Mac runs, written the way `sw_vers
+    /// -productVersion` prints it.
+    static let current = string(ProcessInfo.processInfo.operatingSystemVersion)
+
+    /// "27.0" or "26.7.1": major and minor always, the patch only when it is
+    /// not zero. Internal (not private) so the format can be pinned by tests.
+    static func string(_ version: OperatingSystemVersion) -> String {
+        let base = "\(version.majorVersion).\(version.minorVersion)"
+        return version.patchVersion == 0 ? base : "\(base).\(version.patchVersion)"
+    }
+}

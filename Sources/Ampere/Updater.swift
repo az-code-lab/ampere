@@ -10,6 +10,10 @@ struct AvailableUpdate: Equatable {
     let dmgURL: URL
     /// Lowercased hex SHA-256 of the DMG, as published in the cask.
     let sha256: String
+    /// Oldest macOS the cask says the release runs on, as a major version
+    /// ("26"), from its `depends_on macos:` line. Nil when the cask states no
+    /// minimum, or names a release this build has no number for.
+    let minimumMacOS: String?
 }
 
 /// Lifecycle of a click-to-update install. `failed` keeps the update button
@@ -51,14 +55,63 @@ extension BatteryMonitor {
         else { return nil }
         let urlString = urlTemplate.replacingOccurrences(of: "#{version}", with: version)
         guard let url = URL(string: urlString), url.scheme == "https" else { return nil }
-        return AvailableUpdate(version: version, dmgURL: url, sha256: sha.lowercased())
+        return AvailableUpdate(version: version, dmgURL: url, sha256: sha.lowercased(),
+                               minimumMacOS: minimumMacOS(inCask: content))
+    }
+
+    /// Homebrew's names for macOS releases, with their major versions. A cask
+    /// can only name a release, never a number.
+    private static let homebrewMacOSReleases = [
+        "sonoma": "14", "sequoia": "15", "tahoe": "26", "golden_gate": "27",
+    ]
+
+    /// The minimum macOS a cask's `depends_on macos:` line asks for, as a
+    /// major version. Homebrew reads a bare release name as "this or later",
+    /// so `:tahoe` and the older spelling `">= :tahoe"` both give "26".
+    /// Nil for no such line, for a line that is not a minimum (a list of
+    /// releases, `"<= :…"`), and for a release name this build has no number
+    /// for. The last case cannot be decided here and is deliberately not
+    /// treated as a refusal: a name this build has never heard of may well
+    /// be the macOS it is running on, and refusing would leave that Mac with
+    /// no way to update. The downloaded bundle's own minimum still decides
+    /// before anything is installed (see `launchBlocker`).
+    /// Internal (not private) so the parsing rules can be pinned by tests.
+    static func minimumMacOS(inCask content: String) -> String? {
+        guard let name = firstCapture(#"(?m)^\s*depends_on\s+macos:\s*(?:">=\s*)?:([a-z_]+)"?\s*(?:#.*)?$"#, in: content)
+        else { return nil }
+        return homebrewMacOSReleases[name]
+    }
+
+    /// The macOS an update needs when this Mac runs something older, nil when
+    /// the update can be offered. `running` is a dotted version ("15.7.4").
+    /// Internal (not private) so the rule can be pinned by tests.
+    static func macOSNeeded(for update: AvailableUpdate, running: String) -> String? {
+        guard let minimum = update.minimumMacOS, isNewerVersion(minimum, than: running) else { return nil }
+        return minimum
+    }
+
+    /// Why a bundle whose Info.plist declares `minimumSystemVersion`
+    /// (LSMinimumSystemVersion) must not replace the running app on a Mac
+    /// running `running`, or nil when it can launch there. An absent key
+    /// declares no minimum. A value that does not parse blocks the install:
+    /// swapping in an app that macOS then refuses to open would leave the
+    /// Mac without Ampere, so an unreadable answer counts as "no".
+    /// Internal (not private) so the rule can be pinned by tests.
+    static func launchBlocker(minimumSystemVersion: String?, running: String) -> String? {
+        guard let minimum = minimumSystemVersion else { return nil }
+        guard parseDottedVersion(minimum) != nil else {
+            return "Couldn't read which macOS the new version needs (\(minimum))"
+        }
+        guard isNewerVersion(minimum, than: running) else { return nil }
+        return "The new version needs macOS \(minimum) or later, and this Mac runs macOS \(running)"
     }
 
     /// Download the advertised DMG, verify it (SHA-256 from the cask, code
-    /// signature, Team ID matching the running app), swap the app bundle in
-    /// place, and relaunch. The relaunch goes through `NSApp.terminate`, i.e.
-    /// the same quit path as a normal exit: SMC overrides are restored on the
-    /// way down, and the relaunched copy restores persisted state.
+    /// signature, Team ID matching the running app, a minimum macOS this Mac
+    /// meets), swap the app bundle in place, and relaunch. The relaunch goes
+    /// through `NSApp.terminate`, i.e. the same quit path as a normal exit:
+    /// SMC overrides are restored on the way down, and the relaunched copy
+    /// restores persisted state.
     func installUpdate() {
         switch updateState {
         case .downloading, .installing: return  // already running
@@ -161,7 +214,22 @@ extension BatteryMonitor {
             //    team as the running app.
             try Self.verifyCodeSignature(newApp: newApp, currentApp: appBundleURL)
 
-            // 4. Stage a copy next to the destination (same volume), then
+            // 4. The new bundle must be able to open on this Mac. The cask's
+            //    macOS requirement already keeps such a release from being
+            //    offered, but only for release names this build knows; the
+            //    bundle's own declared minimum is the authority. Without
+            //    this, the swap below would replace a working app with one
+            //    macOS refuses to launch.
+            guard let info = NSDictionary(contentsOf: newApp.appendingPathComponent("Contents/Info.plist")) else {
+                throw UpdateError("Couldn't read the new version's Info.plist")
+            }
+            if let blocker = Self.launchBlocker(
+                minimumSystemVersion: info["LSMinimumSystemVersion"] as? String,
+                running: SystemVersion.current) {
+                throw UpdateError(blocker)
+            }
+
+            // 5. Stage a copy next to the destination (same volume), then
             //    swap it with the live bundle. renamex_np(RENAME_SWAP)
             //    exchanges the two paths atomically — at no instant is
             //    Ampere.app missing from disk. Volumes without swap support
@@ -194,7 +262,7 @@ extension BatteryMonitor {
             // relaunch doesn't stall on a Gatekeeper first-open dialog.
             _ = Self.runProcess("/usr/bin/xattr", ["-dr", "com.apple.quarantine", appBundleURL.path])
 
-            // 5. Hand off to a detached shell that waits for this process to
+            // 6. Hand off to a detached shell that waits for this process to
             //    exit, then opens the new copy.
             try Self.spawnRelauncher(appPath: appBundleURL.path)
             AmpereLog.app("Ampere: Update %@ installed — relaunching", update.version)

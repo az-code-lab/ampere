@@ -236,8 +236,13 @@ final class BatteryMonitor: ObservableObject {
     /// Lifecycle of an in-flight click-to-update install (see Updater.swift).
     @Published var updateState: UpdateState = .idle
     /// Feedback for a user-initiated "Check for Updates" click. Automatic
-    /// (daily) checks stay silent and never touch this.
-    enum ManualUpdateCheck { case none, checking, upToDate, failed }
+    /// (daily) checks stay silent and never touch this. `needsNewerMacOS`
+    /// answers a check that found a newer release this Mac's macOS is too
+    /// old for: `update` is that release, `macOS` the major version it needs.
+    enum ManualUpdateCheck: Equatable {
+        case none, checking, upToDate, failed
+        case needsNewerMacOS(update: String, macOS: String)
+    }
     @Published var manualUpdateCheck: ManualUpdateCheck = .none
     /// Invalidates the delayed reset of an outcome when a newer manual
     /// check starts before the previous outcome's text has cleared.
@@ -936,7 +941,8 @@ final class BatteryMonitor: ObservableObject {
                     return
                 case .idle, .failed: break
                 }
-                if Self.isNewerVersion(update.version, than: current) {
+                switch Self.updateOffer(update, installed: current, running: SystemVersion.current) {
+                case .available:
                     if self.updateAvailable != update {
                         self.updateAvailable = update
                         // A .failed from an older offer doesn't apply to this
@@ -946,7 +952,16 @@ final class BatteryMonitor: ObservableObject {
                     }
                     // The update row appearing is the answer; no text needed.
                     if manual { self.finishManualCheck(.none) }
-                } else {
+                case .needsNewerMacOS(let macOS):
+                    // Offering it would end in a refused install, so nothing
+                    // is offered and the installed version stays. `brew
+                    // upgrade` makes the same call from the same cask line.
+                    self.updateAvailable = nil
+                    self.updateState = .idle
+                    AmpereLog.app("Ampere: Update %@ needs macOS %@ or later (this Mac runs %@); staying on %@",
+                                  update.version, macOS, SystemVersion.current, current)
+                    if manual { self.finishManualCheck(.needsNewerMacOS(update: update.version, macOS: macOS)) }
+                case .upToDate:
                     self.updateAvailable = nil
                     self.updateState = .idle
                     if manual { self.finishManualCheck(.upToDate) }
@@ -954,6 +969,24 @@ final class BatteryMonitor: ObservableObject {
             }
         }
         task.resume()
+    }
+
+    /// What a fetched cask means for this install.
+    enum UpdateOffer: Equatable {
+        case upToDate
+        case available
+        /// A newer release exists, but it needs this macOS major version or
+        /// later and the Mac runs something older.
+        case needsNewerMacOS(String)
+    }
+
+    /// Decide it: a release that is not newer is never a macOS question, and
+    /// a newer one is offered only to a Mac that can run it.
+    /// Internal (not private) so the precedence can be pinned by tests.
+    static func updateOffer(_ update: AvailableUpdate, installed: String, running: String) -> UpdateOffer {
+        guard isNewerVersion(update.version, than: installed) else { return .upToDate }
+        if let macOS = macOSNeeded(for: update, running: running) { return .needsNewerMacOS(macOS) }
+        return .available
     }
 
     /// Compare two dotted version strings (e.g. "0.0.18" > "0.0.17").
@@ -974,8 +1007,9 @@ final class BatteryMonitor: ObservableObject {
     }
 
     /// "1.2.3" → [1, 2, 3]; nil if any component is non-numeric or the
-    /// string is empty.
-    private static func parseDottedVersion(_ s: String) -> [Int]? {
+    /// string is empty. Internal (not private): the updater extension in
+    /// Updater.swift validates a bundle's minimum macOS with it.
+    static func parseDottedVersion(_ s: String) -> [Int]? {
         let parts = s.split(separator: ".")
         guard !parts.isEmpty else { return nil }
         let nums = parts.compactMap { Int($0) }

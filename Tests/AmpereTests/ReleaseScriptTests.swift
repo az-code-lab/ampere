@@ -223,4 +223,29 @@ final class ReleaseScriptTests: XCTestCase {
         XCTAssertTrue(text.contains("Developer ID Application\\\" certificate for team"),
                       "the missing-certificate message no longer names what to install")
     }
+
+    func testTheBundleDeclaresTheSameOldestMacOSTheBinaryIsBuiltFor() throws {
+        // The oldest macOS the app can open on is stated three times: the
+        // deployment target in Package.swift (what the binary itself
+        // enforces), and LSMinimumSystemVersion and the asset catalog target
+        // here. The self-updater reads only LSMinimumSystemVersion before it
+        // swaps a new bundle in, so a plist that says less than the binary
+        // demands would let it install an app that cannot launch.
+        let manifest = try String(contentsOf: Self.repoRoot.appending(path: "Package.swift"), encoding: .utf8)
+        let script = try scriptText()
+        func capture(_ pattern: String, in text: String) throws -> String {
+            let regex = try NSRegularExpression(pattern: pattern)
+            let match = try XCTUnwrap(regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+                                      "nothing matches \(pattern)")
+            return String(text[try XCTUnwrap(Range(match.range(at: 1), in: text))])
+        }
+        // `.macOS(.v14)` or `.macOS("26.0")`.
+        let target = try capture(#"\.macOS\(\s*(?:\.v|")([0-9.]+)"?\s*\)"#, in: manifest)
+        let major = try XCTUnwrap(target.split(separator: ".").first.map(String.init))
+        let plist = try capture(#"<key>LSMinimumSystemVersion</key>\s*<string>([0-9.]+)</string>"#, in: script)
+        let assets = try capture(#"--minimum-deployment-target\s+([0-9.]+)"#, in: script)
+        let expected = target.contains(".") ? target : "\(major).0"
+        XCTAssertEqual(plist, expected, "LSMinimumSystemVersion and the Package.swift deployment target disagree")
+        XCTAssertEqual(assets, expected, "the asset catalog target and the Package.swift deployment target disagree")
+    }
 }

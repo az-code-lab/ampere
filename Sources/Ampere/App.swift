@@ -721,6 +721,11 @@ struct ContentView: View {
                             .font(.system(size: 12))
                             .foregroundColor(.orange)
                             .help("Could not reach the update feed. Check your connection and try again, or run: brew upgrade --cask ampere")
+                    case .needsNewerMacOS(let update, let macOS):
+                        Text("Needs macOS \(macOS)")
+                            .font(.system(size: 12))
+                            .foregroundColor(.orange)
+                            .help("Ampere \(update) needs macOS \(macOS) or later, and this Mac runs macOS \(SystemVersion.current). Ampere \(AppVersion.current) stays installed.")
                     }
                 }
                 Button("About") {

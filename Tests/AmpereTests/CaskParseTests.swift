@@ -3,7 +3,10 @@ import XCTest
 
 /// Pins `BatteryMonitor.parseCask`. The self-updater downloads and installs
 /// whatever this returns, so a partial or ambiguous parse must fail closed
-/// (nil) rather than guess.
+/// (nil) rather than guess. The one field read leniently is the minimum
+/// macOS: a line that cannot be read means "no known minimum", because the
+/// downloaded bundle's own minimum still decides before anything is installed
+/// (see UpdateMacOSGateTests).
 final class CaskParseTests: XCTestCase {
 
     private let goodSHA = String(repeating: "ab", count: 32)
@@ -11,7 +14,8 @@ final class CaskParseTests: XCTestCase {
     /// Mirrors the real Casks/ampere.rb shape.
     private func cask(version: String = "0.0.47",
                       sha: String? = nil,
-                      url: String? = "https://github.com/az-code-lab/ampere/releases/download/v#{version}/Ampere.dmg") -> String {
+                      url: String? = "https://github.com/az-code-lab/ampere/releases/download/v#{version}/Ampere.dmg",
+                      macos: String? = "depends_on macos: :tahoe") -> String {
         """
         cask "ampere" do
           version "\(version)"
@@ -20,9 +24,10 @@ final class CaskParseTests: XCTestCase {
           \(url.map { "url \"\($0)\"" } ?? "")
           name "Ampere"
           desc "Menu bar app for monitoring battery status and controlling charging"
-          homepage "https://github.com/az-code-lab/ampere"
+          homepage "https://amperebattery.app/"
 
-          depends_on macos: :sonoma
+          depends_on arch: :arm64
+          \(macos ?? "")
 
           app "Ampere.app"
         end
@@ -35,6 +40,46 @@ final class CaskParseTests: XCTestCase {
         XCTAssertEqual(update?.sha256, goodSHA)
         XCTAssertEqual(update?.dmgURL.absoluteString,
                        "https://github.com/az-code-lab/ampere/releases/download/v0.0.47/Ampere.dmg")
+        XCTAssertEqual(update?.minimumMacOS, "26")
+    }
+
+    // MARK: Minimum macOS
+
+    func testMinimumMacOS_BareReleaseNameMeansThisOrLater() {
+        XCTAssertEqual(BatteryMonitor.parseCask(cask(macos: "depends_on macos: :sonoma"))?.minimumMacOS, "14")
+        XCTAssertEqual(BatteryMonitor.parseCask(cask(macos: "depends_on macos: :sequoia"))?.minimumMacOS, "15")
+        XCTAssertEqual(BatteryMonitor.parseCask(cask(macos: "depends_on macos: :golden_gate"))?.minimumMacOS, "27")
+    }
+
+    func testMinimumMacOS_OlderComparisonSpelling() {
+        XCTAssertEqual(BatteryMonitor.parseCask(cask(macos: #"depends_on macos: ">= :tahoe""#))?.minimumMacOS, "26")
+    }
+
+    func testMinimumMacOS_TrailingCommentIgnored() {
+        XCTAssertEqual(BatteryMonitor.parseCask(cask(macos: "depends_on macos: :tahoe # CHTE or Charge Limit"))?.minimumMacOS, "26")
+    }
+
+    func testMinimumMacOS_AbsentLine_Nil() {
+        // The arch line alone must not be read as a macOS requirement.
+        let update = BatteryMonitor.parseCask(cask(macos: nil))
+        XCTAssertNotNil(update)
+        XCTAssertNil(update?.minimumMacOS)
+    }
+
+    func testMinimumMacOS_NotAMinimum_Nil() {
+        // A ceiling or a list says nothing about the oldest macOS allowed.
+        XCTAssertNil(BatteryMonitor.parseCask(cask(macos: #"depends_on macos: "<= :tahoe""#))?.minimumMacOS)
+        XCTAssertNil(BatteryMonitor.parseCask(cask(macos: "depends_on macos: [:sonoma, :sequoia]"))?.minimumMacOS)
+        XCTAssertNil(BatteryMonitor.parseCask(cask(macos: "depends_on maximum_macos: :tahoe"))?.minimumMacOS)
+    }
+
+    func testMinimumMacOS_UnknownReleaseName_NilButStillAnUpdate() {
+        // A name newer than this build knows may be the very macOS it runs
+        // on; refusing would strand that Mac, so the offer stands and the
+        // bundle's own minimum decides at install time.
+        let update = BatteryMonitor.parseCask(cask(macos: "depends_on macos: :some_future_release"))
+        XCTAssertEqual(update?.version, "0.0.47")
+        XCTAssertNil(update?.minimumMacOS)
     }
 
     func testUppercaseShaNormalizedToLowercase() {

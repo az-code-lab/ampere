@@ -49,6 +49,13 @@ final class RegistrationManager: ObservableObject {
         ? String(AppVersion.current.dropFirst())
         : AppVersion.current
 
+    /// This Mac's macOS version ("26.7.1"), reported with register/verify
+    /// beside the app version. It shows the license dashboard which systems
+    /// registered Macs run, which is what decides the oldest macOS the app
+    /// has to keep supporting. Only registered copies ever send it: an
+    /// unregistered copy makes no license-server call at all.
+    private static let macOSVersion = SystemVersion.current
+
     /// Production server; override for local testing with
     /// `defaults write <bundle id> registration.serverURL http://localhost:8080`.
     private static var baseURL: URL {
@@ -98,7 +105,7 @@ final class RegistrationManager: ObservableObject {
         lastError = nil
         post("/api/pub/license/register",
              body: ["email": email, "license_key": key, "device_serial": serial,
-                    "app_version": Self.appVersion]) { [weak self] result in
+                    "app_version": Self.appVersion, "macos_version": Self.macOSVersion]) { [weak self] result in
             guard let self else { return }
             self.isBusy = false
             switch result {
@@ -150,7 +157,7 @@ final class RegistrationManager: ObservableObject {
         guard isRegistered, !email.isEmpty, let serial = deviceSerial else { return }
         post("/api/pub/license/verify",
              body: ["email": email, "device_serial": serial, "product": Self.product,
-                    "app_version": Self.appVersion]) { [weak self] result in
+                    "app_version": Self.appVersion, "macos_version": Self.macOSVersion]) { [weak self] result in
             guard let self else { return }
             if case .success(let json) = result,
                let valid = json["valid"] as? Bool {
