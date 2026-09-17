@@ -50,6 +50,36 @@ struct BatteryState: Equatable {
     let fullyCharged: Bool
 }
 
+/// The "Battery Served" card's labels, from the gas gauge's lifetime
+/// operating-hours counter (`TotalOperatingTime`). The gauge is powered by
+/// the cells themselves and has counted since the pack was built, so the
+/// counter is the battery's age (checked on a 2021 MacBook Pro: it starts
+/// within two weeks of the manufacture week encoded in the battery
+/// serial). Pure inputs so the format can be unit-tested apart from the
+/// registry read that feeds it (see `BatteryMonitor.readBattery`).
+enum BatteryAge {
+    /// Labels for a counter that read `operatingHours` at `sampledAt`: the
+    /// age is the counter plus whatever has passed since the sample (the
+    /// registry's copy is only as fresh as its last update). Months are
+    /// capped at 11 because 365-day years leave up to 364 days of
+    /// remainder, which 30-day months would render as "12m".
+    static func labels(operatingHours: Int, sampledAt: Date, now: Date) -> (years: String, days: String) {
+        let builtAt = sampledAt.addingTimeInterval(-TimeInterval(operatingHours) * 3600)
+        let totalDays = max(0, Int(now.timeIntervalSince(builtAt) / 86400))
+        let years = totalDays / 365
+        let months = min(11, (totalDays % 365) / 30)
+        let yearsLabel: String
+        if years > 0 {
+            yearsLabel = "\(years)y \(months)m"
+        } else if months > 0 {
+            yearsLabel = "\(months)m"
+        } else {
+            yearsLabel = "< 1m"
+        }
+        return (yearsLabel, "\(totalDays)d")
+    }
+}
+
 final class BatteryMonitor: ObservableObject {
     struct IO {
         var battery: () -> BatteryState? = BatteryMonitor.readBattery
@@ -226,6 +256,11 @@ final class BatteryMonitor: ObservableObject {
     /// hidden view isn't recreated on reopen, and offscreen SwiftUI onChange
     /// delivery is not guaranteed.
     @Published var settingsExpanded: Bool = false
+    /// True while the panel is a free-floating window, torn off the menu
+    /// bar item. Pure UI state like `isPopoverVisible`, set and cleared by
+    /// AppDelegate: the panel's window-drag gesture is live only in this
+    /// state (see DetachedPanelDrag).
+    @Published var panelDetached: Bool = false
 
     @Published var autoManageEnabled: Bool {
         didSet {
@@ -1275,6 +1310,39 @@ final class BatteryMonitor: ObservableObject {
         let value = bytes.withUnsafeBytes { $0.loadUnaligned(as: Float.self) }
         guard value.isFinite, value > -40, value < 120 else { return nil }
         return Double(value)
+    }
+
+    // MARK: - Battery registry layout
+
+    /// The gas gauge's lifetime records (`BatteryData.LifetimeData`) for
+    /// the given AppleSmartBattery entry.
+    ///
+    /// Up to macOS 26 the detailed BatteryData dictionary sits on that entry
+    /// itself. macOS 27 left a reduced BatteryData there (eleven keys, no
+    /// LifetimeData) and moved the detailed one, under the same key names,
+    /// to a child entry of class AppleSmartBatteryPack. The entry's own
+    /// dictionary is tried first, so earlier systems read exactly what they
+    /// always did. Note when inspecting this by hand: `ioreg -a` silently
+    /// omits the pack's BatteryData (it holds a value a plist cannot carry),
+    /// which makes the records look deleted; `ioreg -l` shows them.
+    private static func batteryLifetimeData(of battery: io_registry_entry_t) -> [String: Any]? {
+        func lifetimeData(_ entry: io_registry_entry_t) -> [String: Any]? {
+            let data = IORegistryEntryCreateCFProperty(entry, "BatteryData" as CFString, nil, 0)?
+                .takeRetainedValue() as? [String: Any]
+            return data?["LifetimeData"] as? [String: Any]
+        }
+        if let records = lifetimeData(battery) { return records }
+
+        var children: io_iterator_t = 0
+        guard IORegistryEntryGetChildIterator(battery, kIOServicePlane, &children) == KERN_SUCCESS else { return nil }
+        defer { IOObjectRelease(children) }
+        while case let child = IOIteratorNext(children), child != MACH_PORT_NULL {
+            defer { IOObjectRelease(child) }
+            if IOObjectConformsTo(child, "AppleSmartBatteryPack") != 0, let records = lifetimeData(child) {
+                return records
+            }
+        }
+        return nil
     }
 
     // MARK: - Keep awake (idle-sleep assertion)
@@ -2645,16 +2713,19 @@ final class BatteryMonitor: ObservableObject {
                 temperature = Double(val) / 100.0
                 temperatureRead = true
             }
-            // macOS 27 dropped the top-level capacity and temperature keys:
-            // DesignCapacity, AppleRawMaxCapacity and AppleRawCurrentCapacity
-            // now exist only inside the BatteryData dictionary (as
-            // DesignCapacity, FullChargeCapacity and RemainingCapacity), and
-            // Temperature left the registry entry altogether, leaving the
-            // SMC's battery sensor as the only source. Without these
-            // fallbacks the Health card showed the 100% default, Raw Charge
-            // collapsed to the plain percentage and Temperature read 0°C.
-            // Each fallback runs only when its top-level key is absent, so
-            // earlier macOS versions keep reading exactly what they did.
+            // macOS 27 took the capacity and temperature keys off this entry
+            // (they moved, with the rest of the detailed data, into the
+            // BatteryData of its AppleSmartBatteryPack child; see
+            // batteryLifetimeData). What stayed here is a reduced
+            // BatteryData that carries the same capacities as
+            // DesignCapacity, FullChargeCapacity and RemainingCapacity
+            // (equal to the pack's raw values when compared), and the SMC's
+            // battery sensor tracks the gauge temperature to 0.1°C, so both
+            // are read from here. Without these fallbacks the Health card
+            // showed the 100% default, Raw Charge collapsed to the plain
+            // percentage and Temperature read 0°C. Each fallback runs only
+            // when its top-level key is absent, so earlier macOS versions
+            // keep reading exactly what they did.
             if designCap == 0 || maxCap == 0 || currentCap == 0,
                let battData = IORegistryEntryCreateCFProperty(service, "BatteryData" as CFString, nil, 0)?.takeRetainedValue() as? [String: Any] {
                 if designCap == 0, let val = battData["DesignCapacity"] as? Int { designCap = val }
@@ -2726,27 +2797,22 @@ final class BatteryMonitor: ObservableObject {
             }
         }
 
-        // Battery age: estimate manufacture date from UpdateTime - TotalOperatingTime
+        // Battery age, from the gauge's lifetime operating-hours counter
+        // (see BatteryAge), stamped with the time the registry sampled it.
+        // macOS 27 moved the counter's dictionary to a child entry, which
+        // left the Battery Served card on its dash until the lookup
+        // followed it there (see batteryLifetimeData).
         var batteryAgeYears = ""
         var batteryAgeDays = ""
         if service != MACH_PORT_NULL,
            let updateTime = IORegistryEntryCreateCFProperty(service, "UpdateTime" as CFString, nil, 0)?.takeRetainedValue() as? Int,
-           let battData = IORegistryEntryCreateCFProperty(service, "BatteryData" as CFString, nil, 0)?.takeRetainedValue() as? [String: Any],
-           let lifeData = battData["LifetimeData"] as? [String: Any],
+           let lifeData = batteryLifetimeData(of: service),
            let totalHours = lifeData["TotalOperatingTime"] as? Int, totalHours > 0 {
-            let firstUseTimestamp = TimeInterval(updateTime) - TimeInterval(totalHours * 3600)
-            let firstUseDate = Date(timeIntervalSince1970: firstUseTimestamp)
-            let totalDays = Int(Date().timeIntervalSince(firstUseDate) / 86400)
-            let years = totalDays / 365
-            let months = (totalDays % 365) / 30
-            if years > 0 {
-                batteryAgeYears = "\(years)y \(months)m"
-            } else if months > 0 {
-                batteryAgeYears = "\(months)m"
-            } else {
-                batteryAgeYears = "< 1m"
-            }
-            batteryAgeDays = "\(totalDays)d"
+            let age = BatteryAge.labels(operatingHours: totalHours,
+                                        sampledAt: Date(timeIntervalSince1970: TimeInterval(updateTime)),
+                                        now: Date())
+            batteryAgeYears = age.years
+            batteryAgeDays = age.days
         }
 
         let healthPercent = designCap > 0 ? min(100, Int(Double(maxCap) / Double(designCap) * 100)) : 100

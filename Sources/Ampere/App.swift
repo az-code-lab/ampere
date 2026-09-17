@@ -355,6 +355,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             // updateMenuBarIcon must be active from the first anchored frame.
             panelAnchored = true
             updateMenuBarIcon()
+            // A panel shown from the menu bar item is attached by
+            // definition. The flag is normally cleared when the detached
+            // window closes, but it must never outlive that window: with
+            // it set, the panel's window-drag gesture would move the new
+            // popover instead of letting it tear off (see DetachedPanelDrag).
+            monitor.panelDetached = false
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             NSApp.activate(ignoringOtherApps: true)
             // Force the popover's panel key so SwiftUI drag gestures (the
@@ -406,6 +412,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         panelAnchored = false
         updateMenuBarIcon()
         monitor.pinned = true
+        // From here on the panel moves like a window; see DetachedPanelDrag.
+        monitor.panelDetached = true
         // Observe the detached window closing — popoverDidClose only fires
         // during the detach transition, NOT when the detached window is closed.
         if let window = popover.contentViewController?.view.window {
@@ -417,10 +425,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     /// Shared teardown for both panel close paths (attached popover closing,
-    /// detached window closing): unpin, drop back to slow polling, and fold
-    /// the settings section so the next open starts collapsed.
+    /// detached window closing): unpin, mark the panel attached again (the
+    /// next open is a popover), drop back to slow polling, and fold the
+    /// settings section so the next open starts collapsed.
     private func panelDidClose() {
         monitor.pinned = false
+        monitor.panelDetached = false
         monitor.setFastPolling(false)
         monitor.settingsExpanded = false
     }
@@ -582,6 +592,7 @@ struct ContentView: View {
         }
         .frame(width: 580)
         .background(Color(.windowBackgroundColor))
+        .modifier(DetachedPanelDrag(detached: monitor.panelDetached))
         .onChange(of: showAbout) {
             // Mirror sheet visibility into the monitor so AppDelegate keeps
             // the popover from closing (and breaking) underneath the sheet.
@@ -2459,10 +2470,43 @@ struct SheetKeyActivator: NSViewRepresentable {
     }
 }
 
+// MARK: - Detached Panel Drag
+
+/// Lets the torn-off panel be dragged by any spot that is not a control.
+///
+/// AppKit makes a detached popover's window movable by its background, but
+/// on macOS 27 SwiftUI content no longer counts as background: wherever the
+/// hosting view draws anything (the panel's background fill, text, cards) a
+/// mouse-down does not start the window drag. The panel is SwiftUI edge to
+/// edge, so once torn off it could not be moved at all. WindowDragGesture is
+/// SwiftUI's own way to say "this content drags its window"; buttons, the
+/// cards' taps and the slider's draggers sit deeper in the hierarchy and
+/// keep precedence over it.
+///
+/// Live only while detached: on the attached popover the same gesture moves
+/// the popover without tearing it off (arrow, pin state and close behavior
+/// all still those of an attached popover); the tear-off there belongs to
+/// AppKit's own recognizer. The gesture needs macOS 15; earlier systems
+/// still treat the hosting view as window background, which is what
+/// WindowDragBlocker below exists for.
+struct DetachedPanelDrag: ViewModifier {
+    let detached: Bool
+
+    func body(content: Content) -> some View {
+        if #available(macOS 15.0, *) {
+            content.gesture(WindowDragGesture(), isEnabled: detached)
+        } else {
+            content
+        }
+    }
+}
+
 // MARK: - Window Drag Blocker
 
-/// Overlay that prevents window drag from intercepting SwiftUI gestures.
-/// Used on the range slider so thumbs are draggable in detached popover mode.
+/// Background that prevents window drag from intercepting SwiftUI gestures
+/// on systems where the hosting view counts as window background (it no
+/// longer does on macOS 27, see DetachedPanelDrag). Used on the range
+/// slider so thumbs are draggable in detached popover mode.
 struct WindowDragBlocker: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView {
         let view = NoDragView()
