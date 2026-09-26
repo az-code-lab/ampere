@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "Ampere",
-    platforms: [.macOS(.v14)],
+    platforms: [.macOS("26.0")],
     targets: [
         .target(name: "Shared"),
         .executableTarget(

@@ -112,7 +112,7 @@ final class HelperSetupTests: XCTestCase {
                        try Data(contentsOf: fixture.writer))
         XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.paths.legacy))
         XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.marker.path))
-        XCTAssertEqual(try String(contentsOfFile: fixture.paths.sudoers),
+        XCTAssertEqual(try String(contentsOfFile: fixture.paths.sudoers, encoding: .utf8),
                        "test_user ALL=(root) NOPASSWD: sha256:\(fixture.digest) \(fixture.paths.helper)\n")
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: fixture.paths.directory), ["az-ampere-smc"])
     }
@@ -134,7 +134,7 @@ final class HelperSetupTests: XCTestCase {
         ])
         let result = try run(fixture.install())
         XCTAssertEqual(result.status, 0, result.output)
-        XCTAssertEqual(try String(contentsOfFile: fixture.paths.sudoers), [
+        XCTAssertEqual(try String(contentsOfFile: fixture.paths.sudoers, encoding: .utf8), [
             fixture.rule("alice", digest: fixture.digest, path: fixture.paths.helper),
             fixture.rule("bob", digest: fixture.digest, path: fixture.paths.helper),
             fixture.rule("test_user", digest: fixture.digest, path: fixture.paths.helper),
@@ -152,7 +152,7 @@ final class HelperSetupTests: XCTestCase {
         let result = try run(fixture.removal())
         XCTAssertEqual(result.status, 0, result.output)
         XCTAssertEqual(fixture.calls, ["restore", "remove-legacy"])
-        XCTAssertEqual(try String(contentsOfFile: fixture.paths.sudoers), alice + "\n")
+        XCTAssertEqual(try String(contentsOfFile: fixture.paths.sudoers, encoding: .utf8), alice + "\n")
         XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.paths.helper))
         XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.paths.legacy))
         XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.state.path))
@@ -166,7 +166,7 @@ final class HelperSetupTests: XCTestCase {
         XCTAssertEqual(fixture.calls, [])
         XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.paths.helper))
         XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.paths.legacy))
-        XCTAssertEqual(try String(contentsOfFile: fixture.paths.sudoers), "old sudoers")
+        XCTAssertEqual(try String(contentsOfFile: fixture.paths.sudoers, encoding: .utf8), "old sudoers")
         XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.marker.path))
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: fixture.paths.directory), [])
     }
@@ -182,9 +182,9 @@ final class HelperSetupTests: XCTestCase {
         XCTAssertEqual(fixture.calls, ["restore", "remove-legacy", "spawn-watchdog:123"])
         XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.paths.helper))
         XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.paths.legacy))
-        XCTAssertEqual(try String(contentsOfFile: fixture.paths.sudoers),
+        XCTAssertEqual(try String(contentsOfFile: fixture.paths.sudoers, encoding: .utf8),
                        "test_user ALL=(root) NOPASSWD: sha256:\(fixture.digest) \(fixture.paths.helper)\n")
-        XCTAssertEqual(try String(contentsOf: fixture.marker), "17 29")
+        XCTAssertEqual(try String(contentsOf: fixture.marker, encoding: .utf8), "17 29")
     }
 
     func testRevokeFailurePreservesHelperRuleAndSavedSettings() throws {

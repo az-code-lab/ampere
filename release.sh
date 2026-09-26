@@ -93,10 +93,11 @@ cd "$REPO_DIR"
 # path; clang derives the SDK version it records in the binary
 # (LC_BUILD_VERSION) from -isysroot or SDKROOT, and with neither it falls
 # back to the deployment target. The result is a binary stamped as built
-# against the macOS 14 SDK, which AppKit and SwiftUI then run in macOS 14
-# compatibility mode on every later macOS (on macOS 27 that opened an empty
-# "Ampere Settings" window at launch). Passing -isysroot restores the real
-# SDK version, verified with otool -l | grep -A4 LC_BUILD_VERSION.
+# against the SDK of the oldest macOS it runs on, which AppKit and SwiftUI
+# then run in that release's compatibility mode on every later macOS (with
+# the macOS 14 target of the time, macOS 27 opened an empty "Ampere
+# Settings" window at launch). Passing -isysroot restores the real SDK
+# version, verified with otool -l | grep -A4 LC_BUILD_VERSION.
 SDK_FLAGS=(-Xswiftc -Xclang-linker -Xswiftc -isysroot -Xswiftc -Xclang-linker -Xswiftc "$(xcrun --show-sdk-path)")
 swift build -c release "${SDK_FLAGS[@]}" 2>&1
 
@@ -114,7 +115,7 @@ echo "$VERSION" > "$APP_DIR/Contents/Resources/version.txt"
 cp "$REPO_DIR/Ampere.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
 xcrun actool "$REPO_DIR/Assets.xcassets" \
     --compile "$APP_DIR/Contents/Resources" \
-    --platform macosx --minimum-deployment-target 14.0 \
+    --platform macosx --minimum-deployment-target 26.0 \
     --app-icon AppIcon --output-partial-info-plist /dev/null > /dev/null
 
 # Create Info.plist
@@ -138,7 +139,7 @@ cat > "$APP_DIR/Contents/Info.plist" << PLIST
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>LSMinimumSystemVersion</key>
-    <string>14.0</string>
+    <string>26.0</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>CFBundleIconName</key>

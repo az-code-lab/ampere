@@ -58,7 +58,7 @@ final class HelperSecurityTests: XCTestCase {
         try FileManager.default.createSymbolicLink(at: legacy, withDestinationURL: destination)
         XCTAssertFalse(HelperSecurity.removeFileWithoutFollowingDirectories(
             at: legacy.appending(path: "az-ampere-smc").path))
-        XCTAssertEqual(try String(contentsOf: target), "keep")
+        XCTAssertEqual(try String(contentsOf: target, encoding: .utf8), "keep")
 
         try FileManager.default.removeItem(at: legacy)
         try FileManager.default.createDirectory(at: legacy, withIntermediateDirectories: false)

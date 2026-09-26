@@ -2491,18 +2491,13 @@ struct SheetKeyActivator: NSViewRepresentable {
 /// Live only while detached: on the attached popover the same gesture moves
 /// the popover without tearing it off (arrow, pin state and close behavior
 /// all still those of an attached popover); the tear-off there belongs to
-/// AppKit's own recognizer. The gesture needs macOS 15; earlier systems
-/// still treat the hosting view as window background, which is what
-/// WindowDragBlocker below exists for.
+/// AppKit's own recognizer. macOS 26 still treats the hosting view as window
+/// background as well, which is what WindowDragBlocker below exists for.
 struct DetachedPanelDrag: ViewModifier {
     let detached: Bool
 
     func body(content: Content) -> some View {
-        if #available(macOS 15.0, *) {
-            content.gesture(WindowDragGesture(), isEnabled: detached)
-        } else {
-            content
-        }
+        content.gesture(WindowDragGesture(), isEnabled: detached)
     }
 }
 

@@ -31,7 +31,7 @@ A lightweight macOS menu bar app for monitoring battery status and controlling c
 - Apple Silicon Mac
 - Admin privileges (for charge control features)
 
-macOS 14 and 15 are not supported. Ampere is built and tested on macOS 26 and 27 only, and what it needs to control charging is not reliably there on the older systems: they have the `CHTE` key only with the firmware some of their security updates install, and the macOS charge limit that Ampere falls back on without `CHTE` arrived in macOS 26.4 (see Firmware without CHTE below). The app still opens on macOS 14 and 15, so an existing install there is not cut off, but it gets no further updates: the Homebrew cask requires macOS 26, and the in-app updater follows the cask (see Updates).
+macOS 14 and 15 are not supported. Ampere is built and tested on macOS 26 and 27 only, and what it needs to control charging is not reliably there on the older systems: they have the `CHTE` key only with the firmware some of their security updates install, and the macOS charge limit that Ampere falls back on without `CHTE` arrived in macOS 26.4 (see Firmware without CHTE below). Releases after 0.0.65 do not open on macOS 14 or 15 at all, since the app itself asks for macOS 26. A copy of 0.0.65 or earlier already installed there still opens, but gets no further updates: the Homebrew cask requires macOS 26, and the in-app updater follows the cask (see Updates).
 
 ## Installation
 
@@ -199,7 +199,7 @@ If any step fails (e.g. the install location isn't writable), the error is shown
 
 A release is offered only to a Mac that can run it. The cask's `depends_on macos:` line names the oldest macOS a release supports (Homebrew reads a bare release name such as `:tahoe` as "this or later"). When this Mac runs something older, no update is offered and the installed version stays; a clicked **Check for Updates** answers **Needs macOS N** instead of **Up to Date**. `brew upgrade` refuses the same release from the same line, so both channels agree. A release name newer than the running build knows is not treated as a refusal (it may be the very macOS the build runs on), which is why step 2 checks the downloaded bundle as well: that check needs no name table, and it is the one that keeps a working copy from being replaced by an app macOS will not open.
 
-The launch floor (`LSMinimumSystemVersion` and the deployment target in `Package.swift`, both 14.0) is deliberately lower than the supported floor above. Versions up to 0.0.64 install whatever the cask advertises without asking whether it can open here, so raising the launch floor now would let a Mac on macOS 14 or 15 swap a working copy for one that cannot launch. It can be raised once installs have moved through a version that makes the check; the macOS version registered copies report (see Charge Bounds and Registration) shows when that is.
+The launch floor (`LSMinimumSystemVersion` and the deployment target in `Package.swift`) is 26.0, the same as the supported floor above. Through 0.0.65 it was deliberately lower, 14.0: versions up to 0.0.64 install whatever the cask advertises without asking whether it can open here, so the floor stayed low until the macOS version registered copies report (see Charge Bounds and Registration) showed no Mac left on macOS 14 or 15. Unregistered copies report nothing, so one of 0.0.64 or earlier on those systems can still swap in a release that will not open there.
 
 ## Build from Source
 
@@ -214,7 +214,7 @@ swift build -c debug
 .build/debug/Ampere
 ```
 
-`run.sh` and `release.sh` pass the linker the SDK explicitly (`SDK_FLAGS` in both scripts). Under Xcode 27's toolchain a bare `swift build` produces a binary stamped as built against the macOS 14 SDK: SwiftPM's Swift Build engine runs `swiftc` without `SDKROOT`, and `clang` then records the deployment target instead of the SDK version. AppKit and SwiftUI run such a binary in macOS 14 compatibility mode on every later macOS; on macOS 27 that showed an empty "Ampere Settings" window at launch. Check a build with `otool -l .build/debug/Ampere | grep -A4 LC_BUILD_VERSION`; the `sdk` line must show the current SDK, not `14.0`.
+`run.sh` and `release.sh` pass the linker the SDK explicitly (`SDK_FLAGS` in both scripts). Under Xcode 27's toolchain a bare `swift build` produces a binary stamped as built against the SDK of its deployment target: SwiftPM's Swift Build engine runs `swiftc` without `SDKROOT`, and `clang` then records the deployment target instead of the SDK version. AppKit and SwiftUI run such a binary in that older release's compatibility mode on every later macOS; with the macOS 14 target of the time, macOS 27 showed an empty "Ampere Settings" window at launch. Check a build with `otool -l .build/debug/Ampere | grep -A4 LC_BUILD_VERSION`; the `sdk` line must show the SDK you built with (27.0 under Xcode 27), not the deployment target's `26.0`.
 
 ## Uninstall
 
