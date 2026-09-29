@@ -2014,6 +2014,11 @@ private struct PowerFlowDiagram: View {
                 .font(.system(size: 12, weight: .medium, design: .rounded))
                 .foregroundColor(.secondary)
                 .lineLimit(1)
+                // Negative and three-digit values ("-22.8 W" on battery,
+                // "140.0 W" from a big adapter) are wider than the node
+                // area; let the label overflow its 44 pt column rather
+                // than truncate to "-22.8…".
+                .fixedSize()
                 .frame(height: Self.nodeTextH)
         }
         .frame(width: Self.nodeAreaWidth)
@@ -2031,6 +2036,11 @@ private struct PowerFlowDiagram: View {
                 .font(.system(size: 12, weight: .medium, design: .rounded))
                 .foregroundColor(.secondary)
                 .lineLimit(1)
+                // Negative and three-digit values ("-22.8 W" on battery,
+                // "140.0 W" from a big adapter) are wider than the node
+                // area; let the label overflow its 44 pt column rather
+                // than truncate to "-22.8…".
+                .fixedSize()
                 .frame(height: Self.nodeTextH)
         }
         .frame(width: Self.nodeAreaWidth)

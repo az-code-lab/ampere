@@ -1,0 +1,134 @@
+WEBVTT
+
+1
+00:00:01.400 --> 00:00:02.354
+Meet Ampere.
+
+2
+00:00:02.354 --> 00:00:06.328
+A menu bar battery manager for Apple Silicon Macs.
+
+3
+00:00:08.533 --> 00:00:13.811
+Lithium-ion batteries age fastest when they sit at 100 percent, or drain near empty.
+
+4
+00:00:13.811 --> 00:00:18.272
+A MacBook that lives on the charger spends most of its life at the top.
+
+5
+00:00:20.200 --> 00:00:23.471
+Ampere holds your battery in a healthy range instead.
+
+6
+00:00:23.471 --> 00:00:25.631
+Pick a band, like 40 to 60 percent.
+
+7
+00:00:25.631 --> 00:00:30.877
+Charging starts at the bottom of the band, holds in the middle, and stops at the top.
+
+8
+00:00:30.877 --> 00:00:31.741
+Automatically.
+
+9
+00:00:33.667 --> 00:00:37.891
+The panel shows everything your battery wants you to know.
+
+10
+00:00:37.891 --> 00:00:40.586
+Adapter, battery, and system wattage.
+
+11
+00:00:40.586 --> 00:00:45.684
+Voltages, currents, temperature, cycle count, health, and battery age.
+
+12
+00:00:45.684 --> 00:00:48.088
+A dozen readouts, always current.
+
+13
+00:00:50.000 --> 00:00:54.650
+Between the bounds, charging stays off until you ask, even after a restart.
+
+14
+00:00:54.650 --> 00:00:59.920
+Every cycle runs full, from the lower bound to the upper, with no fragmented top-ups.
+
+15
+00:01:01.833 --> 00:01:03.542
+Heading out without a charger?
+
+16
+00:01:03.542 --> 00:01:09.920
+Charge to Full tops the battery up in one tap, and normal management takes over again once the charge completes.
+
+17
+00:01:09.920 --> 00:01:11.686
+Sitting above your upper bound?
+
+18
+00:01:11.686 --> 00:01:15.103
+Discharge back down to it, even with the charger plugged in.
+
+19
+00:01:17.033 --> 00:01:25.121
+Close the lid mid-charge, and Ampere pauses just before sleep and continues when your Mac wakes, so a charge never overshoots your bound.
+
+20
+00:01:25.121 --> 00:01:27.837
+Quitting Ampere restores every system default.
+
+21
+00:01:27.837 --> 00:01:33.268
+And if the app is ever force-killed, a watchdog puts your Mac back to normal within seconds.
+
+22
+00:01:35.200 --> 00:01:38.254
+The menu bar icon shows your live charge level.
+
+23
+00:01:38.254 --> 00:01:42.803
+Pin the panel open, or drag it off the menu bar and float it anywhere.
+
+24
+00:01:42.803 --> 00:01:45.077
+Keep your Mac awake for a set time.
+
+25
+00:01:45.077 --> 00:01:46.117
+Launch at login.
+
+26
+00:01:46.117 --> 00:01:47.936
+Update right from the panel.
+
+27
+00:01:49.867 --> 00:01:53.536
+Install it with Homebrew, or download the disk image.
+
+28
+00:01:53.536 --> 00:01:57.343
+Grant admin once, set your bounds, and forget about it.
+
+29
+00:01:57.343 --> 00:02:01.012
+Ampere is free in the default 40 to 60 percent range.
+
+30
+00:02:01.012 --> 00:02:03.851
+A one-time license unlocks custom bounds.
+
+31
+00:02:05.967 --> 00:02:06.536
+Ampere.
+
+32
+00:02:06.536 --> 00:02:08.811
+Take charge of your battery.
+
+33
+00:02:08.811 --> 00:02:11.087
+Get it at amperebattery.app.
+

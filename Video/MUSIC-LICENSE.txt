@@ -1,0 +1,42 @@
+Music under the narration of the Ampere introduction video
+(Video/out/Ampere-Intro.mp4 and Video/out/Ampere-Intro-4K.mp4)
+
+The track plays low under the voice, is fetched by Video/make-video.sh
+into Video/out/music, and is refused unless its SHA-256 matches the one
+below. The composer (Video/IntroVideo.swift, Music.known) is the source
+of these entries.
+
+Default track
+  Title:    Digital Lemonade
+  Artist:   Kevin MacLeod (incompetech.com)
+  Source:   https://incompetech.com/music/royalty-free/mp3-royaltyfree/Digital%20Lemonade.mp3
+  SHA-256:  be9f665efd035dea23a1e9539c534ba905f44144f7dda05a0a663ccecda1ab21
+  License:  Creative Commons: By Attribution 4.0 (CC BY 4.0)
+            https://creativecommons.org/licenses/by/4.0/
+  Credit:   Music: Digital Lemonade by Kevin MacLeod (incompetech.com), CC BY 4.0
+
+Alternative track (AMPERE_VIDEO_MUSIC="Getting it Done")
+  Title:    Getting it Done
+  Artist:   Kevin MacLeod (incompetech.com)
+  Source:   https://incompetech.com/music/royalty-free/mp3-royaltyfree/Getting%20it%20Done.mp3
+  SHA-256:  bc74076ec1c263f6ac4634403d0acc1ccc5d2e79f2d083243e00d236b547c15b
+  License:  Creative Commons: By Attribution 4.0 (CC BY 4.0)
+            https://creativecommons.org/licenses/by/4.0/
+  Credit:   Music: Getting it Done by Kevin MacLeod (incompetech.com), CC BY 4.0
+
+What the license asks
+  CC BY 4.0 allows copying, sharing, and adapting the music, including
+  commercially, as long as the author is credited, in any reasonable
+  manner for the medium. The composer prints the credit line above on
+  the video's closing card, which is how a film carries it; a repeat in
+  a video description is a courtesy. Kevin MacLeod's own wording is:
+
+    Digital Lemonade Kevin MacLeod (incompetech.com)
+    Licensed under Creative Commons: By Attribution 4.0 License
+    http://creativecommons.org/licenses/by/4.0/
+
+  Incompetech also sells a Standard License for the same tracks that asks
+  for no credit; with one bought, the credit lines in Music.known can go.
+
+A track of your own (AMPERE_VIDEO_MUSIC=<file>) is mixed the same way but
+credited by nobody: its license is yours to satisfy.
