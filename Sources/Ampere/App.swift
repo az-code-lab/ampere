@@ -2411,6 +2411,14 @@ struct RegistrationView: View {
                         .font(.system(size: 12, weight: .semibold))
                         .fixedSize(horizontal: false, vertical: true)
                 }
+                // How many Macs the key is on, out of its room, as the server
+                // said at the verify this window started when it opened.
+                if let usage = RegistrationManager.usage(macs: registration.deviceCount,
+                                                         of: registration.maxDevices) {
+                    Text(usage)
+                        .font(.system(size: 12))
+                        .foregroundColor(.secondary)
+                }
                 if let error = registration.lastError {
                     Text(error)
                         .font(.system(size: 12))
@@ -2485,7 +2493,7 @@ struct RegistrationView: View {
         .onAppear {
             emailInput = registration.email
             keyInput = registration.licenseKey
-            registration.clearStaleError()
+            registration.windowOpened()
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                 if !registration.isRegistered { focus = .email }
             }

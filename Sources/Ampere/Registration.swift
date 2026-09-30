@@ -18,8 +18,9 @@ func deviceSerialNumber() -> String? {
 }
 
 /// What the license server says of a key, as far as the app uses it: whose it
-/// is and how many Macs it registers at once. Read off the key the register
-/// call answers with, or the one the verify call wraps in its verdict.
+/// is, how many Macs it registers at once, and how many it is registered on.
+/// Read off the key the register call answers with, or the one the verify
+/// call wraps in its verdict.
 struct LicenseFacts: Equatable {
     /// The licensee's name; nil when the server does not say.
     var name: String?
@@ -28,15 +29,22 @@ struct LicenseFacts: Equatable {
     /// changes later. One when the server does not say, or says nonsense,
     /// the way the server itself reads an unsaid count.
     var maxDevices: Int
+    /// How many Macs the key is registered on right now, the asking Mac
+    /// included. Nil when the server does not say (one from before the count
+    /// was sent) or says nonsense: never guessed, since a Mac that is
+    /// registered is always one of them.
+    var deviceCount: Int?
 
-    init(name: String?, maxDevices: Int) {
+    init(name: String?, maxDevices: Int, deviceCount: Int?) {
         self.name = name
         self.maxDevices = max(1, maxDevices)
+        self.deviceCount = deviceCount.flatMap { $0 >= 1 ? $0 : nil }
     }
 
     init(license: [String: Any]) {
         self.init(name: license["name"] as? String,
-                  maxDevices: license["max_devices"] as? Int ?? 1)
+                  maxDevices: license["max_devices"] as? Int ?? 1,
+                  deviceCount: license["device_count"] as? Int)
     }
 }
 
@@ -48,8 +56,9 @@ struct LicenseFacts: Equatable {
 /// several fills up and refuses a further Mac until one is deregistered here
 /// or released under My Licenses at azcode.dev.
 ///
-/// Registration state (email, name, key, the key's Mac count, active flag)
-/// persists in UserDefaults so the app restores it after a restart or crash.
+/// Registration state (email, name, key, the key's room for Macs and the
+/// Macs in use, active flag) persists in UserDefaults so the app restores it
+/// after a restart or crash.
 /// The server is the source of truth: a periodic verify (email + device
 /// serial, no key) can flip the app back to unregistered if this Mac was
 /// deregistered or released from the key, another Mac took its place on a
@@ -67,6 +76,12 @@ final class RegistrationManager: ObservableObject {
     /// registration window words the key's rules by it (`explanation(macs:)`),
     /// and without a count it words them so they hold for any key.
     @Published private(set) var maxDevices: Int?
+    /// How many Macs the key is registered on, this one included, as of the
+    /// last register or verify: the window shows it as "Macs in use: 2 of 5"
+    /// (`usage(macs:of:)`), and verifies as it opens so the number is
+    /// current. Nil while the server has not said, and once this Mac is off
+    /// the key.
+    @Published private(set) var deviceCount: Int?
     @Published private(set) var isBusy = false
     @Published var lastError: String?
 
@@ -81,6 +96,7 @@ final class RegistrationManager: ObservableObject {
     private static let nameDefaultsKey = "registration.name"
     private static let keyDefaultsKey = "registration.licenseKey"
     private static let maxDevicesDefaultsKey = "registration.maxDevices"
+    private static let deviceCountDefaultsKey = "registration.deviceCount"
     private static let activeDefaultsKey = "registration.active"
     /// Sent with every call, so the server only ever hands this app an
     /// Ampere key: another app's key answers "Invalid license key" instead
@@ -123,6 +139,7 @@ final class RegistrationManager: ObservableObject {
         // Absent for a copy registered before the count was kept: unknown,
         // not one, until the first verify brings the key's own count.
         self.maxDevices = (defaults.object(forKey: Self.maxDevicesDefaultsKey) as? Int).map { max(1, $0) }
+        self.deviceCount = defaults.object(forKey: Self.deviceCountDefaultsKey) as? Int
         self.isRegistered = defaults.bool(forKey: Self.activeDefaultsKey)
 
         // Verify shortly after launch, then ~daily with jitter (same rationale
@@ -164,7 +181,8 @@ final class RegistrationManager: ObservableObject {
             case .success(let json):
                 let facts = LicenseFacts(license: json)
                 self.setState(registered: true, email: email, key: key,
-                              name: facts.name ?? "", maxDevices: facts.maxDevices)
+                              name: facts.name ?? "", maxDevices: facts.maxDevices,
+                              deviceCount: .some(facts.deviceCount))
                 AmpereLog.app("Ampere: Registered to %@ (a key for %d Macs)", email, facts.maxDevices)
                 completion(true)
             case .failure(let message, _):
@@ -188,13 +206,13 @@ final class RegistrationManager: ObservableObject {
             self.isBusy = false
             switch result {
             case .success:
-                self.setState(registered: false)
+                self.setState(registered: false, deviceCount: .some(nil))
                 AmpereLog.app("Ampere: Deregistered")
                 completion(true)
             case .failure(_, let status) where status == 404:
                 // The server has no active registration for this Mac — the
                 // goal state is already true, so agree with it locally.
-                self.setState(registered: false)
+                self.setState(registered: false, deviceCount: .some(nil))
                 completion(true)
             case .failure(let message, _):
                 self.lastError = message
@@ -204,42 +222,59 @@ final class RegistrationManager: ObservableObject {
     }
 
     /// Ask the server whether this email + serial still hold a valid
-    /// registration. Only a definitive `valid: false` clears local state;
-    /// errors and network failures leave it untouched.
+    /// registration: about once a day, and each time the registration window
+    /// opens. Only a definitive `valid: false` clears local state; errors and
+    /// network failures leave it untouched.
     func verify() {
         guard isRegistered, !email.isEmpty, let serial = deviceSerial else { return }
+        let asked = email
         post("/api/pub/license/verify",
              body: ["email": email, "device_serial": serial, "product": Self.product,
                     "app_version": Self.appVersion, "macos_version": Self.macOSVersion]) { [weak self] result in
-            guard let self else { return }
-            if case .success(let json) = result,
-               let valid = json["valid"] as? Bool {
-                if !valid {
-                    AmpereLog.app("Ampere: Registration no longer valid, switching to unregistered")
-                    self.setState(registered: false)
-                    self.lastError = Self.lapsedMessage
-                } else if let license = json["license"] as? [String: Any] {
-                    // Keep the licensee name and the key's Mac count in sync
-                    // with the server: the name can be filled in or corrected
-                    // after the initial registration, and an admin can give
-                    // the key room for more Macs (or fewer).
-                    let facts = LicenseFacts(license: license)
-                    let name = facts.name.flatMap { $0 == self.name ? nil : $0 }
-                    let maxDevices = facts.maxDevices == self.maxDevices ? nil : facts.maxDevices
-                    if name != nil || maxDevices != nil {
-                        self.setState(registered: true, name: name, maxDevices: maxDevices)
-                    }
-                }
+            guard let self, case .success(let json) = result else { return }
+            self.applyVerification(json, askedAs: asked)
+        }
+    }
+
+    /// A verify answer, applied only while the registration it was asked
+    /// about still stands. An answer that lands after this copy deregistered
+    /// (Deregister clicked while the window's own check was still on the
+    /// wire), or after it registered to another email, speaks of a
+    /// registration this copy no longer holds, and changes nothing: without
+    /// this, a late "valid" would mark a deregistered copy registered again.
+    func applyVerification(_ json: [String: Any], askedAs asked: String) {
+        guard isRegistered, email == asked, let valid = json["valid"] as? Bool else { return }
+        if !valid {
+            AmpereLog.app("Ampere: Registration no longer valid, switching to unregistered")
+            setState(registered: false, deviceCount: .some(nil))
+            lastError = Self.lapsedMessage
+        } else if let license = json["license"] as? [String: Any] {
+            // Keep the licensee name and the key's Macs in sync with the
+            // server: the name can be filled in or corrected after the
+            // initial registration, an admin can give the key room for more
+            // Macs (or fewer), and other Macs join and leave it.
+            let facts = LicenseFacts(license: license)
+            let name = facts.name.flatMap { $0 == self.name ? nil : $0 }
+            let maxDevices = facts.maxDevices == self.maxDevices ? nil : facts.maxDevices
+            let deviceCount = facts.deviceCount.flatMap { $0 == self.deviceCount ? nil : $0 }
+            if name != nil || maxDevices != nil || deviceCount != nil {
+                setState(registered: true, name: name, maxDevices: maxDevices,
+                         deviceCount: deviceCount.map { .some($0) })
             }
         }
     }
 
-    /// Called as the registration window opens: a stale form error from an
+    /// Called as the registration window opens. A stale form error from an
     /// earlier attempt goes, but why a daily verify ended the registration
-    /// stays. The window is usually closed when a verify ends it, and opening
-    /// it is where the user looks; the next register attempt clears it.
-    func clearStaleError() {
+    /// stays: the window is usually closed when a verify ends it, and opening
+    /// it is where the user looks; the next register attempt clears it. A
+    /// registered copy then asks the server for the registration as it
+    /// stands, so the Macs in use are current the moment the window shows
+    /// (DBClient's License pane does the same). An unregistered copy asks
+    /// nothing.
+    func windowOpened() {
         if lastError != Self.lapsedMessage { lastError = nil }
+        verify()
     }
 
     // MARK: - Words
@@ -247,6 +282,15 @@ final class RegistrationManager: ObservableObject {
     /// What the registration window says when a daily verify ends the
     /// registration: every way a key can stop holding this Mac.
     static let lapsedMessage = "The registration is no longer valid for this Mac: this Mac was deregistered or released from the key, another Mac took its place, the license ended, or it was withdrawn."
+
+    /// The registered window's line for how many Macs the key is registered
+    /// on, out of the Macs it registers: "Macs in use: 2 of 5". Nil, and no
+    /// line, while either number is unknown, and for a one-Mac key, which is
+    /// only ever in use on this Mac.
+    static func usage(macs count: Int?, of room: Int?) -> String? {
+        guard let count, let room, room > 1 else { return nil }
+        return "Macs in use: \(count) of \(room)"
+    }
 
     /// The registered window's account of the key's rules, for the key this
     /// copy holds: how many Macs it registers and how room is made on it. A
@@ -274,18 +318,29 @@ final class RegistrationManager: ObservableObject {
         }
     }
 
-    /// Persist and publish a registration state change. Email/name/key are
-    /// kept on deregistration so the form can prefill for a later re-register;
-    /// the key's Mac count is kept too, and replaced by the server's own at
-    /// the next registration.
+    /// Persist and publish a registration state change. Nil leaves a field as
+    /// it is. Email/name/key are kept on deregistration so the form can
+    /// prefill for a later re-register; the key's room for Macs is kept too,
+    /// and replaced by the server's own at the next registration. The Macs
+    /// in use describe the key only while this Mac is on it, so leaving
+    /// clears them: `deviceCount` is doubly optional because "none known"
+    /// is itself an answer (.some(nil) clears it).
     private func setState(registered: Bool, email: String? = nil, key: String? = nil,
-                          name: String? = nil, maxDevices: Int? = nil) {
+                          name: String? = nil, maxDevices: Int? = nil, deviceCount: Int?? = nil) {
         if let email { self.email = email; defaults.set(email, forKey: Self.emailDefaultsKey) }
         if let name { self.name = name; defaults.set(name, forKey: Self.nameDefaultsKey) }
         if let key { self.licenseKey = key; defaults.set(key, forKey: Self.keyDefaultsKey) }
         if let maxDevices {
             self.maxDevices = max(1, maxDevices)
             defaults.set(self.maxDevices, forKey: Self.maxDevicesDefaultsKey)
+        }
+        if let deviceCount {
+            self.deviceCount = deviceCount
+            if let deviceCount {
+                defaults.set(deviceCount, forKey: Self.deviceCountDefaultsKey)
+            } else {
+                defaults.removeObject(forKey: Self.deviceCountDefaultsKey)
+            }
         }
         isRegistered = registered
         defaults.set(registered, forKey: Self.activeDefaultsKey)
