@@ -47,6 +47,41 @@ final class KeepAwakeTests: XCTestCase {
             enabled: true, adapterConnected: true, deadline: now, now: now))
     }
 
+    // MARK: - When a session ends on its own
+
+    private func end(enabled: Bool = true, ac: Bool? = true, deadline: Date? = nil) -> BatteryMonitor.KeepAwakeSessionEnd? {
+        BatteryMonitor.keepAwakeSessionEnd(enabled: enabled, adapterConnected: ac, deadline: deadline, now: now)
+    }
+
+    func testSessionEnd_RunningSessionOnACKeepsRunning() {
+        XCTAssertNil(end())
+        XCTAssertNil(end(deadline: now.addingTimeInterval(1)))
+    }
+
+    func testSessionEnd_NoSessionNeverEnds() {
+        XCTAssertNil(end(enabled: false, ac: false))
+        XCTAssertNil(end(enabled: false, deadline: now))
+    }
+
+    func testSessionEnd_DeadlineExpires() {
+        XCTAssertEqual(end(deadline: now), .expired)
+        XCTAssertEqual(end(ac: false, deadline: now), .expired, "Expiry is reported ahead of the adapter")
+    }
+
+    func testSessionEnd_UnpluggingEnds() {
+        XCTAssertEqual(end(ac: false), .unplugged)
+        XCTAssertEqual(end(ac: false, deadline: now.addingTimeInterval(1)), .unplugged)
+    }
+
+    /// A failed battery read is unknown, not unplugged: the assertion is
+    /// released (keepAwakeAssertionDesired on false) but the session
+    /// survives the tick.
+    func testSessionEnd_UnknownAdapterKeepsTheSession() {
+        XCTAssertNil(end(ac: nil))
+        XCTAssertNil(end(ac: nil, deadline: now.addingTimeInterval(1)))
+        XCTAssertEqual(end(ac: nil, deadline: now), .expired)
+    }
+
     func testDeadlineHelper_ZeroMinutes_MeansForever() {
         XCTAssertNil(BatteryMonitor.keepAwakeDeadline(minutes: 0, from: now))
     }

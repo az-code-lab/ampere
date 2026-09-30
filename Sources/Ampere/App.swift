@@ -1158,7 +1158,8 @@ struct ContentView: View {
     }
 
     private func keepAwakeRow() -> some View {
-        HStack {
+        let onPower = monitor.state?.adapterConnected ?? false
+        return HStack {
             // Bare glyph in the shared 26 pt frame like the other main-panel
             // rows (the *.circle.fill family is the settings section's).
             // Coffee cup: the universal keep-awake metaphor (caffeinate).
@@ -1174,29 +1175,36 @@ struct ContentView: View {
                     .foregroundColor(.secondary)
             }
             Spacer()
-            // The display option is offered on AC only, where a session can
-            // hold anything at all, and confirmed on the way on (the sheet
-            // below): it is the one switch here that changes who can use
-            // the Mac, not just whether it sleeps.
-            if monitor.state?.adapterConnected ?? false {
-                Toggle(isOn: Binding(
-                    get: { monitor.keepAwakeDisplay },
-                    set: { on in
-                        if on {
-                            confirmKeepAwakeDisplay = true
-                        } else {
-                            monitor.setKeepAwakeDisplay(false)
-                        }
+            // Both switches are AC-only and disabled (not hidden) on
+            // battery, where a session cannot exist: unplugging ends the
+            // session and turns both off, and plugging back in starts
+            // nothing. The display option is an option of the running
+            // session, so it is also disabled while the toggle is off, and
+            // confirmed on the way on (the sheet below): it is the one
+            // switch here that changes who can use the Mac, not just
+            // whether it sleeps.
+            Toggle(isOn: Binding(
+                get: { monitor.keepAwakeDisplay },
+                set: { on in
+                    if on {
+                        confirmKeepAwakeDisplay = true
+                    } else {
+                        monitor.setKeepAwakeDisplay(false)
                     }
-                )) {
-                    Image(systemName: "display")
                 }
-                .toggleStyle(.button)
-                .controlSize(.small)
-                .help(monitor.keepAwakeDisplay
-                    ? "On: the display stays on during Keep Awake sessions on power, so the Mac does not lock on its own. Turn off to let the display sleep and the screen lock as usual."
-                    : "Off: the display sleeps and the screen locks on its own schedule. Turn on to keep the display on during Keep Awake sessions on power; the Mac will then not lock on its own.")
+            )) {
+                Image(systemName: "display")
             }
+            .toggleStyle(.button)
+            .controlSize(.small)
+            .disabled(!onPower || !monitor.keepAwakeEnabled)
+            .help(!onPower
+                ? "Unavailable on battery: the display sleeps and the screen locks on its own schedule. Connect a power adapter and turn Keep Awake on to keep the display on during the session."
+                : !monitor.keepAwakeEnabled
+                ? "Unavailable while Keep Awake is off: turn Keep Awake on first, then turn this on to keep the display on during the session; the Mac will then not lock on its own."
+                : monitor.keepAwakeDisplay
+                ? "On: the display stays on during this Keep Awake session, so the Mac does not lock on its own. Turn off to let the display sleep and the screen lock as usual. Turns off with Keep Awake."
+                : "Off: the display sleeps and the screen locks on its own schedule. Turn on to keep the display on during this Keep Awake session; the Mac will then not lock on its own.")
             Picker("", selection: Binding(
                 get: { monitor.keepAwakeMinutes },
                 set: { monitor.setKeepAwakeDuration(minutes: $0) }
@@ -1215,11 +1223,14 @@ struct ContentView: View {
             ))
             .toggleStyle(.switch)
             .controlSize(.small)
+            .disabled(!onPower)
         }
         .padding(.horizontal, 16)
-        .help(monitor.keepAwakeEnabled
-            ? "On: keeping the Mac awake while the power adapter is connected; on battery it sleeps normally. \(monitor.keepAwakeDisplay ? "The display is kept on too, so the Mac does not lock on its own." : "The display still sleeps on its own schedule.") Turn off to allow normal sleep."
-            : "Off: normal macOS sleep. Turn on to keep the Mac awake while the power adapter is connected, for the selected duration; on battery it sleeps normally. The display sleeps normally unless the display button beside the duration is on.")
+        .help(!onPower
+            ? "Unavailable on battery: the Mac sleeps normally. Connect a power adapter to turn Keep Awake on; unplugging ends a session, and plugging back in does not restart it."
+            : monitor.keepAwakeEnabled
+            ? "On: keeping the Mac awake for the selected duration. \(monitor.keepAwakeDisplay ? "The display is kept on too, so the Mac does not lock on its own." : "The display still sleeps on its own schedule.") Turn off to allow normal sleep; unplugging the power adapter ends the session too."
+            : "Off: normal macOS sleep. Turn on to keep the Mac awake for the selected duration while the power adapter is connected; unplugging ends the session. The display sleeps normally unless the display button beside the duration is on.")
         .sheet(isPresented: $confirmKeepAwakeDisplay) {
             keepAwakeDisplayWarning
         }
@@ -1231,9 +1242,9 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Keep the display on?")
                 .font(.headline)
-            Text("While a Keep Awake session runs on power, the display stays on and the Mac does not lock on its own. Anyone at the Mac can use it until you lock it or the session ends.")
+            Text("While this Keep Awake session runs, the display stays on and the Mac does not lock on its own. Anyone at the Mac can use it until you lock it or the session ends.")
                 .font(.system(size: 12))
-            Text("A screen saver that is set to start may still start and lock the screen. Closing the lid, a hot corner, a manual lock, and a lock your organization manages all work as before. On battery the display sleeps normally.")
+            Text("A screen saver that is set to start may still start and lock the screen. Closing the lid, a hot corner, a manual lock, and a lock your organization manages all work as before. Turning Keep Awake off or unplugging the power adapter ends the session and turns this off.")
                 .font(.system(size: 12))
                 .foregroundColor(.secondary)
             HStack {

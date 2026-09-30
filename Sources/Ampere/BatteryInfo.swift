@@ -183,10 +183,10 @@ final class BatteryMonitor: ObservableObject {
     /// assertion needs no root, is refcounted per process, and the kernel
     /// drops it on crash/quit, so it can never strand the system. The
     /// trade-off is that it cannot absorb lid-close sleep — that remains
-    /// exclusive to the charge/discharge overrides. On battery the intent
-    /// persists but the assertion is released (see
-    /// keepAwakeAssertionDesired); the display still sleeps normally
-    /// unless keepAwakeDisplay is on.
+    /// exclusive to the charge/discharge overrides. A session is AC-only:
+    /// unplugging ends it (both this and keepAwakeDisplay go off, see
+    /// reconcileKeepAwake), and plugging back in starts nothing; the
+    /// display still sleeps normally unless keepAwakeDisplay is on.
     @Published var keepAwakeEnabled: Bool {
         didSet { defaults.set(keepAwakeEnabled, forKey: "keepAwakeEnabled") }
     }
@@ -194,13 +194,17 @@ final class BatteryMonitor: ObservableObject {
     @Published var keepAwakeMinutes: Int {
         didSet { defaults.set(keepAwakeMinutes, forKey: "keepAwakeMinutes") }
     }
-    /// Keep Awake also keeps the display on: a session then holds the
+    /// The running session also keeps the display on: it then holds the
     /// display-sleep assertion (the `caffeinate -d` kind, which implies the
     /// system stays awake too), so the screen does not lock on its own
-    /// while the session runs on AC. Off by default. The panel offers it
-    /// on AC only and confirms it with a warning on the way on (see
-    /// keepAwakeRow). Persisted like the toggle; on battery the assertion
-    /// is released either way, and a screen saver that is set to start
+    /// while the session runs on AC. Off by default. An option of the
+    /// session, never a setting of its own: it can only be on while
+    /// keepAwakeEnabled is (setKeepAwakeDisplay refuses otherwise), and
+    /// whatever ends the session (the toggle, the deadline, unplugging)
+    /// turns it off too, so the invariant holds at rest and after a
+    /// restart. The panel confirms it with a warning on the way on (see
+    /// keepAwakeRow). Persisted like the toggle so a restart mid-session
+    /// resumes the same kind of hold; a screen saver that is set to start
     /// may still start and lock the screen.
     @Published var keepAwakeDisplay: Bool {
         didSet { defaults.set(keepAwakeDisplay, forKey: "keepAwakeDisplay") }
@@ -567,21 +571,30 @@ final class BatteryMonitor: ObservableObject {
         let storedKeepAwakeMinutes = defaults.object(forKey: "keepAwakeMinutes") as? Int ?? 0
         self.keepAwakeMinutes = Self.keepAwakeDurations.contains(storedKeepAwakeMinutes)
             ? storedKeepAwakeMinutes : 0
-        self.keepAwakeDisplay = defaults.bool(forKey: "keepAwakeDisplay")
         let persistedKeepAwake = defaults.bool(forKey: "keepAwakeEnabled")
         let persistedKeepAwakeDeadline = (defaults.object(forKey: "keepAwakeDeadline") as? Double)
             .map { Date(timeIntervalSince1970: $0) }
+        let resumedKeepAwake: Bool
         if persistedKeepAwake, let deadline = persistedKeepAwakeDeadline, deadline <= Date() {
-            self.keepAwakeEnabled = false
+            resumedKeepAwake = false
             self.keepAwakeDeadline = nil
             defaults.set(false, forKey: "keepAwakeEnabled")
             defaults.removeObject(forKey: "keepAwakeDeadline")
         } else {
-            self.keepAwakeEnabled = persistedKeepAwake
+            resumedKeepAwake = persistedKeepAwake
             self.keepAwakeDeadline = persistedKeepAwake ? persistedKeepAwakeDeadline : nil
             if !persistedKeepAwake, persistedKeepAwakeDeadline != nil {
                 defaults.removeObject(forKey: "keepAwakeDeadline")
             }
+        }
+        self.keepAwakeEnabled = resumedKeepAwake
+        // The display option belongs to the session: with no session to
+        // resume (never on, or expired above) it is off, whatever a build
+        // that persisted it on its own left behind.
+        let persistedKeepAwakeDisplay = defaults.bool(forKey: "keepAwakeDisplay")
+        self.keepAwakeDisplay = resumedKeepAwake && persistedKeepAwakeDisplay
+        if persistedKeepAwakeDisplay, !resumedKeepAwake {
+            defaults.set(false, forKey: "keepAwakeDisplay")
         }
         let originalLower = defaults.object(forKey: "chargeLowerBound") as? Int
         let originalUpper = defaults.object(forKey: "chargeUpperBound") as? Int
@@ -1476,15 +1489,37 @@ final class BatteryMonitor: ObservableObject {
 
     /// Pure gate for whether the keep-awake assertion should be held.
     /// AC-only by design: an assertion on battery would drain a forgotten
-    /// Mac, and it cannot absorb lid-close sleep anyway, so on battery the
-    /// toggle keeps its intent and the Mac sleeps normally. A deadline at
-    /// or before `now` means the session ended.
+    /// Mac, and it cannot absorb lid-close sleep anyway. A deadline at or
+    /// before `now` means the session ended. Both battery and an ended
+    /// session also end the session itself (keepAwakeSessionEnd); this
+    /// gate is what the held assertion is reconciled against on every
+    /// tick, so a session that is in the middle of ending, or one that
+    /// cannot decide because the adapter state is unknown, still holds
+    /// nothing.
     static func keepAwakeAssertionDesired(
         enabled: Bool, adapterConnected: Bool, deadline: Date?, now: Date
     ) -> Bool {
         guard enabled, adapterConnected else { return false }
         if let deadline, deadline <= now { return false }
         return true
+    }
+
+    /// Why a running session ends on its own, or nil to keep running.
+    /// `adapterConnected` is nil while the adapter state is unknown (a
+    /// failed battery read): that releases the assertion (the gate above)
+    /// but does not end the session, so one bad IOKit read cannot throw
+    /// away an eight-hour session. Only a Mac known to be on battery does.
+    enum KeepAwakeSessionEnd: Equatable {
+        case expired
+        case unplugged
+    }
+    static func keepAwakeSessionEnd(
+        enabled: Bool, adapterConnected: Bool?, deadline: Date?, now: Date
+    ) -> KeepAwakeSessionEnd? {
+        guard enabled else { return nil }
+        if let deadline, deadline <= now { return .expired }
+        if adapterConnected == false { return .unplugged }
+        return nil
     }
 
     /// Deadline for a session of `minutes` starting at `from`; 0 = Forever
@@ -1521,22 +1556,25 @@ final class BatteryMonitor: ObservableObject {
         return display ? .display : .system
     }
 
-    /// UI entry point for the display option. Takes effect at once while a
-    /// session runs (the held assertion is swapped); otherwise it waits for
-    /// the next session.
+    /// UI entry point for the display option: an option of the running
+    /// session, so turning it on with the toggle off is refused (the
+    /// button is disabled then, too). Takes effect at once: the held
+    /// assertion is swapped.
     func setKeepAwakeDisplay(_ on: Bool) {
-        guard on != keepAwakeDisplay else { return }
+        guard on != keepAwakeDisplay, !on || keepAwakeEnabled else { return }
         keepAwakeDisplay = on
-        reconcileKeepAwake(adapterConnected: state?.adapterConnected ?? false)
+        reconcileKeepAwake(adapterConnected: state?.adapterConnected)
     }
 
     /// UI entry point for the toggle. Starting a session stamps the
-    /// deadline from the configured duration; stopping clears it.
+    /// deadline from the configured duration; stopping clears it and takes
+    /// the display option down with it.
     func setKeepAwake(_ on: Bool) {
         guard on != keepAwakeEnabled else { return }
         keepAwakeEnabled = on
+        if !on { keepAwakeDisplay = false }
         setKeepAwakeDeadline(on ? Self.keepAwakeDeadline(minutes: keepAwakeMinutes, from: Date()) : nil)
-        reconcileKeepAwake(adapterConnected: state?.adapterConnected ?? false)
+        reconcileKeepAwake(adapterConnected: state?.adapterConnected)
     }
 
     /// UI entry point for the duration picker. Changing the duration
@@ -1547,7 +1585,7 @@ final class BatteryMonitor: ObservableObject {
         keepAwakeMinutes = minutes
         if keepAwakeEnabled {
             setKeepAwakeDeadline(Self.keepAwakeDeadline(minutes: minutes, from: Date()))
-            reconcileKeepAwake(adapterConnected: state?.adapterConnected ?? false)
+            reconcileKeepAwake(adapterConnected: state?.adapterConnected)
         }
     }
 
@@ -1583,16 +1621,21 @@ final class BatteryMonitor: ObservableObject {
     /// Reconcile the powerd assertion with the desired state. Runs on
     /// every refresh tick (adapter transitions arrive there via the IOPS
     /// notification source), from the UI entry points, and from the expiry
-    /// timer's refresh. A failed create simply retries next tick, same
+    /// timer's refresh. `adapterConnected` is nil when the tick could not
+    /// read the battery. A failed create simply retries next tick, same
     /// contract as the SMC reconciliation.
-    private func reconcileKeepAwake(adapterConnected: Bool) {
+    private func reconcileKeepAwake(adapterConnected: Bool?) {
         let now = Date()
-        // Session over: flip the toggle off (didSet persists) so the UI
-        // reads "off", never "on but expired".
-        if keepAwakeEnabled, let deadline = keepAwakeDeadline, deadline <= now {
+        // Session over (deadline passed, or the adapter is gone): flip the
+        // toggle and the display option off (didSet persists both) so the
+        // UI reads "off", never "on but expired" or "on but on battery";
+        // plugging back in then starts nothing.
+        if let end = Self.keepAwakeSessionEnd(enabled: keepAwakeEnabled, adapterConnected: adapterConnected,
+                                              deadline: keepAwakeDeadline, now: now) {
             keepAwakeEnabled = false
+            keepAwakeDisplay = false
             setKeepAwakeDeadline(nil)
-            AmpereLog.app("Ampere: Keep-awake session expired")
+            AmpereLog.app("Ampere: Keep-awake session ended (%@)", end == .expired ? "expired" : "unplugged")
         }
         // Launch case: a deadline restored by init has no timer yet
         // (timers can't be scheduled mid-init).
@@ -1600,7 +1643,7 @@ final class BatteryMonitor: ObservableObject {
             scheduleKeepAwakeExpiry()
         }
         let desired = Self.keepAwakeAssertion(
-            enabled: keepAwakeEnabled, display: keepAwakeDisplay, adapterConnected: adapterConnected,
+            enabled: keepAwakeEnabled, display: keepAwakeDisplay, adapterConnected: adapterConnected ?? false,
             deadline: keepAwakeDeadline, now: now)
         guard desired != keepAwakeAssertionHeld else { return }
         // A change of kind (the display option toggled mid-session) is a
@@ -2006,8 +2049,9 @@ final class BatteryMonitor: ObservableObject {
         // below: the assertion must track adapter state even on ticks that
         // dispatch SMC work and exit. A failed battery read releases it
         // (sleep allowed) — the safe direction for unknown state, matching
-        // the rest of this file.
-        reconcileKeepAwake(adapterConnected: battery?.adapterConnected ?? false)
+        // the rest of this file — but leaves the session on; only a Mac
+        // known to be unplugged ends it.
+        reconcileKeepAwake(adapterConnected: battery?.adapterConnected)
 
         // Only one Ampere process may manage charge control (see
         // InstanceGuard). Stand by while an earlier instance runs; take over

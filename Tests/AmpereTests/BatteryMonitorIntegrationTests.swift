@@ -20,6 +20,8 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         }
         var percentage = 50
         var connected = true
+        /// True: the battery cannot be read this tick (IOKit failure).
+        var unreadable = false
         var full = false
         var authorized = true
         var stale = false
@@ -122,7 +124,7 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
 
         func monitor(startMonitoring: Bool = false, locked: Bool = true) -> BatteryMonitor {
             var io = BatteryMonitor.IO()
-            io.battery = { self.reading() }
+            io.battery = { self.unreadable ? nil : self.reading() }
             io.lidClosed = { false }
             io.sleepDisabled = {
                 self.lock.lock(); defer { self.lock.unlock() }
@@ -786,14 +788,116 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
 
     // MARK: - Keep Awake display option
 
-    func testKeepAwakeDisplay_PersistsAcrossRestartAndDefaultsToOff() {
+    func testKeepAwakeDisplay_PersistsAcrossRestartWithItsSessionAndDefaultsToOff() {
         let hw = Hardware()
         XCTAssertFalse(hw.monitor().keepAwakeDisplay, "Off until the user confirms it")
+        hw.preferences.values["keepAwakeEnabled"] = true
         hw.preferences.values["keepAwakeDisplay"] = true
         let monitor = hw.monitor()
-        XCTAssertTrue(monitor.keepAwakeDisplay)
+        XCTAssertTrue(monitor.keepAwakeEnabled)
+        XCTAssertTrue(monitor.keepAwakeDisplay, "A restart mid-session resumes the same kind of hold")
         monitor.setKeepAwakeDisplay(false)
         XCTAssertEqual(hw.preferences.values["keepAwakeDisplay"] as? Bool, false)
         XCTAssertFalse(hw.monitor().keepAwakeDisplay)
+    }
+
+    func testKeepAwakeDisplay_RefusedWhileTheToggleIsOff() {
+        let hw = Hardware(), monitor = hw.monitor()
+        monitor.setKeepAwakeDisplay(true)
+        XCTAssertFalse(monitor.keepAwakeDisplay, "An option of the running session only")
+        XCTAssertNil(hw.preferences.values["keepAwakeDisplay"])
+        monitor.setKeepAwake(true)
+        monitor.setKeepAwakeDisplay(true)
+        XCTAssertTrue(monitor.keepAwakeDisplay)
+    }
+
+    func testKeepAwakeDisplay_OffWithoutASessionAtLaunch() {
+        // A build that persisted the option on its own may leave it on with
+        // the toggle off; the invariant is restored at launch.
+        let hw = Hardware()
+        hw.preferences.values["keepAwakeDisplay"] = true
+        XCTAssertFalse(hw.monitor().keepAwakeDisplay)
+        XCTAssertEqual(hw.preferences.values["keepAwakeDisplay"] as? Bool, false)
+        // Same for a session that expired while the app was not running.
+        hw.preferences.values["keepAwakeEnabled"] = true
+        hw.preferences.values["keepAwakeDeadline"] = Date().addingTimeInterval(-60).timeIntervalSince1970
+        hw.preferences.values["keepAwakeDisplay"] = true
+        let monitor = hw.monitor()
+        XCTAssertFalse(monitor.keepAwakeEnabled)
+        XCTAssertFalse(monitor.keepAwakeDisplay)
+        XCTAssertEqual(hw.preferences.values["keepAwakeDisplay"] as? Bool, false)
+    }
+
+    func testKeepAwake_TurningTheToggleOffTurnsTheDisplayOptionOff() {
+        let hw = Hardware(), monitor = hw.monitor()
+        monitor.setKeepAwake(true)
+        monitor.setKeepAwakeDisplay(true)
+        monitor.setKeepAwake(false)
+        XCTAssertFalse(monitor.keepAwakeDisplay)
+        XCTAssertEqual(hw.preferences.values["keepAwakeDisplay"] as? Bool, false)
+        XCTAssertEqual(hw.preferences.values["keepAwakeEnabled"] as? Bool, false)
+    }
+
+    func testKeepAwake_ExpiryTurnsBothOff() {
+        let hw = Hardware()
+        hw.preferences.values["keepAwakeEnabled"] = true
+        hw.preferences.values["keepAwakeDisplay"] = true
+        hw.preferences.values["keepAwakeDeadline"] = Date().addingTimeInterval(0.3).timeIntervalSince1970
+        let monitor = hw.monitor()
+        XCTAssertTrue(monitor.keepAwakeEnabled)
+        monitor.refresh() // arms the expiry timer the init could not
+        awaitCondition { !monitor.keepAwakeEnabled }
+        XCTAssertFalse(monitor.keepAwakeDisplay)
+        XCTAssertNil(monitor.keepAwakeDeadline)
+        XCTAssertEqual(hw.preferences.values["keepAwakeDisplay"] as? Bool, false)
+        XCTAssertNil(hw.preferences.values["keepAwakeDeadline"])
+    }
+
+    func testKeepAwake_UnpluggingEndsTheSessionAndReconnectingStartsNothing() {
+        let hw = Hardware(), monitor = hw.monitor()
+        monitor.refresh()
+        monitor.setKeepAwake(true)
+        monitor.setKeepAwakeDisplay(true)
+        hw.connected = false
+        monitor.refresh()
+        XCTAssertFalse(monitor.keepAwakeEnabled)
+        XCTAssertFalse(monitor.keepAwakeDisplay)
+        XCTAssertNil(monitor.keepAwakeDeadline)
+        XCTAssertEqual(hw.preferences.values["keepAwakeEnabled"] as? Bool, false)
+        XCTAssertEqual(hw.preferences.values["keepAwakeDisplay"] as? Bool, false)
+        hw.connected = true
+        monitor.refresh()
+        XCTAssertFalse(monitor.keepAwakeEnabled, "Plugging back in starts nothing")
+        XCTAssertFalse(monitor.keepAwakeDisplay)
+    }
+
+    func testKeepAwake_LaunchOnBatteryEndsAPersistedSession() {
+        // The app crashed mid-session and relaunches unplugged: the first
+        // poll does what the unplug would have done.
+        let hw = Hardware()
+        hw.connected = false
+        hw.preferences.values["keepAwakeEnabled"] = true
+        hw.preferences.values["keepAwakeDisplay"] = true
+        let monitor = hw.monitor()
+        XCTAssertTrue(monitor.keepAwakeEnabled, "Init cannot tell yet; the first poll decides")
+        monitor.refresh()
+        XCTAssertFalse(monitor.keepAwakeEnabled)
+        XCTAssertFalse(monitor.keepAwakeDisplay)
+        XCTAssertEqual(hw.preferences.values["keepAwakeEnabled"] as? Bool, false)
+        XCTAssertEqual(hw.preferences.values["keepAwakeDisplay"] as? Bool, false)
+    }
+
+    func testKeepAwake_AFailedBatteryReadKeepsTheSession() {
+        let hw = Hardware(), monitor = hw.monitor()
+        monitor.refresh()
+        monitor.setKeepAwake(true)
+        monitor.setKeepAwakeDisplay(true)
+        hw.unreadable = true
+        monitor.refresh()
+        XCTAssertTrue(monitor.keepAwakeEnabled, "Unknown is not unplugged")
+        XCTAssertTrue(monitor.keepAwakeDisplay)
+        hw.unreadable = false
+        monitor.refresh()
+        XCTAssertTrue(monitor.keepAwakeEnabled)
     }
 }
