@@ -36,9 +36,13 @@ func smcWriteKey(_ conn: io_connect_t, _ key: String, _ bytes: [UInt8]) -> Bool 
     let inputSize = MemoryLayout<SMCKeyData>.size
     var outputSize = MemoryLayout<SMCKeyData>.size
 
+    // Two verdicts per call: the IOKit return says the request reached the
+    // SMC, `outputStruct.result` is the SMC's own status (0 = success; for
+    // instance 0x84 = key not found, which arrives with kIOReturnSuccess).
+    // Both are checked, here and after the write, as smcKeyExists does.
     var result = IOConnectCallStructMethod(conn, SMCCmd.userClientSelector,
         &inputStruct, inputSize, &outputStruct, &outputSize)
-    guard result == kIOReturnSuccess else { return false }
+    guard result == kIOReturnSuccess, outputStruct.result == 0 else { return false }
 
     let dataType = outputStruct.keyInfo.dataType
     let dataSize = outputStruct.keyInfo.dataSize
@@ -63,7 +67,7 @@ func smcWriteKey(_ conn: io_connect_t, _ key: String, _ bytes: [UInt8]) -> Bool 
     outputSize = MemoryLayout<SMCKeyData>.size
     result = IOConnectCallStructMethod(conn, SMCCmd.userClientSelector,
         &inputStruct, inputSize, &outputStruct, &outputSize)
-    return result == kIOReturnSuccess
+    return result == kIOReturnSuccess && outputStruct.result == 0
 }
 
 /// True when the SMC exposes `key` at all. macOS 27's firmware dropped

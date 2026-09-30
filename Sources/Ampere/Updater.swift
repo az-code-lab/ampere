@@ -412,10 +412,12 @@ extension BatteryMonitor {
         try task.run()
     }
 
-    /// Run a tool to completion, capturing output. Reads both pipes to EOF
-    /// before waiting so a full pipe buffer can't deadlock the child.
+    /// Run a tool to completion, capturing output. Both pipes are drained
+    /// to EOF at the same time, before waiting: a child that fills one pipe
+    /// (64 KB) while the parent still waits on the other blocks forever,
+    /// and so would the parent. Internal so a test can drive it.
     @discardableResult
-    private static func runProcess(_ launchPath: String, _ arguments: [String]) -> (status: Int32, stdout: Data, stderr: Data) {
+    static func runProcess(_ launchPath: String, _ arguments: [String]) -> (status: Int32, stdout: Data, stderr: Data) {
         let task = Process()
         task.executableURL = URL(fileURLWithPath: launchPath)
         task.arguments = arguments
@@ -429,8 +431,14 @@ extension BatteryMonitor {
         } catch {
             return (-1, Data(), Data())
         }
+        var stderr = Data()
+        let stderrDrained = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .utility).async {
+            stderr = errPipe.fileHandleForReading.readDataToEndOfFile()
+            stderrDrained.signal()
+        }
         let stdout = outPipe.fileHandleForReading.readDataToEndOfFile()
-        let stderr = errPipe.fileHandleForReading.readDataToEndOfFile()
+        stderrDrained.wait()
         task.waitUntilExit()
         return (task.terminationStatus, stdout, stderr)
     }

@@ -45,6 +45,9 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         var limitsReadable = true
         /// The targets "powerd" enforces, as the native commands leave them.
         var registered: [Int] = []
+        /// False: the helper's native-limit writes succeed but powerd never
+        /// applies them (`registered` stays as it is).
+        var enforcesLimits = true
         var clock = Date()
         let preferences = MemoryBatteryPreferences()
         private let lock = NSLock()
@@ -70,6 +73,11 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         func fail(_ command: String) {
             lock.lock(); defer { lock.unlock() }
             failingCommands.insert(command)
+        }
+
+        func stopFailing(_ command: String) {
+            lock.lock(); defer { lock.unlock() }
+            failingCommands.remove(command)
         }
 
         func resetChargingKey() {
@@ -106,7 +114,8 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
             default:
                 if command.hasPrefix("discharge:") { chie = 8; held = true }
                 if command.hasPrefix("register-daemon:") { daemonRegistered = true }
-                if command.hasPrefix("native-limit:"), let n = Int(command.dropFirst("native-limit:".count)) {
+                if command.hasPrefix("native-limit:"), enforcesLimits,
+                   let n = Int(command.dropFirst("native-limit:".count)) {
                     registered = [n]
                 }
             }
@@ -424,6 +433,58 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         XCTAssertEqual(monitor.lastHealthCheckStatus, "pass")
     }
 
+    func testSleepHoldWaitsForAWatchdogAndRetriesTheSpawn() {
+        let hw = Hardware()
+        hw.percentage = 30
+        let spawn = "spawn-watchdog:\(pid)"
+        hw.fail(spawn)
+        let monitor = hw.monitor(startMonitoring: true)
+        awaitCondition { hw.writes.count >= 4 }
+        drainCallbacks()
+        XCTAssertEqual(hw.writes, ["nodischarge", "allow", spawn, spawn],
+                       "The launch spawn failed: the hold retries it once, then waits rather than block sleep with no crash net")
+        XCTAssertTrue(monitor.chargeToUpperBound)
+        XCTAssertFalse(monitor.sleepHoldActive)
+        hw.stopFailing(spawn)
+        monitor.refresh()
+        awaitCondition { hw.writes.contains("hold-sleep") }
+        XCTAssertEqual(Array(hw.writes.suffix(2)), [spawn, "hold-sleep"])
+        XCTAssertTrue(monitor.sleepHoldActive)
+        for _ in 0..<2 { monitor.refresh() }
+        drainCallbacks()
+        XCTAssertEqual(hw.writes.count, 6, "A running watchdog is not spawned again")
+    }
+
+    /// The hold's "spawn first" decision reads this table, so a wrong entry
+    /// means either a hold with no crash net or a duplicate watchdog.
+    func testWatchdogTrackingFollowsTheHelperCommands() {
+        XCTAssertEqual(BatteryMonitor.watchdogSpawned(after: "spawn-watchdog:42", ok: true), true)
+        XCTAssertEqual(BatteryMonitor.watchdogSpawned(after: "spawn-watchdog:42", ok: false), false)
+        XCTAssertEqual(BatteryMonitor.watchdogSpawned(after: "discharge:42", ok: true), true,
+                       "The discharge command spawns its own watchdog")
+        XCTAssertEqual(BatteryMonitor.watchdogSpawned(after: "discharge:42", ok: false), false,
+                       "A failed discharge rolls its watchdog back; the preceding nodischarge retired the old one")
+        XCTAssertEqual(BatteryMonitor.watchdogSpawned(after: "nodischarge", ok: true), false)
+        XCTAssertEqual(BatteryMonitor.watchdogSpawned(after: "restore", ok: true), false)
+        XCTAssertNil(BatteryMonitor.watchdogSpawned(after: "nodischarge", ok: false),
+                     "Watchdogs are retired last, so a failed restore leaves them running")
+        XCTAssertNil(BatteryMonitor.watchdogSpawned(after: "restore", ok: false))
+        for untouched in ["inhibit", "allow", "hold-sleep", "release-sleep-hold", "native-limit:60",
+                          "native-limit-release", "register-daemon:/Applications/Ampere.app"] {
+            XCTAssertNil(BatteryMonitor.watchdogSpawned(after: untouched, ok: true), untouched)
+            XCTAssertNil(BatteryMonitor.watchdogSpawned(after: untouched, ok: false), untouched)
+        }
+    }
+
+    func testSleepHoldNeedsNoSpawnWhenTheLaunchWatchdogIsRunning() {
+        let hw = Hardware()
+        hw.percentage = 30
+        let monitor = hw.monitor(startMonitoring: true)
+        awaitCondition { hw.writes.contains("hold-sleep") }
+        XCTAssertEqual(hw.writes, ["nodischarge", "allow", "spawn-watchdog:\(pid)", "hold-sleep"])
+        XCTAssertTrue(monitor.sleepHoldActive)
+    }
+
     func testStandsByForAnEarlierInstanceAndTakesOverWhenItQuits() {
         let hw = Hardware()
         hw.competing = "Ampere running as alice"
@@ -719,6 +780,81 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         drainCallbacks()
         XCTAssertEqual(monitor.lastHealthCheckStatus, "pass")
         XCTAssertNil(monitor.healthWarning)
+    }
+
+    func testNativeMode_ALimitThatNeverSticksWarnsAfterOneSilentRepair() {
+        let hw = Hardware()
+        hw.percentage = 50
+        let monitor = nativeMonitor(hw)
+        for _ in 0..<5 { monitor.refresh() }
+        drainCallbacks()
+        XCTAssertEqual(monitor.lastHealthCheckStatus, "pass")
+        // powerd drops the limit and applies none of the re-issued targets.
+        hw.enforcesLimits = false
+        hw.clearRegisteredLimits()
+        hw.clock = hw.clock.addingTimeInterval(200)
+        monitor.refresh()
+        drainCallbacks()
+        XCTAssertEqual(monitor.lastHealthCheckStatus, "FAIL")
+        XCTAssertNil(monitor.healthWarning, "The first repair is silent")
+        monitor.refresh()
+        awaitCondition { hw.writes.filter { $0 == "native-limit:50" }.count == 2 }
+        hw.clock = hw.clock.addingTimeInterval(200)
+        monitor.refresh()
+        drainCallbacks()
+        XCTAssertEqual(monitor.lastHealthCheckStatus, "FAIL")
+        XCTAssertNotNil(monitor.healthWarning,
+                        "A mismatch that survives a repair shows the warning; the repair write landing proves nothing")
+        // Enforcement returns: the next repair sticks and the warning clears.
+        hw.enforcesLimits = true
+        monitor.refresh()
+        awaitCondition { hw.writes.filter { $0 == "native-limit:50" }.count == 3 }
+        hw.clock = hw.clock.addingTimeInterval(200)
+        for _ in 0..<2 { monitor.refresh() }
+        drainCallbacks()
+        XCTAssertEqual(monitor.lastHealthCheckStatus, "pass")
+        XCTAssertNil(monitor.healthWarning)
+    }
+
+    func testNativeMode_CancelledFullChargeIsHeldWhenItsWriteCompletes() {
+        let hw = Hardware()
+        hw.percentage = 50
+        let monitor = nativeMonitor(hw)
+        let gate = hw.blockNext("native-limit:100")
+        monitor.setChargeToFull(true)
+        XCTAssertEqual(gate.entered.wait(timeout: .now() + 3), .success)
+        monitor.setChargeToFull(false)
+        gate.release.signal()
+        awaitCondition { hw.writes.last == "native-limit:50" }
+        XCTAssertEqual(Array(hw.writes.suffix(2)), ["native-limit:100", "native-limit:50"],
+                       "The hold lands from the write's own completion, not at the next poll")
+        XCTAssertTrue(monitor.chargingPaused)
+        XCTAssertFalse(monitor.chargeToFull)
+        for _ in 0..<2 { monitor.refresh() }
+        drainCallbacks()
+        XCTAssertEqual(hw.writes.filter { $0 == "native-limit:50" }.count, 2, "Later polls find the hold current")
+    }
+
+    func testNativeMode_FullChargeCancelledDuringItsWriteIsSettledBeforeSleep() {
+        let hw = Hardware()
+        hw.percentage = 50
+        let monitor = nativeMonitor(hw)
+        let gate = hw.blockNext("native-limit:100")
+        monitor.setChargeToFull(true)
+        XCTAssertEqual(gate.entered.wait(timeout: .now() + 3), .success)
+        monitor.setChargeToFull(false)
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.03) { gate.release.signal() }
+        monitor.prepareForSleep()
+        XCTAssertEqual(Array(hw.writes.suffix(2)), ["native-limit:100", "native-limit:50"],
+                       "The hold lands before sleep; refresh is blocked until wake")
+        drainCallbacks() // the taken-over write's queued completion runs and changes nothing
+        monitor.refresh()
+        XCTAssertEqual(hw.writes.last, "native-limit:50")
+        monitor.resumeAfterWake()
+        drainCallbacks()
+        XCTAssertEqual(hw.writes.filter { $0 == "native-limit:50" }.count, 2, "Wake finds the target current")
+        XCTAssertTrue(monitor.chargingPaused)
+        XCTAssertFalse(monitor.chargeToFull)
     }
 
     func testNativeMode_SleepHooksWriteNothingAndQuitRestores() {

@@ -487,9 +487,50 @@ final class BatteryMonitor: ObservableObject {
     /// the health check treats a mismatch inside that window as settling,
     /// not failure.
     private var nativeLimitWrittenAt: Date?
+    /// Native-mode counterpart of chteRepairAttempted, with the same
+    /// contract: set when the health check re-issues a target, cleared only
+    /// by a check that passes. A write landing (including the repair write
+    /// itself) proves nothing about enforcement, so it leaves this alone.
     private var nativeRepairAttempted = false
     /// Grace period after a native write before a mismatch counts.
     private static let nativeLimitSettleSeconds: TimeInterval = 150
+    /// One native-mode helper call, from dispatch to completion. A class so
+    /// the completion can tell whether it is still the current write:
+    /// prepareForSleep records a write that is in flight when sleep begins
+    /// and settles the target itself, after which the queued completion
+    /// must not store the stale target on wake.
+    private final class NativeLimitWrite {
+        let target: Int?
+        let intent: NativeLimitIntent
+        /// controlRevision at dispatch: a change since means a request
+        /// arrived while the helper ran and the state must be re-evaluated.
+        let revision: UInt64
+        let percentage: Int
+        /// Set on the SMC queue when the helper returns. Read on the main
+        /// queue from the completion, or after smcQueue.sync has drained.
+        var succeeded = false
+        var command: String { target.map { "native-limit:\($0)" } ?? "native-limit-release" }
+        init(target: Int?, intent: NativeLimitIntent, revision: UInt64, percentage: Int) {
+            self.target = target
+            self.intent = intent
+            self.revision = revision
+            self.percentage = percentage
+        }
+    }
+    private var nativeLimitInFlight: NativeLimitWrite?
+    /// Whether the helper's crash watchdog for this process is known to be
+    /// running: true after a successful spawn (launch, the helper install
+    /// transaction, a discharge start, the respawn after nodischarge), false
+    /// once a helper transaction retires it (nodischarge, restore) or a spawn
+    /// fails. A sleep hold is never applied without one (see the dispatch in
+    /// refresh): the watchdog is what puts sleep back if the app dies. Read
+    /// and written on both the main and the SMC queue, hence the lock.
+    private let watchdogLock = NSLock()
+    private var watchdogSpawnedStorage = false
+    private var watchdogSpawned: Bool {
+        get { watchdogLock.lock(); defer { watchdogLock.unlock() }; return watchdogSpawnedStorage }
+        set { watchdogLock.lock(); defer { watchdogLock.unlock() }; watchdogSpawnedStorage = newValue }
+    }
     /// Sleep-hold intent from the state machine, persisted so a crash or
     /// in-app upgrade mid-hold re-arms after relaunch (launch cleanup always
     /// restores pmset via nodischarge, so without the persisted intent a
@@ -899,9 +940,11 @@ final class BatteryMonitor: ObservableObject {
     /// full-charge or manual-resume request whose callback is still pending.
     func prepareForSleep() {
         preparingForSleep = true
-        // The firmware keeps enforcing the macOS charge limit through
-        // sleep; there is no inhibit key to write ahead of it.
-        guard chargeControlHold == nil, !nativeLimitMode else { return }
+        guard chargeControlHold == nil else { return }
+        if nativeLimitMode {
+            settleNativeLimitBeforeSleep()
+            return
+        }
         smcQueue.sync {}
         guard isSudoRuleInstalled, let battery = io.battery(), battery.adapterConnected else { return }
         let pause: Bool
@@ -1163,6 +1206,7 @@ final class BatteryMonitor: ObservableObject {
                     self.sleepHoldIntent = false
                     self.nativeLimitWritten = nil
                     self.nativeLimitIntent = nil
+                    self.watchdogSpawned = false
                     self.lastError = nil
                     self.healthWarning = nil
                 } else {
@@ -1265,8 +1309,12 @@ final class BatteryMonitor: ObservableObject {
         }
         smcQueue.async { [weak self] in
             let ok = self?.io.installHelper() ?? false
-            // The setup transaction already installed a fresh watchdog.
-            if ok { self?.registerCleanupDaemonIfNeeded() }
+            // The setup transaction already installed a fresh watchdog (a
+            // spawn failure fails the install).
+            if ok {
+                self?.watchdogSpawned = true
+                self?.registerCleanupDaemonIfNeeded()
+            }
             DispatchQueue.main.async {
                 // Optional chaining: NSApp is nil under the test host.
                 NSApp?.activate(ignoringOtherApps: true)
@@ -1345,7 +1393,23 @@ final class BatteryMonitor: ObservableObject {
         }
     }
 
-    private func runSMCWriteViaSudo(_ arg: String) -> Bool { io.writeHelper(arg) }
+    private func runSMCWriteViaSudo(_ arg: String) -> Bool {
+        let ok = io.writeHelper(arg)
+        if let spawned = Self.watchdogSpawned(after: arg, ok: ok) { watchdogSpawned = spawned }
+        return ok
+    }
+
+    /// What a helper command leaves of the crash watchdog, or nil when it
+    /// does not touch it. spawn-watchdog and discharge start one (a failed
+    /// discharge rolls its own back, and the nodischarge that precedes
+    /// every spawn has already retired the previous one); nodischarge and
+    /// restore retire it, but only once they succeed (HelperRecovery stops
+    /// watchdogs last).
+    static func watchdogSpawned(after command: String, ok: Bool) -> Bool? {
+        if command.hasPrefix("spawn-watchdog:") || command.hasPrefix("discharge:") { return ok }
+        if command == "nodischarge" || command == "restore" { return ok ? false : nil }
+        return nil
+    }
 
     private static func checkHelperAuthorization() -> Bool {
         // -k ignores cached sudo credentials for this command. Success
@@ -2323,6 +2387,7 @@ final class BatteryMonitor: ObservableObject {
                 case .none:    op = reassert ? (decision.newState.chargingPaused ? .inhibit : .allow) : nil
                 }
                 let next = decision.newState
+                let selfPID = ProcessInfo.processInfo.processIdentifier
                 smcQueue.async { [weak self] in
                     guard let self = self else { return }
                     // CHTE first: at the upper bound the inhibit must land
@@ -2331,8 +2396,18 @@ final class BatteryMonitor: ObservableObject {
                     let ok = op.map { self.runSMCWrite($0) } ?? true
                     var holdApplied = false
                     if ok, holdOpNeeded {
-                        holdApplied = self.runSMCWriteViaSudo(
-                            next.sleepHold ? "hold-sleep" : "release-sleep-hold")
+                        // No sleep override without a crash net, the rule
+                        // the helper applies to a discharge: only the
+                        // watchdog puts sleep back if the app dies mid-hold.
+                        // A spawn that failed at launch is retried here;
+                        // failing again, the hold waits for the next tick.
+                        if next.sleepHold, !self.watchdogSpawned,
+                           !self.runSMCWriteViaSudo("spawn-watchdog:\(selfPID)") {
+                            AmpereLog.app("Ampere: Sleep hold skipped at %d%%: no watchdog to restore sleep after a crash", pct)
+                        } else {
+                            holdApplied = self.runSMCWriteViaSudo(
+                                next.sleepHold ? "hold-sleep" : "release-sleep-hold")
+                        }
                     }
                     DispatchQueue.main.async {
                         self.autoManageInFlight = false
@@ -2501,7 +2576,9 @@ final class BatteryMonitor: ObservableObject {
     /// write confirms a transition, so the state is applied directly and
     /// the one helper call per change carries the target. Sleep holds
     /// never arm: the firmware enforces the target through sleep.
-    private func nativeRefresh(_ battery: BatteryState?) {
+    /// `beforeSleep` runs the one helper call inline and skips the health
+    /// check: prepareForSleep needs the target settled before it returns.
+    private func nativeRefresh(_ battery: BatteryState?, beforeSleep: Bool = false) {
         guard let b = battery else { return }
         // Explicit requests (manual Pause/Resume, cancelling a full charge)
         // apply immediately; the machine below then evaluates against them.
@@ -2570,38 +2647,70 @@ final class BatteryMonitor: ObservableObject {
             nativeLimitIntent = intent
         } else if !autoManageInFlight {
             autoManageInFlight = true
-            let command = target.map { "native-limit:\($0)" } ?? "native-limit-release"
-            let pct = b.percentage
-            smcQueue.async { [weak self] in
-                guard let self else { return }
-                let ok = self.runSMCWriteViaSudo(command)
-                DispatchQueue.main.async {
-                    self.autoManageInFlight = false
-                    if ok {
-                        self.nativeLimitWritten = target
-                        self.nativeLimitIntent = intent
-                        self.nativeLimitWrittenAt = self.io.now()
-                        self.nativeRepairAttempted = false
-                        self.lastError = nil
-                        if let target {
-                            AmpereLog.app("Ampere: macOS charge limit set to %d%% at %d%%", target, pct)
-                        } else {
-                            AmpereLog.app("Ampere: macOS charge limit released at %d%%", pct)
-                        }
-                    } else {
-                        // One attempt per change; the next tick retries.
-                        self.lastError = "Charge control failed — revoke and re-grant admin access"
-                        AmpereLog.app("Ampere: %@ failed at %d%%", command, pct)
+            let write = NativeLimitWrite(target: target, intent: intent,
+                                         revision: controlRevision, percentage: b.percentage)
+            nativeLimitInFlight = write
+            if beforeSleep {
+                smcQueue.sync { write.succeeded = runSMCWriteViaSudo(write.command) }
+                finishNativeLimitWrite(write)
+            } else {
+                smcQueue.async { [weak self] in
+                    guard let self else { return }
+                    write.succeeded = self.runSMCWriteViaSudo(write.command)
+                    DispatchQueue.main.async {
+                        // Recorded by prepareForSleep already: nothing left
+                        // to store, and the target it settled must stand.
+                        guard self.nativeLimitInFlight === write else { return }
+                        self.finishNativeLimitWrite(write)
                     }
                 }
             }
             return
         }
 
-        if refreshCount > Self.healthCheckSettleRefreshes,
+        if !beforeSleep, refreshCount > Self.healthCheckSettleRefreshes,
            !autoManageInFlight, isSudoRuleInstalled, b.adapterConnected {
             performNativeHealthCheck(battery: b)
         }
+    }
+
+    /// Record the outcome of a native write once the helper has returned.
+    /// A request that arrived while the helper ran (a cancelled full charge,
+    /// a manual pause) is evaluated right away rather than at the next poll:
+    /// the write stored its own target, and the newer intent may need a
+    /// different one.
+    private func finishNativeLimitWrite(_ write: NativeLimitWrite) {
+        autoManageInFlight = false
+        nativeLimitInFlight = nil
+        if write.succeeded {
+            nativeLimitWritten = write.target
+            nativeLimitIntent = write.intent
+            nativeLimitWrittenAt = io.now()
+            lastError = nil
+            if let target = write.target {
+                AmpereLog.app("Ampere: macOS charge limit set to %d%% at %d%%", target, write.percentage)
+            } else {
+                AmpereLog.app("Ampere: macOS charge limit released at %d%%", write.percentage)
+            }
+        } else {
+            // One attempt per change; the next tick retries.
+            lastError = "Charge control failed — revoke and re-grant admin access"
+            AmpereLog.app("Ampere: %@ failed at %d%%", write.command, write.percentage)
+        }
+        if controlRevision != write.revision { refresh() }
+    }
+
+    /// Pre-sleep handling for native mode. The firmware keeps enforcing the
+    /// macOS charge limit through sleep, so there is no inhibit to write
+    /// ahead of it. What must not ride through sleep is a target the user
+    /// has since changed: a full charge cancelled while its 100% write was
+    /// still in the helper is stored by that write's completion, which runs
+    /// after wake, and refresh() is blocked until then. Wait for the helper,
+    /// record the write here, and settle the target with one inline poll.
+    private func settleNativeLimitBeforeSleep() {
+        smcQueue.sync {}
+        if let write = nativeLimitInFlight { finishNativeLimitWrite(write) }
+        nativeRefresh(io.battery(), beforeSleep: true)
     }
 
     /// Health check for native mode: the target powerd enforces (read
