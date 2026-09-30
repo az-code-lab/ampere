@@ -102,15 +102,49 @@ final class NativeChargeLimitTests: XCTestCase {
         XCTAssertNil(target(.release, pct: 50, previous: .hold, written: 50))
     }
 
-    func testTarget_HoldIsStickyOnACAndTracksDownOffAC() {
+    func testTarget_HoldFollowsTheLevelUpOnACAndDownOffAC() {
         XCTAssertEqual(target(.hold, pct: 50), 50, "A fresh hold pins the current level")
-        XCTAssertEqual(target(.hold, pct: 51, previous: .hold, written: 50), 50,
-                       "A level that ticks up while the firmware settles is not chased")
+        XCTAssertEqual(target(.hold, pct: 51, previous: .hold, written: 50), 51,
+                       "A level that ticks up before the target applies is kept, not drained back")
+        XCTAssertEqual(target(.hold, pct: 49, previous: .hold, written: 50), 50,
+                       "A dip under load on AC is not followed; the firmware charges it back")
         XCTAssertEqual(target(.hold, pct: 70, previous: .drainTo(60), written: 60), 70,
                        "Turning discharge off mid-drain holds where the battery is now")
         XCTAssertEqual(target(.hold, pct: 45, ac: false, previous: .hold, written: 50), 45,
                        "Off AC the hold follows the level down")
         XCTAssertEqual(target(.hold, pct: 47, ac: false, previous: .hold, written: 45), 45,
                        "...and never back up")
+    }
+
+    // MARK: - Mechanism
+
+    private func mechanism(chte: Bool, client: Bool = true, readable: Bool = true) -> BatteryMonitor.ChargeControlMechanism {
+        BatteryMonitor.chargeControlMechanism(chteAvailable: chte, nativeClientAvailable: client,
+                                              nativeLimitsReadable: readable)
+    }
+
+    func testMechanism_CHTEFirstWhereverItExists() {
+        XCTAssertEqual(mechanism(chte: true), .chargeTerminateKey)
+        XCTAssertEqual(mechanism(chte: true, client: false, readable: false), .chargeTerminateKey,
+                       "The key alone decides; a macOS without the charge limit still has CHTE control")
+    }
+
+    func testMechanism_NativeNeedsBothTheClientAndReadableLimits() {
+        XCTAssertEqual(mechanism(chte: false), .nativeLimit)
+        XCTAssertEqual(mechanism(chte: false, client: false), .unavailable,
+                       "No client class: this macOS has no charge limit")
+        XCTAssertEqual(mechanism(chte: false, readable: false), .unavailable,
+                       "pmset cannot report limits: nothing for the health check to verify against")
+        XCTAssertEqual(mechanism(chte: false, client: false, readable: false), .unavailable)
+    }
+
+    func testMechanism_NativeProbesAreNotRunWhileCHTEExists() {
+        var probed = false
+        let mechanism = BatteryMonitor.chargeControlMechanism(
+            chteAvailable: true,
+            nativeClientAvailable: { probed = true; return true }(),
+            nativeLimitsReadable: { probed = true; return true }())
+        XCTAssertEqual(mechanism, .chargeTerminateKey)
+        XCTAssertFalse(probed, "A Mac with CHTE never loads the private framework or spawns pmset")
     }
 }

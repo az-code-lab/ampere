@@ -88,8 +88,13 @@ final class BatteryMonitor: ObservableObject {
         var readKey: (String) -> [UInt8]? = BatteryMonitor.smcReadKey
         /// False on firmware without the CHTE key (macOS 27, and the same
         /// firmware in macOS 26.7): charge control then goes through
-        /// macOS's own charge limit (see NativeChargeLimit).
+        /// macOS's own charge limit when this macOS has one (see
+        /// chargeControlMechanism).
         var chargeTerminateAvailable: () -> Bool = { BatteryMonitor.smcReadKey(SMC.keyChargeTerminate) != nil }
+        /// True when this macOS has the manual charge limit at all (see
+        /// NativeChargeLimit.clientClass); false on a macOS that predates
+        /// it, whatever the firmware.
+        var nativeLimitClientAvailable: () -> Bool = { NativeChargeLimit.clientClass() != nil }
         /// The targets powerd currently enforces (`pmset -g battlimit`);
         /// nil when the tool could not be run.
         var registeredNativeLimits: () -> [Int]? = BatteryMonitor.readRegisteredNativeLimits
@@ -210,6 +215,11 @@ final class BatteryMonitor: ObservableObject {
         /// This account declined the password prompt while taking over
         /// from that process. The next charge-control action asks again.
         case accessDeclined
+        /// Neither mechanism exists on this Mac: the firmware has no CHTE
+        /// key and this macOS has no charge limit to hand a target to (see
+        /// chargeControlMechanism). Nothing is written, no helper is
+        /// installed, and nothing needs restoring; the panel monitors only.
+        case noMechanism
     }
     @Published private(set) var chargeControlHold: ChargeControlHold?
     /// True while another process holds charge control; the panel hides
@@ -217,6 +227,41 @@ final class BatteryMonitor: ObservableObject {
     var standingBy: Bool {
         if case .otherInstance = chargeControlHold { return true }
         return false
+    }
+    /// True while nothing this instance could write would apply: another
+    /// process holds control, or this Mac has no mechanism. The panel
+    /// hides the controls either way; the status line says which.
+    var controlsUnavailable: Bool {
+        standingBy || chargeControlHold == .noMechanism
+    }
+
+    /// Which mechanism can hold the charge on this Mac. Decided from what
+    /// is present, never from the macOS version: the SMC's CHTE key first,
+    /// because it is immediate and exact; without it, macOS's own charge
+    /// limit, but only when the client class behind it answers the
+    /// manual-limit calls the release path makes and `pmset -g battlimit`
+    /// answers, which the health check verifies against. A Mac with
+    /// neither (firmware that lost CHTE under a macOS that predates the
+    /// charge limit) gets no charge control rather than a target that
+    /// nothing enforces: a preference write there reports success, the
+    /// health check can never read a limit back, and the release the
+    /// helper would later need has no client to talk to.
+    enum ChargeControlMechanism: Equatable {
+        case chargeTerminateKey
+        case nativeLimit
+        case unavailable
+    }
+
+    /// Internal (not private) so the precedence can be pinned by tests.
+    /// The native probes are autoclosures: a Mac with CHTE never loads the
+    /// private framework or spawns pmset.
+    static func chargeControlMechanism(
+        chteAvailable: Bool, nativeClientAvailable: @autoclosure () -> Bool,
+        nativeLimitsReadable: @autoclosure () -> Bool
+    ) -> ChargeControlMechanism {
+        if chteAvailable { return .chargeTerminateKey }
+        if nativeClientAvailable() && nativeLimitsReadable() { return .nativeLimit }
+        return .unavailable
     }
     /// True once this account has been verified (or granted) passwordless
     /// access to the helper in this session; false again after Revoke. The
@@ -406,17 +451,19 @@ final class BatteryMonitor: ObservableObject {
     /// mismatch that survives a repair attempt surfaces it, where "revoke &
     /// re-grant admin" is plausible advice again.
     private var chteRepairAttempted = false
-    /// True when the SMC has no CHTE key, so charging is held through
-    /// macOS's own charge limit instead of the inhibit key. Decided when
-    /// this instance takes charge control; everything below that reads
-    /// CHTE or CHIE for control is bypassed while it is set, and the
-    /// firmware, not a poll, stops the charge at the target.
+    /// True when the SMC has no CHTE key and this macOS has a charge limit
+    /// of its own, so charging is held through that instead of the inhibit
+    /// key (chargeControlMechanism, decided when this instance takes
+    /// charge control). Everything below that reads CHTE or CHIE for
+    /// control is bypassed while it is set, and the firmware, not a poll,
+    /// stops the charge at the target.
     @Published private(set) var nativeLimitMode = false
     /// The target last handed to the helper in native mode; nil once
     /// released (the user's own macOS setting is back in force).
     private var nativeLimitWritten: Int?
-    /// What that target was for, so a hold keeps its level across polls
-    /// instead of chasing the percentage upward while the firmware settles.
+    /// What that target was for, so a hold is recognized as the same hold
+    /// across polls (it follows the level up on AC and down off AC, see
+    /// nativeLimitTarget) rather than restarting at every tick.
     private var nativeLimitIntent: NativeLimitIntent?
     /// When the last native write landed. The agent applies a target at its
     /// next once-a-minute evaluation (82 seconds observed on macOS 27.0), so
@@ -659,6 +706,22 @@ final class BatteryMonitor: ObservableObject {
     /// charge-control action asks again. Returns false when the app is quitting.
     @discardableResult
     private func activateChargeControl(atLaunch: Bool) -> Bool {
+        // What can hold the charge here, from what is present (never the
+        // macOS version). With neither mechanism there is nothing a helper
+        // could do: no prompt, no cleanup writes, no watchdog, and nothing
+        // to restore at quit. A helper an earlier version installed stays
+        // put; if it still answers to this account, Revoke is offered.
+        let mechanism = Self.chargeControlMechanism(
+            chteAvailable: io.chargeTerminateAvailable(),
+            nativeClientAvailable: io.nativeLimitClientAvailable(),
+            nativeLimitsReadable: io.registeredNativeLimits() != nil)
+        nativeLimitMode = mechanism == .nativeLimit
+        if mechanism == .unavailable {
+            chargeControlHold = .noMechanism
+            accountAuthorized = isSudoRuleInstalled && !io.helperStale() && io.helperAuthorized()
+            AmpereLog.app("Ampere: Charge control unavailable: this firmware has no CHTE key and this macOS has no charge limit; monitoring only")
+            return true
+        }
         // Install/update the helper or authorize this macOS account.
         // brew uninstall would have removed the helper; a fresh app build
         // would have a different helper binary. The install prompts for
@@ -748,7 +811,7 @@ final class BatteryMonitor: ObservableObject {
             // expected state by the time refresh() starts dispatching
             // auto-manage actions — otherwise refresh's state machine
             // could race against an in-flight cleanup write.
-            nativeLimitMode = !io.chargeTerminateAvailable()
+            // nativeLimitMode was decided above, before the helper prompt.
             nativeLimitWritten = nil
             nativeLimitIntent = nil
             let okDischarge = runSMCWriteViaSudo("nodischarge")
@@ -1162,7 +1225,9 @@ final class BatteryMonitor: ObservableObject {
     func ensureSudoInstalled(completion: @escaping (Bool) -> Void) {
         // Standing by: installing would run the migration's restore and
         // spawn a watchdog against the instance that holds charge control.
-        if standingBy {
+        // No mechanism: nothing a helper could do here would apply. The
+        // status line already explains both.
+        if controlsUnavailable {
             completion(false)
             return
         }
@@ -2311,11 +2376,14 @@ final class BatteryMonitor: ObservableObject {
     }
 
     /// The target to hand the helper for `intent`, given what was written
-    /// last. A hold is sticky: the level is fixed when the hold begins and
-    /// kept while the firmware settles, so a percentage that ticks up in
-    /// the minute before the agent applies the target is drained back
-    /// rather than chased upward. Off AC the hold follows the level down,
-    /// so a reconnect never charges toward a stale level. Nil releases.
+    /// last. On AC a hold follows the level up: the agent needs up to a
+    /// minute to apply a target, and a percentage that ticks up meanwhile
+    /// becomes the new target rather than being drained back to the old
+    /// one (the firmware drains a battery that sits above its limit). The
+    /// chase ends by itself, since charging stops the moment the limit
+    /// lands. A dip under load on AC is not followed; the firmware charges
+    /// it back. Off AC the hold follows the level down, so a reconnect
+    /// never charges toward a stale level. Nil releases.
     static func nativeLimitTarget(
         intent: NativeLimitIntent, percentage: Int, adapterConnected: Bool,
         previousIntent: NativeLimitIntent?, previousTarget: Int?
@@ -2325,7 +2393,7 @@ final class BatteryMonitor: ObservableObject {
         case .chargeTo(let target), .drainTo(let target): return target
         case .hold:
             guard previousIntent == .hold, let previous = previousTarget else { return percentage }
-            return adapterConnected ? previous : min(previous, percentage)
+            return adapterConnected ? max(previous, percentage) : min(previous, percentage)
         }
     }
 
@@ -2398,7 +2466,9 @@ final class BatteryMonitor: ObservableObject {
         if target == nativeLimitWritten {
             // Same target for a new reason (a charge that reached the bound
             // becomes a hold there): no write needed, but the intent must
-            // follow so the hold stays sticky from here on.
+            // follow so the next poll treats it as the same hold (which
+            // follows the level up on AC and down off AC) rather than a
+            // fresh one.
             nativeLimitIntent = intent
         } else if !autoManageInFlight {
             autoManageInFlight = true

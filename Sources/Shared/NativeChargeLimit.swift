@@ -24,6 +24,27 @@ public enum NativeChargeLimit {
     /// Darwin notification the agent observes to reload its preferences
     /// (it logs "Loaded Settings" the moment it is posted).
     public static let reloadNotification = "com.apple.smartcharging.defaultschanged"
+    /// The private framework and client class behind System Settings'
+    /// Charge Limit, and the manual-charge-limit selectors the helper's
+    /// release path calls on it. Their presence is also how the app tells
+    /// whether this macOS has the feature at all: a macOS that predates it
+    /// has no such class, or a class without these methods. Nothing here
+    /// consults the macOS version.
+    public static let clientFrameworkPath = "/System/Library/PrivateFrameworks/PowerUI.framework/Versions/A/PowerUI"
+    public static let clientClassName = "PowerUISmartChargeClient"
+    public static let clientSelectors = ["isMCLCurrentlyEnabled:", "enableMCL:", "disableMCL:"]
+
+    /// The client class, when this macOS has the manual charge limit: the
+    /// framework loads, the class exists, and its instances answer every
+    /// selector in `clientSelectors`. Nil otherwise. Class inspection only:
+    /// no privileges are needed and no connection to the agent is opened.
+    public static func clientClass() -> AnyClass? {
+        guard dlopen(clientFrameworkPath, RTLD_NOW) != nil,
+              let cls: AnyClass = NSClassFromString(clientClassName),
+              clientSelectors.allSatisfy({ class_respondsToSelector(cls, NSSelectorFromString($0)) })
+        else { return nil }
+        return cls
+    }
 
     /// Targets the firmware accepts. 100 means "no limit" to the agent.
     public static func validLimit(_ percent: Int) -> Bool {

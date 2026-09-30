@@ -35,6 +35,12 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         /// True: the SMC has no CHTE key (macOS 27 firmware), so the
         /// monitor takes the macOS charge-limit path.
         var chteMissing = false
+        /// True: this macOS has no charge limit (the PowerUI client class
+        /// behind it is missing), as on macOS 15.
+        var nativeClientMissing = false
+        /// False: `pmset -g battlimit` fails, as it does where the getter
+        /// does not exist.
+        var limitsReadable = true
         /// The targets "powerd" enforces, as the native commands leave them.
         var registered: [Int] = []
         var clock = Date()
@@ -128,9 +134,10 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
                 return [self.chie]
             }
             io.chargeTerminateAvailable = { !self.chteMissing }
+            io.nativeLimitClientAvailable = { !self.nativeClientMissing }
             io.registeredNativeLimits = {
                 self.lock.lock(); defer { self.lock.unlock() }
-                return self.registered
+                return self.limitsReadable ? self.registered : nil
             }
             io.now = { self.clock }
             io.writeHelper = write
@@ -593,11 +600,19 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
                        "Launch cleanup releases whatever a crashed session left, then the first poll sets the target")
         XCTAssertTrue(monitor.chargingPaused)
         // The firmware may let the level tick up before the target applies:
-        // the hold is not chased.
+        // the hold follows it up, once per new level, so nothing is drained
+        // back to 50.
         hw.percentage = 51
+        monitor.refresh()
+        awaitCondition { hw.writes.last == "native-limit:51" }
         for _ in 0..<3 { monitor.refresh() }
         drainCallbacks()
-        XCTAssertEqual(hw.writes.count, 4)
+        XCTAssertEqual(hw.writes.count, 5, "The same level is not written twice")
+        // A dip under load on AC is not followed; the firmware charges it back.
+        hw.percentage = 50
+        for _ in 0..<2 { monitor.refresh() }
+        drainCallbacks()
+        XCTAssertEqual(hw.writes.count, 5)
         XCTAssertFalse(hw.writes.contains("inhibit"))
         XCTAssertFalse(hw.writes.contains("allow"))
     }
@@ -715,5 +730,57 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         XCTAssertEqual(hw.writes.count, before, "No pre-sleep pause and no wake re-assert: the firmware holds the target")
         monitor.restoreBeforeTermination()
         XCTAssertEqual(hw.writes.last, "restore")
+    }
+
+    // MARK: - No mechanism (firmware without CHTE under a macOS without the charge limit)
+
+    func testNoMechanism_MonitorsOnlyWithoutInstallingOrWritingAnything() {
+        let hw = Hardware()
+        hw.chteMissing = true
+        hw.nativeClientMissing = true
+        hw.installed = false
+        hw.authorized = false
+        let monitor = hw.monitor(startMonitoring: true)
+        drainCallbacks()
+        XCTAssertEqual(monitor.chargeControlHold, .noMechanism)
+        XCTAssertFalse(monitor.nativeLimitMode)
+        XCTAssertTrue(monitor.controlsUnavailable)
+        XCTAssertFalse(monitor.accountAuthorized)
+        XCTAssertEqual(hw.installs, 0, "No admin prompt for a helper that could do nothing")
+        XCTAssertEqual(hw.writes, [])
+        XCTAssertNotNil(monitor.state, "Battery information still flows")
+        // Every control path declines without a misleading error, and the
+        // sleep hooks and quit write nothing: nothing of ours is in force.
+        monitor.toggleCharging()
+        for _ in 0..<3 { monitor.refresh() }
+        monitor.prepareForSleep()
+        monitor.resumeAfterWake()
+        monitor.restoreBeforeTermination()
+        drainCallbacks()
+        XCTAssertEqual(hw.writes, [])
+        XCTAssertEqual(hw.installs, 0)
+        XCTAssertNil(monitor.lastError)
+    }
+
+    func testNoMechanism_WhenPmsetCannotReportLimits_KeepsALeftoverHelperRevocable() {
+        let hw = Hardware()
+        hw.chteMissing = true
+        hw.limitsReadable = false
+        let monitor = hw.monitor(startMonitoring: true)
+        drainCallbacks()
+        XCTAssertEqual(monitor.chargeControlHold, .noMechanism)
+        XCTAssertFalse(monitor.nativeLimitMode)
+        XCTAssertEqual(hw.writes, [], "No launch cleanup, no watchdog")
+        XCTAssertTrue(monitor.accountAuthorized, "A helper an earlier version installed is still this account's to revoke")
+    }
+
+    func testMechanism_CHTEWinsWhereBothExist() {
+        let hw = Hardware()
+        hw.percentage = 50
+        let monitor = hw.monitor(startMonitoring: true)
+        awaitCondition { hw.writes.count >= 3 }
+        XCTAssertFalse(monitor.nativeLimitMode)
+        XCTAssertNil(monitor.chargeControlHold)
+        XCTAssertEqual(hw.writes.prefix(3), ["nodischarge", "inhibit", "spawn-watchdog:\(pid)"])
     }
 }

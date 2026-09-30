@@ -638,9 +638,9 @@ struct ContentView: View {
             statusGrid(state)
 
             // Both mode sections write to the SMC; neither is offered while
-            // another Ampere process holds charge control (the status line
-            // says which one).
-            if !monitor.standingBy {
+            // another Ampere process holds charge control or this Mac has no
+            // mechanism to hold a charge (the status line says which).
+            if !monitor.controlsUnavailable {
                 if !monitor.autoManageEnabled && state.adapterConnected {
                     Divider().padding(.horizontal)
 
@@ -842,9 +842,13 @@ struct ContentView: View {
                         .foregroundColor(.secondary)
                     // Which mechanism is holding the charge: the inhibit key
                     // on firmware that still has it, otherwise the macOS
-                    // charge limit (see NativeChargeLimit).
+                    // charge limit, or neither (see chargeControlMechanism).
                     if monitor.nativeLimitMode {
                         Text("Charge control: macOS charge limit (this firmware has no CHTE key).")
+                            .font(.system(size: 12))
+                            .foregroundColor(.secondary)
+                    } else if monitor.chargeControlHold == .noMechanism {
+                        Text("Charge control: unavailable. This firmware has no CHTE key, and this macOS has no charge limit (System Settings > Battery) to hand a target to; Ampere monitors only.")
                             .font(.system(size: 12))
                             .foregroundColor(.secondary)
                     }
@@ -865,7 +869,7 @@ struct ContentView: View {
             if monitor.settingsExpanded {
                 Divider().padding(.horizontal)
                 autoManageToggle()
-                    .disabled(monitor.standingBy)
+                    .disabled(monitor.controlsUnavailable)
                 launchAtLoginRow()
                 menuBarPercentRow()
                 registrationRow()
@@ -936,6 +940,8 @@ struct ContentView: View {
             return "Charge control is in use by \(other)"
         case .accessDeclined:
             return "Admin access required for charge control. Pause charging or re-enable Auto Charge to grant it."
+        case .noMechanism:
+            return "Charge control unavailable: this firmware has no CHTE key and this macOS has no charge limit. Monitoring only."
         case nil:
             break
         }

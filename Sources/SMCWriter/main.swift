@@ -399,28 +399,27 @@ func postNativeLimitReload() -> Bool {
 }
 
 /// Ask PowerUIAgent to switch the manual charge limit off through its own
-/// client interface (the private PowerUI framework, resolved at runtime).
-/// This is the only path on which the agent clears the limit it registered
-/// with powerd. The agent ignores the request while it believes the
-/// feature is off, so a registration left behind by an earlier preference
-/// write is cleared by switching the feature on first.
+/// client interface (the private PowerUI framework, resolved at runtime by
+/// NativeChargeLimit.clientClass, the same check the app runs before it
+/// enters this mode, so the class and its methods are known to exist by
+/// the time anything of ours needs releasing). This is the only path on
+/// which the agent clears the limit it registered with powerd. The agent
+/// ignores the request while it believes the feature is off, so a
+/// registration left behind by an earlier preference write is cleared by
+/// switching the feature on first.
 func nativeLimitDisableViaAgent() -> Bool {
     typealias AllocFn = @convention(c) (AnyClass, Selector) -> Unmanaged<AnyObject>
     typealias InitFn = @convention(c) (AnyObject, Selector, NSString) -> Unmanaged<AnyObject>?
     typealias BoolErrFn = @convention(c) (AnyObject, Selector, UnsafeMutablePointer<Unmanaged<NSError>?>) -> Bool
     typealias U64ErrFn = @convention(c) (AnyObject, Selector, UnsafeMutablePointer<Unmanaged<NSError>?>) -> UInt64
     guard let msgSend = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "objc_msgSend"),
-          dlopen("/System/Library/PrivateFrameworks/PowerUI.framework/Versions/A/PowerUI", RTLD_NOW) != nil,
-          let cls: AnyClass = NSClassFromString("PowerUISmartChargeClient") else {
+          let cls = NativeChargeLimit.clientClass() else {
         fputs("ERROR: PowerUI charge-limit client is unavailable\n", stderr)
         return false
     }
     let instance = unsafeBitCast(msgSend, to: AllocFn.self)(cls, sel_registerName("alloc")).takeUnretainedValue()
-    let requiredSelectors: [String] = ["isMCLCurrentlyEnabled:", "enableMCL:", "disableMCL:"]
     guard let client = unsafeBitCast(msgSend, to: InitFn.self)(
-            instance, sel_registerName("initWithClientName:"), "az-ampere")?.takeUnretainedValue(),
-          let object = client as? NSObjectProtocol,
-          requiredSelectors.allSatisfy({ object.responds(to: NSSelectorFromString($0)) })
+            instance, sel_registerName("initWithClientName:"), "az-ampere")?.takeUnretainedValue()
     else {
         fputs("ERROR: PowerUI charge-limit client changed shape\n", stderr)
         return false
