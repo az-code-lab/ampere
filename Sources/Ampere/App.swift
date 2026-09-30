@@ -103,7 +103,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // registration state into the monitor's lock. Fires for the initial
         // value too (a no-op, init already applied it) and for every later
         // flip, whether from the registration window or a daily verify that
-        // finds the license revoked or moved to another Mac. The reset must
+        // finds this Mac off its key (released under My Licenses, or replaced
+        // on a one-Mac key) or the license ended or revoked. The reset must
         // not depend on the panel being open, hence here and not in the view.
         registrationObserver = registration.$isRegistered
             .removeDuplicates()
@@ -2353,7 +2354,9 @@ struct RegistrationView: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 Divider()
-                Text("Deregistering frees the key so it can be registered on another Mac.")
+                // The key's own rules, by the Mac count the server gave it:
+                // a one-Mac key moves, a fuller one fills up and refuses.
+                Text(RegistrationManager.explanation(macs: registration.maxDevices))
                     .font(.system(size: 12))
                     .foregroundColor(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -2418,7 +2421,7 @@ struct RegistrationView: View {
         .onAppear {
             emailInput = registration.email
             keyInput = registration.licenseKey
-            registration.lastError = nil
+            registration.clearStaleError()
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                 if !registration.isRegistered { focus = .email }
             }
