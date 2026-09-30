@@ -71,4 +71,31 @@ final class KeepAwakeTests: XCTestCase {
         XCTAssertEqual(BatteryMonitor.keepAwakeDurationLabel(60), "1 hour")
         XCTAssertEqual(BatteryMonitor.keepAwakeDurationLabel(480), "8 hours")
     }
+
+    // MARK: - Which assertion (the display option)
+
+    private func assertion(enabled: Bool = true, display: Bool, ac: Bool = true,
+                           deadline: Date? = nil) -> BatteryMonitor.KeepAwakeAssertion? {
+        BatteryMonitor.keepAwakeAssertion(enabled: enabled, display: display, adapterConnected: ac,
+                                          deadline: deadline, now: now)
+    }
+
+    func testAssertion_DisplayOptionPicksTheDisplayKind() {
+        XCTAssertEqual(assertion(display: true), .display)
+        XCTAssertEqual(assertion(display: false), .system)
+    }
+
+    func testAssertion_DisplayOptionObeysTheSameGatesAsTheToggle() {
+        XCTAssertNil(assertion(enabled: false, display: true), "The display option alone holds nothing")
+        XCTAssertNil(assertion(display: true, ac: false), "Never on battery")
+        XCTAssertNil(assertion(display: true, deadline: now), "An ended session holds nothing")
+        XCTAssertEqual(assertion(display: true, deadline: now.addingTimeInterval(1)), .display)
+    }
+
+    func testAssertion_KindsMapToTheirPowerdTypes() {
+        XCTAssertEqual(BatteryMonitor.KeepAwakeAssertion.system.type as String, "PreventUserIdleSystemSleep")
+        XCTAssertEqual(BatteryMonitor.KeepAwakeAssertion.display.type as String, "PreventUserIdleDisplaySleep")
+        XCTAssertNotEqual(BatteryMonitor.KeepAwakeAssertion.system.name, BatteryMonitor.KeepAwakeAssertion.display.name,
+                          "pmset -g assertions must tell the two apart")
+    }
 }

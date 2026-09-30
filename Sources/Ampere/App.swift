@@ -573,6 +573,8 @@ struct ContentView: View {
     @AppStorage("ui.amperageShowMA") private var amperageShowMA = false
     @AppStorage("ui.rawChargeShowMAh") private var rawChargeShowMAh = false
     @State private var showAbout = false
+    /// The warning sheet shown before Keep Awake's display option turns on.
+    @State private var confirmKeepAwakeDisplay = false
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
     @State private var pinHovering = false
 
@@ -597,7 +599,10 @@ struct ContentView: View {
         .onChange(of: showAbout) {
             // Mirror sheet visibility into the monitor so AppDelegate keeps
             // the popover from closing (and breaking) underneath the sheet.
-            monitor.sheetVisible = showAbout
+            monitor.sheetVisible = showAbout || confirmKeepAwakeDisplay
+        }
+        .onChange(of: confirmKeepAwakeDisplay) {
+            monitor.sheetVisible = showAbout || confirmKeepAwakeDisplay
         }
     }
 
@@ -1169,6 +1174,29 @@ struct ContentView: View {
                     .foregroundColor(.secondary)
             }
             Spacer()
+            // The display option is offered on AC only, where a session can
+            // hold anything at all, and confirmed on the way on (the sheet
+            // below): it is the one switch here that changes who can use
+            // the Mac, not just whether it sleeps.
+            if monitor.state?.adapterConnected ?? false {
+                Toggle(isOn: Binding(
+                    get: { monitor.keepAwakeDisplay },
+                    set: { on in
+                        if on {
+                            confirmKeepAwakeDisplay = true
+                        } else {
+                            monitor.setKeepAwakeDisplay(false)
+                        }
+                    }
+                )) {
+                    Image(systemName: "display")
+                }
+                .toggleStyle(.button)
+                .controlSize(.small)
+                .help(monitor.keepAwakeDisplay
+                    ? "On: the display stays on during Keep Awake sessions on power, so the Mac does not lock on its own. Turn off to let the display sleep and the screen lock as usual."
+                    : "Off: the display sleeps and the screen locks on its own schedule. Turn on to keep the display on during Keep Awake sessions on power; the Mac will then not lock on its own.")
+            }
             Picker("", selection: Binding(
                 get: { monitor.keepAwakeMinutes },
                 set: { monitor.setKeepAwakeDuration(minutes: $0) }
@@ -1190,8 +1218,38 @@ struct ContentView: View {
         }
         .padding(.horizontal, 16)
         .help(monitor.keepAwakeEnabled
-            ? "On: keeping the Mac awake while the power adapter is connected; on battery it sleeps normally. Turn off to allow normal sleep."
-            : "Off: normal macOS sleep. Turn on to keep the Mac awake while the power adapter is connected, for the selected duration; on battery it sleeps normally. Does not affect display sleep.")
+            ? "On: keeping the Mac awake while the power adapter is connected; on battery it sleeps normally. \(monitor.keepAwakeDisplay ? "The display is kept on too, so the Mac does not lock on its own." : "The display still sleeps on its own schedule.") Turn off to allow normal sleep."
+            : "Off: normal macOS sleep. Turn on to keep the Mac awake while the power adapter is connected, for the selected duration; on battery it sleeps normally. The display sleeps normally unless the display button beside the duration is on.")
+        .sheet(isPresented: $confirmKeepAwakeDisplay) {
+            keepAwakeDisplayWarning
+        }
+    }
+
+    /// Shown before the display option turns on: what it gives up, and
+    /// what it cannot promise. The option only turns on from its button.
+    private var keepAwakeDisplayWarning: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Keep the display on?")
+                .font(.headline)
+            Text("While a Keep Awake session runs on power, the display stays on and the Mac does not lock on its own. Anyone at the Mac can use it until you lock it or the session ends.")
+                .font(.system(size: 12))
+            Text("A screen saver that is set to start may still start and lock the screen. Closing the lid, a hot corner, a manual lock, and a lock your organization manages all work as before. On battery the display sleeps normally.")
+                .font(.system(size: 12))
+                .foregroundColor(.secondary)
+            HStack {
+                Spacer()
+                Button("Cancel") { confirmKeepAwakeDisplay = false }
+                    .keyboardShortcut(.cancelAction)
+                Button("Keep Display On") {
+                    monitor.setKeepAwakeDisplay(true)
+                    confirmKeepAwakeDisplay = false
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 340)
+        .background(SheetKeyActivator())
     }
 
     private func autoManageToggle() -> some View {

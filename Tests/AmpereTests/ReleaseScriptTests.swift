@@ -239,7 +239,7 @@ final class ReleaseScriptTests: XCTestCase {
                                       "nothing matches \(pattern)")
             return String(text[try XCTUnwrap(Range(match.range(at: 1), in: text))])
         }
-        // `.macOS(.v14)` or `.macOS("26.0")`.
+        // `.macOS(.v14)` or `.macOS("15.0")`.
         let target = try capture(#"\.macOS\(\s*(?:\.v|")([0-9.]+)"?\s*\)"#, in: manifest)
         let major = try XCTUnwrap(target.split(separator: ".").first.map(String.init))
         let plist = try capture(#"<key>LSMinimumSystemVersion</key>\s*<string>([0-9.]+)</string>"#, in: script)

@@ -783,4 +783,17 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         XCTAssertNil(monitor.chargeControlHold)
         XCTAssertEqual(hw.writes.prefix(3), ["nodischarge", "inhibit", "spawn-watchdog:\(pid)"])
     }
+
+    // MARK: - Keep Awake display option
+
+    func testKeepAwakeDisplay_PersistsAcrossRestartAndDefaultsToOff() {
+        let hw = Hardware()
+        XCTAssertFalse(hw.monitor().keepAwakeDisplay, "Off until the user confirms it")
+        hw.preferences.values["keepAwakeDisplay"] = true
+        let monitor = hw.monitor()
+        XCTAssertTrue(monitor.keepAwakeDisplay)
+        monitor.setKeepAwakeDisplay(false)
+        XCTAssertEqual(hw.preferences.values["keepAwakeDisplay"] as? Bool, false)
+        XCTAssertFalse(hw.monitor().keepAwakeDisplay)
+    }
 }

@@ -115,7 +115,7 @@ echo "$VERSION" > "$APP_DIR/Contents/Resources/version.txt"
 cp "$REPO_DIR/Ampere.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
 xcrun actool "$REPO_DIR/Assets.xcassets" \
     --compile "$APP_DIR/Contents/Resources" \
-    --platform macosx --minimum-deployment-target 26.0 \
+    --platform macosx --minimum-deployment-target 15.0 \
     --app-icon AppIcon --output-partial-info-plist /dev/null > /dev/null
 
 # Create Info.plist
@@ -139,7 +139,7 @@ cat > "$APP_DIR/Contents/Info.plist" << PLIST
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>LSMinimumSystemVersion</key>
-    <string>26.0</string>
+    <string>15.0</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>CFBundleIconName</key>

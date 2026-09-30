@@ -27,11 +27,11 @@ A lightweight macOS menu bar app for monitoring battery status and controlling c
 
 ## Requirements
 
-- macOS 26 (Tahoe) or later
+- macOS 15 (Sequoia) or later
 - Apple Silicon Mac
 - Admin privileges (for charge control features)
 
-macOS 14 and 15 are not supported. Ampere is built and tested on macOS 26 and 27 only, and what it needs to control charging is not reliably there on the older systems: they have the `CHTE` key only with the firmware some of their security updates install, and the macOS charge limit that Ampere falls back on without `CHTE` arrived in macOS 26.4 (see Firmware without CHTE below). Releases after 0.0.65 do not open on macOS 14 or 15 at all, since the app itself asks for macOS 26. A copy of 0.0.65 or earlier already installed there still opens, but gets no further updates: the Homebrew cask requires macOS 26, and the in-app updater follows the cask (see Updates).
+macOS 14 is not supported: the Homebrew cask and the in-app updater refuse it, and a copy of 0.0.65 or earlier already installed there still opens but gets no further updates (see Updates). macOS 15 is supported, with one caveat about charge control. Ampere needs either the `CHTE` key in the firmware or the macOS charge limit, and macOS 15 has only the first: the firmware that its later security updates install has no `CHTE` key, and the charge limit Ampere falls back on without it arrived in macOS 26.4. Ampere checks for both when it takes charge control and, finding neither, monitors the battery only and says so on the panel (see Firmware without CHTE below). Ampere is developed on macOS 26 and 27.
 
 ## Installation
 
@@ -140,7 +140,9 @@ When auto charge is off and a power adapter is connected, a manual **Pause Charg
 
 ### Keep Awake
 
-The **Keep Awake** row on the panel stops the Mac from going to idle sleep while a power adapter is connected, for a chosen duration (15 minutes to 8 hours, or Forever). While a timed session runs, the row shows its end time ("until 3:45 PM"). It holds a standard macOS power assertion, the same mechanism `caffeinate` uses, so it needs no admin rights and cannot outlive the app: quitting releases it, and the kernel drops it automatically after a crash. The display still sleeps normally.
+The **Keep Awake** row on the panel stops the Mac from going to idle sleep while a power adapter is connected, for a chosen duration (15 minutes to 8 hours, or Forever). While a timed session runs, the row shows its end time ("until 3:45 PM"). It holds a standard macOS power assertion, the same mechanism `caffeinate` uses, so it needs no admin rights and cannot outlive the app: quitting releases it, and the kernel drops it automatically after a crash. The display still sleeps normally unless the display option below is on.
+
+**Keep Display On**, a button with a display symbol beside the duration menu, appears only while a power adapter is connected. With it on, a session holds the display-sleep assertion instead (what `caffeinate -d` holds; it implies the system stays awake too), so the display stays on and the Mac does not lock on its own while the session runs on power. It is off by default and remembered across restarts, and turning it on shows a warning first: anyone at the Mac can use it until it is locked or the session ends; a screen saver that is set to start may still start and lock the screen; a closed lid, a hot corner, a manual lock, and a lock managed by an organization all work as before. On battery the display sleeps normally, like the rest of Keep Awake. Switching the option while a session runs swaps the held assertion, so the process holds exactly one at any time. No lock setting is ever changed, and the assertion cannot outlive the app.
 
 On battery the assertion is released and the Mac sleeps as usual; the toggle keeps its intent, so plugging back in re-engages it. The duration is a wall-clock deadline ("until 3:45 PM"), not a stopwatch: it keeps counting on battery, survives an app restart mid-session, and when it passes the toggle turns itself off. Changing the duration during a session restarts the countdown from now.
 
@@ -208,7 +210,7 @@ If any step fails (e.g. the install location isn't writable), the error is shown
 
 A release is offered only to a Mac that can run it. The cask's `depends_on macos:` line names the oldest macOS a release supports (Homebrew reads a bare release name such as `:tahoe` as "this or later"). When this Mac runs something older, no update is offered and the installed version stays; a clicked **Check for Updates** answers **Needs macOS N** instead of **Up to Date**. `brew upgrade` refuses the same release from the same line, so both channels agree. A release name newer than the running build knows is not treated as a refusal (it may be the very macOS the build runs on), which is why step 2 checks the downloaded bundle as well: that check needs no name table, and it is the one that keeps a working copy from being replaced by an app macOS will not open.
 
-The launch floor (`LSMinimumSystemVersion` and the deployment target in `Package.swift`) is 26.0, the same as the supported floor above. Through 0.0.65 it was deliberately lower, 14.0: versions up to 0.0.64 install whatever the cask advertises without asking whether it can open here, so the floor stayed low until the macOS version registered copies report (see Charge Bounds and Registration) showed no Mac left on macOS 14 or 15. Unregistered copies report nothing, so one of 0.0.64 or earlier on those systems can still swap in a release that will not open there.
+The launch floor (`LSMinimumSystemVersion` and the deployment target in `Package.swift`) is 15.0, the same as the supported floor above and as the cask's `depends_on macos: :sequoia`. Through 0.0.65 it was 14.0: versions up to 0.0.64 install whatever the cask advertises without asking whether it can open here, so the floor stayed low while the macOS version registered copies report (see Charge Bounds and Registration) still showed Macs on macOS 14. Unregistered copies report nothing, so one of 0.0.64 or earlier on macOS 14 can still swap in a release that will not open there.
 
 ## Build from Source
 
@@ -223,7 +225,7 @@ swift build -c debug
 .build/debug/Ampere
 ```
 
-`run.sh` and `release.sh` pass the linker the SDK explicitly (`SDK_FLAGS` in both scripts). Under Xcode 27's toolchain a bare `swift build` produces a binary stamped as built against the SDK of its deployment target: SwiftPM's Swift Build engine runs `swiftc` without `SDKROOT`, and `clang` then records the deployment target instead of the SDK version. AppKit and SwiftUI run such a binary in that older release's compatibility mode on every later macOS; with the macOS 14 target of the time, macOS 27 showed an empty "Ampere Settings" window at launch. Check a build with `otool -l .build/debug/Ampere | grep -A4 LC_BUILD_VERSION`; the `sdk` line must show the SDK you built with (27.0 under Xcode 27), not the deployment target's `26.0`.
+`run.sh` and `release.sh` pass the linker the SDK explicitly (`SDK_FLAGS` in both scripts). Under Xcode 27's toolchain a bare `swift build` produces a binary stamped as built against the SDK of its deployment target: SwiftPM's Swift Build engine runs `swiftc` without `SDKROOT`, and `clang` then records the deployment target instead of the SDK version. AppKit and SwiftUI run such a binary in that older release's compatibility mode on every later macOS; with the macOS 14 target of the time, macOS 27 showed an empty "Ampere Settings" window at launch. Check a build with `otool -l .build/debug/Ampere | grep -A4 LC_BUILD_VERSION`; the `sdk` line must show the SDK you built with (27.0 under Xcode 27), not the deployment target's `15.0`.
 
 ## Uninstall
 

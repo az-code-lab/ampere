@@ -185,13 +185,25 @@ final class BatteryMonitor: ObservableObject {
     /// trade-off is that it cannot absorb lid-close sleep — that remains
     /// exclusive to the charge/discharge overrides. On battery the intent
     /// persists but the assertion is released (see
-    /// keepAwakeAssertionDesired); the display still sleeps normally.
+    /// keepAwakeAssertionDesired); the display still sleeps normally
+    /// unless keepAwakeDisplay is on.
     @Published var keepAwakeEnabled: Bool {
         didSet { defaults.set(keepAwakeEnabled, forKey: "keepAwakeEnabled") }
     }
     /// Session length in minutes; 0 = no deadline (hold until toggled off).
     @Published var keepAwakeMinutes: Int {
         didSet { defaults.set(keepAwakeMinutes, forKey: "keepAwakeMinutes") }
+    }
+    /// Keep Awake also keeps the display on: a session then holds the
+    /// display-sleep assertion (the `caffeinate -d` kind, which implies the
+    /// system stays awake too), so the screen does not lock on its own
+    /// while the session runs on AC. Off by default. The panel offers it
+    /// on AC only and confirms it with a warning on the way on (see
+    /// keepAwakeRow). Persisted like the toggle; on battery the assertion
+    /// is released either way, and a screen saver that is set to start
+    /// may still start and lock the screen.
+    @Published var keepAwakeDisplay: Bool {
+        didSet { defaults.set(keepAwakeDisplay, forKey: "keepAwakeDisplay") }
     }
     /// Wall-clock end of the current keep-awake session; nil while off or
     /// for a Forever session. Persisted as an absolute date so a restart
@@ -424,11 +436,12 @@ final class BatteryMonitor: ObservableObject {
 
     private var timer: Timer?
     private var updateCheckTimer: Timer?
-    /// The held powerd assertion backing keepAwakeEnabled; 0/false = none.
-    /// Reconciled against the desired state every refresh tick, same
-    /// retry-until-they-match contract as sleepHoldActive vs intent.
+    /// The held powerd assertion backing keepAwakeEnabled (0/nil = none)
+    /// and which kind it is. Reconciled against the desired state every
+    /// refresh tick, same retry-until-they-match contract as
+    /// sleepHoldActive vs intent.
     private var keepAwakeAssertionID: IOPMAssertionID = 0
-    private var keepAwakeAssertionHeld = false
+    private var keepAwakeAssertionHeld: KeepAwakeAssertion?
     /// One-shot timer at the session deadline, so expiry lands on time
     /// instead of waiting out the current poll interval (up to 60 s).
     private var keepAwakeExpiryTimer: Timer?
@@ -554,6 +567,7 @@ final class BatteryMonitor: ObservableObject {
         let storedKeepAwakeMinutes = defaults.object(forKey: "keepAwakeMinutes") as? Int ?? 0
         self.keepAwakeMinutes = Self.keepAwakeDurations.contains(storedKeepAwakeMinutes)
             ? storedKeepAwakeMinutes : 0
+        self.keepAwakeDisplay = defaults.bool(forKey: "keepAwakeDisplay")
         let persistedKeepAwake = defaults.bool(forKey: "keepAwakeEnabled")
         let persistedKeepAwakeDeadline = (defaults.object(forKey: "keepAwakeDeadline") as? Double)
             .map { Date(timeIntervalSince1970: $0) }
@@ -910,7 +924,7 @@ final class BatteryMonitor: ObservableObject {
         // Redundant with process exit (the kernel drops assertions of a
         // dead process) but keeps a torn-down monitor from pinning the
         // system awake for the remainder of the process's lifetime.
-        if keepAwakeAssertionHeld { IOPMAssertionRelease(keepAwakeAssertionID) }
+        if keepAwakeAssertionHeld != nil { IOPMAssertionRelease(keepAwakeAssertionID) }
         updateDownloadTask?.cancel()
         if let source = powerSourceRunLoopSource {
             CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .defaultMode)
@@ -1479,6 +1493,43 @@ final class BatteryMonitor: ObservableObject {
         minutes > 0 ? from.addingTimeInterval(TimeInterval(minutes) * 60) : nil
     }
 
+    /// Which powerd assertion a Keep Awake session holds: idle system sleep
+    /// only, or the display too. Holding the display implies the system
+    /// stays awake, so a session never needs both.
+    enum KeepAwakeAssertion: Equatable {
+        case system
+        case display
+        var type: CFString {
+            (self == .display ? kIOPMAssertionTypePreventUserIdleDisplaySleep
+                              : kIOPMAssertionTypePreventUserIdleSystemSleep) as CFString
+        }
+        /// What `pmset -g assertions` shows beside the process.
+        var name: String {
+            self == .display ? "Ampere: Keep Display On" : "Ampere: Keep Mac Awake"
+        }
+    }
+
+    /// The assertion a session should hold, or nil for none: the display
+    /// kind while the display option is on, otherwise the system kind. The
+    /// AC-only and deadline rules of keepAwakeAssertionDesired apply to
+    /// both, so the display option alone never holds anything.
+    static func keepAwakeAssertion(
+        enabled: Bool, display: Bool, adapterConnected: Bool, deadline: Date?, now: Date
+    ) -> KeepAwakeAssertion? {
+        guard keepAwakeAssertionDesired(enabled: enabled, adapterConnected: adapterConnected,
+                                        deadline: deadline, now: now) else { return nil }
+        return display ? .display : .system
+    }
+
+    /// UI entry point for the display option. Takes effect at once while a
+    /// session runs (the held assertion is swapped); otherwise it waits for
+    /// the next session.
+    func setKeepAwakeDisplay(_ on: Bool) {
+        guard on != keepAwakeDisplay else { return }
+        keepAwakeDisplay = on
+        reconcileKeepAwake(adapterConnected: state?.adapterConnected ?? false)
+    }
+
     /// UI entry point for the toggle. Starting a session stamps the
     /// deadline from the configured duration; stopping clears it.
     func setKeepAwake(_ on: Bool) {
@@ -1548,30 +1599,33 @@ final class BatteryMonitor: ObservableObject {
         if keepAwakeExpiryTimer == nil, keepAwakeEnabled, keepAwakeDeadline != nil {
             scheduleKeepAwakeExpiry()
         }
-        let desired = Self.keepAwakeAssertionDesired(
-            enabled: keepAwakeEnabled, adapterConnected: adapterConnected,
+        let desired = Self.keepAwakeAssertion(
+            enabled: keepAwakeEnabled, display: keepAwakeDisplay, adapterConnected: adapterConnected,
             deadline: keepAwakeDeadline, now: now)
         guard desired != keepAwakeAssertionHeld else { return }
-        if desired {
-            var id: IOPMAssertionID = 0
-            let rc = IOPMAssertionCreateWithName(
-                kIOPMAssertionTypePreventUserIdleSystemSleep as CFString,
-                IOPMAssertionLevel(kIOPMAssertionLevelOn),
-                "Ampere: Keep Mac Awake" as CFString, &id)
-            if rc == kIOReturnSuccess {
-                keepAwakeAssertionID = id
-                keepAwakeAssertionHeld = true
-                AmpereLog.app("Ampere: Keep-awake assertion acquired")
-            } else {
-                AmpereLog.app("Ampere: Keep-awake assertion create failed (0x%08x)", UInt32(bitPattern: rc))
-            }
-        } else {
+        // A change of kind (the display option toggled mid-session) is a
+        // release followed by a fresh create, so the process holds exactly
+        // one assertion at any time.
+        if let held = keepAwakeAssertionHeld {
             // Release cannot meaningfully fail (the ID is one we created);
             // clear unconditionally so a stale ID can't wedge the state.
             IOPMAssertionRelease(keepAwakeAssertionID)
             keepAwakeAssertionID = 0
-            keepAwakeAssertionHeld = false
-            AmpereLog.app("Ampere: Keep-awake assertion released")
+            keepAwakeAssertionHeld = nil
+            AmpereLog.app("Ampere: Keep-awake assertion released (%@)", held.name)
+        }
+        if let desired {
+            var id: IOPMAssertionID = 0
+            let rc = IOPMAssertionCreateWithName(
+                desired.type, IOPMAssertionLevel(kIOPMAssertionLevelOn),
+                desired.name as CFString, &id)
+            if rc == kIOReturnSuccess {
+                keepAwakeAssertionID = id
+                keepAwakeAssertionHeld = desired
+                AmpereLog.app("Ampere: Keep-awake assertion acquired (%@)", desired.name)
+            } else {
+                AmpereLog.app("Ampere: Keep-awake assertion create failed (0x%08x)", UInt32(bitPattern: rc))
+            }
         }
     }
 
