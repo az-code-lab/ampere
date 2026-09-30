@@ -39,7 +39,8 @@ func smcWriteKey(_ conn: io_connect_t, _ key: String, _ bytes: [UInt8]) -> Bool 
     // Two verdicts per call: the IOKit return says the request reached the
     // SMC, `outputStruct.result` is the SMC's own status (0 = success; for
     // instance 0x84 = key not found, which arrives with kIOReturnSuccess).
-    // Both are checked, here and after the write, as smcKeyExists does.
+    // Both are checked, here and after the write; smcKeyMissing reads the
+    // same status byte for the one value that proves a key absent.
     var result = IOConnectCallStructMethod(conn, SMCCmd.userClientSelector,
         &inputStruct, inputSize, &outputStruct, &outputSize)
     guard result == kIOReturnSuccess, outputStruct.result == 0 else { return false }
@@ -70,11 +71,14 @@ func smcWriteKey(_ conn: io_connect_t, _ key: String, _ bytes: [UInt8]) -> Bool 
     return result == kIOReturnSuccess && outputStruct.result == 0
 }
 
-/// True when the SMC exposes `key` at all. macOS 27's firmware dropped
-/// CHTE, so the restore paths must treat "nothing to write" as success
-/// there instead of failing forever and pinning a watchdog that retries
-/// every two seconds.
-func smcKeyExists(_ conn: io_connect_t, _ key: String) -> Bool {
+/// True only when the SMC answers the key-info command for `key` with its
+/// not-found status (SMC.statusKeyNotFound), as macOS 27's firmware does
+/// for CHTE. Any other failure, an IOKit error or an error status such as
+/// a bus collision or a timeout, says nothing about the key and reads as
+/// "not missing": a restore that took such an answer for absence would
+/// skip the CHTE write, report success with charging still inhibited,
+/// and retire the watchdog on the strength of it.
+func smcKeyMissing(_ conn: io_connect_t, _ key: String) -> Bool {
     var inputStruct = SMCKeyData()
     var outputStruct = SMCKeyData()
     inputStruct.key = smcFourCharCode(key)
@@ -83,14 +87,17 @@ func smcKeyExists(_ conn: io_connect_t, _ key: String) -> Bool {
     var outputSize = MemoryLayout<SMCKeyData>.size
     let result = IOConnectCallStructMethod(conn, SMCCmd.userClientSelector,
         &inputStruct, inputSize, &outputStruct, &outputSize)
-    return result == kIOReturnSuccess && outputStruct.result == 0 && outputStruct.keyInfo.dataSize > 0
+    return result == kIOReturnSuccess && outputStruct.result == SMC.statusKeyNotFound
 }
 
-/// CHTE=allow where the key exists; success where it does not (see
-/// smcKeyExists). Every restore path shares this so their behavior on
-/// CHTE-less firmware cannot drift.
+/// CHTE=allow where the key exists; success where the firmware has no
+/// such key, so the restore paths do not fail forever there and pin a
+/// watchdog that retries every two seconds. The write goes first and the
+/// probe only explains a failed one, so the shortcut needs the explicit
+/// not-found status (see smcKeyMissing). Every restore path shares this
+/// so their behavior on CHTE-less firmware cannot drift.
 func allowChargingIfSupported(_ conn: io_connect_t) -> Bool {
-    !smcKeyExists(conn, SMC.keyChargeTerminate) || smcWriteKey(conn, SMC.keyChargeTerminate, SMC.chteAllow)
+    smcWriteKey(conn, SMC.keyChargeTerminate, SMC.chteAllow) || smcKeyMissing(conn, SMC.keyChargeTerminate)
 }
 
 // (No smcReadKey here: the helper only writes. Reads live in the app,
@@ -902,27 +909,26 @@ if action == "uninstall" || action == "purge" {
 }
 
 // "uninstall-if-missing:PATH" — the cleanup job's entry point, run by
-// launchd at boot and whenever PATH changes. Wait out the grace period,
-// then uninstall only if the bundle is really gone (see
-// CleanupDaemon.shouldUninstall). stderr goes nowhere under launchd, so
-// outcomes go to the unified log.
+// launchd at boot and whenever PATH changes. Uninstall only once the
+// bundle has been missing for a whole grace period (see
+// CleanupDaemon.stayedMissing) and is really gone (shouldUninstall).
+// stderr goes nowhere under launchd, so outcomes go to the unified log;
+// a run that finds the bundle in place exits quietly.
 if action.hasPrefix("uninstall-if-missing:") {
     let bundlePath = String(action.dropFirst("uninstall-if-missing:".count))
     guard CleanupDaemon.isValidBundlePath(bundlePath) else {
         AmpereLog.helper("Ampere cleanup: invalid bundle path %@", bundlePath)
         exit(1)
     }
-    sleep(CleanupDaemon.gracePeriodSeconds)
     let fileManager = FileManager.default
-    let bundleExists = fileManager.fileExists(atPath: bundlePath)
+    guard CleanupDaemon.stayedMissing(exists: { fileManager.fileExists(atPath: bundlePath) },
+                                      wait: { _ = sleep($0) }) else { exit(0) }
     let parentExists = fileManager.fileExists(atPath: (bundlePath as NSString).deletingLastPathComponent)
     let appRunning = !InstanceGuard.runningInstances().isEmpty
-    guard CleanupDaemon.shouldUninstall(bundleExists: bundleExists, parentExists: parentExists,
+    guard CleanupDaemon.shouldUninstall(bundleExists: false, parentExists: parentExists,
                                         appRunning: appRunning) else {
-        if !bundleExists {
-            AmpereLog.helper("Ampere cleanup: %@ is missing but %@; leaving the helper installed", bundlePath,
-                  parentExists ? "a copy of Ampere is running" : "its volume is not mounted")
-        }
+        AmpereLog.helper("Ampere cleanup: %@ is missing but %@; leaving the helper installed", bundlePath,
+              parentExists ? "a copy of Ampere is running" : "its volume is not mounted")
         exit(0)
     }
     AmpereLog.helper("Ampere cleanup: %@ is gone; restoring the system and removing the helper", bundlePath)

@@ -37,6 +37,9 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         /// True: the SMC has no CHTE key (macOS 27 firmware), so the
         /// monitor takes the macOS charge-limit path.
         var chteMissing = false
+        /// How many CHTE probes the SMC leaves unanswered (a transient
+        /// IOKit failure) before it answers.
+        var chteUnansweredProbes = 0
         /// True: this macOS has no charge limit (the PowerUI client class
         /// behind it is missing), as on macOS 15.
         var nativeClientMissing = false
@@ -144,7 +147,14 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
                 if key == SMC.keyChargeTerminate { return self.chteMissing ? nil : [self.chte, 0, 0, 0] }
                 return [self.chie]
             }
-            io.chargeTerminateAvailable = { !self.chteMissing }
+            io.chargeTerminateKey = {
+                self.lock.lock(); defer { self.lock.unlock() }
+                if self.chteUnansweredProbes > 0 {
+                    self.chteUnansweredProbes -= 1
+                    return .unknown
+                }
+                return self.chteMissing ? .missing : .present
+            }
             io.nativeLimitClientAvailable = { !self.nativeClientMissing }
             io.registeredNativeLimits = {
                 self.lock.lock(); defer { self.lock.unlock() }
@@ -920,6 +930,168 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         XCTAssertFalse(monitor.nativeLimitMode)
         XCTAssertNil(monitor.chargeControlHold)
         XCTAssertEqual(hw.writes.prefix(3), ["nodischarge", "inhibit", "spawn-watchdog:\(pid)"])
+    }
+
+    func testMechanism_AnUnansweredProbeIsRepeatedBeforeTheMechanismIsDecided() {
+        let hw = Hardware()
+        hw.percentage = 50
+        hw.chteUnansweredProbes = 2
+        let monitor = hw.monitor(startMonitoring: true)
+        awaitCondition { hw.writes.count >= 3 }
+        XCTAssertNil(monitor.chargeControlHold)
+        XCTAssertFalse(monitor.nativeLimitMode, "Two failed reads did not pass for firmware without CHTE")
+        XCTAssertEqual(hw.writes.prefix(3), ["nodischarge", "inhibit", "spawn-watchdog:\(pid)"])
+    }
+
+    func testMechanism_AnSMCThatKeepsNotAnsweringHoldsChargeControlUntilItDoes() {
+        let hw = Hardware()
+        hw.percentage = 50
+        hw.installed = false
+        hw.authorized = false
+        // Three probes per activation: the launch's, then the first poll's,
+        // which asks again at once.
+        hw.chteUnansweredProbes = 6
+        let monitor = hw.monitor(startMonitoring: true)
+        drainCallbacks()
+        XCTAssertEqual(monitor.chargeControlHold, .mechanismUnknown)
+        XCTAssertTrue(monitor.controlsUnavailable)
+        XCTAssertFalse(monitor.nativeLimitMode)
+        XCTAssertEqual(hw.installs, 0, "No admin prompt while nothing could be written")
+        XCTAssertEqual(hw.writes, [])
+        monitor.toggleCharging()
+        drainCallbacks()
+        XCTAssertEqual(hw.writes, [])
+        XCTAssertEqual(hw.installs, 0)
+        XCTAssertNil(monitor.lastError, "The status line already explains the hold")
+        // The SMC answers at a later poll: activation runs as it would have
+        // at launch, prompt and cleanup included.
+        monitor.refresh()
+        awaitCondition { hw.writes.count >= 3 }
+        XCTAssertNil(monitor.chargeControlHold)
+        XCTAssertEqual(hw.installs, 1)
+        XCTAssertEqual(hw.writes.prefix(3), ["nodischarge", "inhibit", "spawn-watchdog:\(pid)"])
+        XCTAssertTrue(monitor.chargingPaused)
+    }
+
+    // MARK: - Launch cleanup retry
+
+    func testLaunchCleanup_AFailedRestoreIsRetriedUntilItSucceeds() {
+        let hw = Hardware()
+        hw.percentage = 50
+        hw.fail("nodischarge")
+        let monitor = hw.monitor(startMonitoring: true)
+        drainCallbacks()
+        XCTAssertEqual(hw.writes, ["nodischarge", "inhibit", "spawn-watchdog:\(pid)"])
+        XCTAssertEqual(monitor.recoveryWarning, BatteryMonitor.launchCleanupWarning)
+        // The next polls run the state machine, not the retry.
+        for _ in 0..<2 { monitor.refresh() }
+        drainCallbacks()
+        XCTAssertEqual(hw.writes.count, 3)
+        // Past the interval: one attempt, which fails; the warning stays.
+        hw.clock = hw.clock.addingTimeInterval(130)
+        monitor.refresh()
+        awaitCondition { hw.writes.count == 4 }
+        drainCallbacks()
+        XCTAssertEqual(hw.writes.last, "nodischarge")
+        XCTAssertEqual(monitor.recoveryWarning, BatteryMonitor.launchCleanupWarning)
+        monitor.refresh()
+        drainCallbacks()
+        XCTAssertEqual(hw.writes.count, 4, "Not again before the next interval")
+        // pmset answers again: the restore lands, a watchdog replaces the
+        // one it retired, and the warning clears.
+        hw.stopFailing("nodischarge")
+        hw.clock = hw.clock.addingTimeInterval(130)
+        monitor.refresh()
+        awaitCondition { hw.writes.count >= 6 && monitor.recoveryWarning == nil }
+        XCTAssertEqual(Array(hw.writes.suffix(2)), ["nodischarge", "spawn-watchdog:\(pid)"])
+        for _ in 0..<2 { monitor.refresh() }
+        drainCallbacks()
+        XCTAssertEqual(hw.writes.count, 6)
+    }
+
+    // MARK: - Native mode: unconfirmed limits and a missing watchdog
+
+    func testNativeMode_TurningAutoChargeOffAfterADriftedLimitStillReleases() {
+        let hw = Hardware()
+        hw.percentage = 50
+        let monitor = nativeMonitor(hw)
+        for _ in 0..<5 { monitor.refresh() }
+        drainCallbacks()
+        XCTAssertEqual(monitor.lastHealthCheckStatus, "pass")
+        // Something else moved the limit; past the settle window the check
+        // forgets the target so the next poll re-issues it.
+        hw.registered = [40]
+        hw.clock = hw.clock.addingTimeInterval(200)
+        monitor.refresh()
+        drainCallbacks()
+        XCTAssertEqual(monitor.lastHealthCheckStatus, "FAIL")
+        // Auto Charge goes off before that poll: nothing cached is not the
+        // same as released, so the release is still issued.
+        monitor.autoManageEnabled = false
+        monitor.refresh()
+        awaitCondition { hw.writes.count == 5 && hw.writes.last == "native-limit-release" }
+        XCTAssertEqual(hw.registered, [])
+        XCTAssertFalse(monitor.chargingPaused)
+        hw.clock = hw.clock.addingTimeInterval(200)
+        for _ in 0..<2 { monitor.refresh() }
+        drainCallbacks()
+        XCTAssertEqual(monitor.lastHealthCheckStatus, "pass")
+        XCTAssertEqual(hw.writes.count, 5, "One release at launch, one now, nothing more")
+    }
+
+    func testNativeMode_ALaunchReleaseThatFailedIsRetriedByTheFirstPollEvenWithAutoChargeOff() {
+        let hw = Hardware()
+        hw.preferences.values["autoManageEnabled"] = false
+        hw.percentage = 50
+        hw.chteMissing = true
+        hw.registered = [40]   // a crashed session's hold, still enforced
+        hw.fail("native-limit-release")
+        let monitor = hw.monitor(startMonitoring: true)
+        awaitCondition { hw.writes.count >= 4 }
+        drainCallbacks()
+        XCTAssertEqual(hw.writes, ["nodischarge", "native-limit-release", "spawn-watchdog:\(pid)", "native-limit-release"],
+                       "Nothing cached is not the same as released: the first poll releases again")
+        XCTAssertNotNil(monitor.lastError)
+        // The helper recovers: the release lands and the polls go quiet.
+        hw.stopFailing("native-limit-release")
+        monitor.refresh()
+        awaitCondition { hw.writes.count == 5 && monitor.lastError == nil }
+        XCTAssertEqual(hw.registered, [])
+        for _ in 0..<3 { monitor.refresh() }
+        drainCallbacks()
+        XCTAssertEqual(hw.writes.count, 5)
+        XCTAssertEqual(monitor.lastHealthCheckStatus, "pass")
+    }
+
+    func testNativeMode_AFailedWatchdogSpawnIsRetriedBeforeEachWriteAndReported() {
+        let hw = Hardware()
+        hw.percentage = 50
+        hw.chteMissing = true
+        hw.fail("spawn-watchdog:\(pid)")
+        let monitor = hw.monitor(startMonitoring: true)
+        awaitCondition { hw.writes.count >= 5 }
+        drainCallbacks()
+        XCTAssertEqual(hw.writes, ["nodischarge", "native-limit-release", "spawn-watchdog:\(pid)",
+                                   "spawn-watchdog:\(pid)", "native-limit:50"],
+                       "The limit is written without the safety net rather than withheld")
+        XCTAssertTrue(monitor.chargingPaused)
+        monitor.refresh()
+        drainCallbacks()
+        XCTAssertEqual(monitor.recoveryWarning, BatteryMonitor.watchdogMissingWarning)
+        // The helper manages a spawn again: the next write is covered and
+        // the warning clears.
+        hw.stopFailing("spawn-watchdog:\(pid)")
+        hw.percentage = 51
+        monitor.refresh()
+        awaitCondition { hw.writes.last == "native-limit:51" }
+        monitor.refresh()
+        drainCallbacks()
+        XCTAssertEqual(Array(hw.writes.suffix(2)), ["spawn-watchdog:\(pid)", "native-limit:51"])
+        XCTAssertNil(monitor.recoveryWarning)
+        hw.percentage = 52
+        monitor.refresh()
+        awaitCondition { hw.writes.last == "native-limit:52" }
+        XCTAssertEqual(hw.writes.count, 8, "A running watchdog is not spawned again")
     }
 
     // MARK: - Keep Awake display option

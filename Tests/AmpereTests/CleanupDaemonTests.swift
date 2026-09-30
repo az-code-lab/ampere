@@ -95,4 +95,34 @@ final class CleanupDaemonTests: XCTestCase {
         XCTAssertFalse(CleanupDaemon.shouldUninstall(bundleExists: false, parentExists: true, appRunning: true),
                        "moved while running")
     }
+
+    func testTheGracePeriodStartsWhenTheBundleIsFirstSeenMissingAndAnySightingEndsIt() {
+        var waits: [UInt32] = []
+        // In place when the job starts (boot, or a change to the path that
+        // is not a removal): no wait at all, so the end of a wait can never
+        // coincide with the gap an upgrade leaves.
+        XCTAssertFalse(CleanupDaemon.stayedMissing(exists: { true }, wait: { waits.append($0) }))
+        XCTAssertEqual(waits, [])
+        // Missing throughout: looked for after every poll and once more at
+        // the end of the period.
+        var looks = 0
+        XCTAssertTrue(CleanupDaemon.stayedMissing(gracePeriod: 120, poll: 5,
+                                                  exists: { looks += 1; return false },
+                                                  wait: { waits.append($0) }))
+        XCTAssertEqual(waits.reduce(0, +), 120)
+        XCTAssertEqual(looks, 25)
+        // Back within the period (an undo, an upgrade placing the new
+        // bundle): the run ends at that sighting.
+        waits = []
+        var sightings = [false, false, true]
+        XCTAssertFalse(CleanupDaemon.stayedMissing(gracePeriod: 120, poll: 5,
+                                                   exists: { sightings.removeFirst() },
+                                                   wait: { waits.append($0) }))
+        XCTAssertEqual(waits, [5, 5])
+        // The last poll is cut to what remains of the period.
+        waits = []
+        XCTAssertTrue(CleanupDaemon.stayedMissing(gracePeriod: 7, poll: 5, exists: { false },
+                                                  wait: { waits.append($0) }))
+        XCTAssertEqual(waits, [5, 2])
+    }
 }

@@ -18,6 +18,30 @@ public enum CleanupDaemon {
     /// and re-create the bundle within seconds; a reinstall inside this
     /// window keeps the helper and needs no new password prompt.
     public static let gracePeriodSeconds: UInt32 = 120
+    /// How often the job looks for the bundle during the grace period.
+    public static let pollSeconds: UInt32 = 5
+
+    /// Whether the bundle stayed missing for a whole grace period: it is
+    /// looked for before any wait and then every `poll` seconds, and any
+    /// sighting ends the run. The period thus starts when the bundle is
+    /// first seen missing, never when the job starts: launchd also runs
+    /// the job at boot and on every change to the path, and a single look
+    /// at the end of a wait that began then could land inside the seconds
+    /// a `brew upgrade` (which quits the app first) leaves the path empty
+    /// between removing one bundle and placing the next, and purge a Mac
+    /// that was only being upgraded. A bundle removed again after a
+    /// sighting gets a fresh period from the run that removal starts.
+    public static func stayedMissing(gracePeriod: UInt32 = gracePeriodSeconds, poll: UInt32 = pollSeconds,
+                                     exists: () -> Bool, wait: (UInt32) -> Void) -> Bool {
+        var waited: UInt32 = 0
+        while true {
+            if exists() { return false }
+            if waited >= gracePeriod { return true }
+            let step = min(max(poll, 1), gracePeriod - waited)
+            wait(step)
+            waited += step
+        }
+    }
 
     /// The launchd property list watching `bundlePath`. Equal input gives
     /// identical bytes, so the app can tell an installed job from a stale

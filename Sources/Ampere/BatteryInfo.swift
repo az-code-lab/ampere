@@ -86,11 +86,12 @@ final class BatteryMonitor: ObservableObject {
         var lidClosed: () -> Bool = BatteryMonitor.readClamshellClosed
         var sleepDisabled: () -> Bool = readSleepDisabledFlag
         var readKey: (String) -> [UInt8]? = BatteryMonitor.smcReadKey
-        /// False on firmware without the CHTE key (macOS 27, and the same
-        /// firmware in macOS 26.7): charge control then goes through
-        /// macOS's own charge limit when this macOS has one (see
-        /// chargeControlMechanism).
-        var chargeTerminateAvailable: () -> Bool = { BatteryMonitor.smcReadKey(SMC.keyChargeTerminate) != nil }
+        /// Whether the SMC has the CHTE key. `missing` on firmware without
+        /// it (macOS 27, and the same firmware in macOS 26.7): charge
+        /// control then goes through macOS's own charge limit when this
+        /// macOS has one (see chargeControlMechanism). `unknown` when the
+        /// SMC did not answer, which decides nothing (see smcKeyPresence).
+        var chargeTerminateKey: () -> SMCKeyPresence = { BatteryMonitor.smcKeyPresence(SMC.keyChargeTerminate) }
         /// True when this macOS has the manual charge limit at all (see
         /// NativeChargeLimit.clientClass); false on a macOS that predates
         /// it, whatever the firmware.
@@ -236,6 +237,11 @@ final class BatteryMonitor: ObservableObject {
         /// chargeControlMechanism). Nothing is written, no helper is
         /// installed, and nothing needs restoring; the panel monitors only.
         case noMechanism
+        /// The SMC did not answer the CHTE probe when this instance took
+        /// charge control (see ChargeControlMechanism.undetermined).
+        /// Nothing is written and no helper prompt is shown until it does;
+        /// refresh asks again at every poll.
+        case mechanismUnknown
     }
     @Published private(set) var chargeControlHold: ChargeControlHold?
     /// True while another process holds charge control; the panel hides
@@ -245,10 +251,11 @@ final class BatteryMonitor: ObservableObject {
         return false
     }
     /// True while nothing this instance could write would apply: another
-    /// process holds control, or this Mac has no mechanism. The panel
-    /// hides the controls either way; the status line says which.
+    /// process holds control, this Mac has no mechanism, or the SMC has
+    /// not said which one yet. The panel hides the controls in every
+    /// case; the status line says which.
     var controlsUnavailable: Bool {
-        standingBy || chargeControlHold == .noMechanism
+        standingBy || chargeControlHold == .noMechanism || chargeControlHold == .mechanismUnknown
     }
 
     /// Which mechanism can hold the charge on this Mac. Decided from what
@@ -266,18 +273,34 @@ final class BatteryMonitor: ObservableObject {
         case chargeTerminateKey
         case nativeLimit
         case unavailable
+        /// The SMC did not answer the CHTE probe, so neither branch can be
+        /// taken yet: not the key (its writes fail on firmware without it)
+        /// and not the macOS limit (a CHTE Mac would then run on the wrong
+        /// mechanism for the session). Decided again at the next poll.
+        case undetermined
+    }
+
+    /// What the SMC answered when asked whether it has a key (see
+    /// smcKeyPresence).
+    enum SMCKeyPresence: Equatable {
+        case present
+        case missing
+        case unknown
     }
 
     /// Internal (not private) so the precedence can be pinned by tests.
     /// The native probes are autoclosures: a Mac with CHTE never loads the
-    /// private framework or spawns pmset.
+    /// private framework or spawns pmset, and an unanswered probe runs
+    /// neither.
     static func chargeControlMechanism(
-        chteAvailable: Bool, nativeClientAvailable: @autoclosure () -> Bool,
+        chte: SMCKeyPresence, nativeClientAvailable: @autoclosure () -> Bool,
         nativeLimitsReadable: @autoclosure () -> Bool
     ) -> ChargeControlMechanism {
-        if chteAvailable { return .chargeTerminateKey }
-        if nativeClientAvailable() && nativeLimitsReadable() { return .nativeLimit }
-        return .unavailable
+        switch chte {
+        case .present: return .chargeTerminateKey
+        case .unknown: return .undetermined
+        case .missing: return nativeClientAvailable() && nativeLimitsReadable() ? .nativeLimit : .unavailable
+        }
     }
     /// True once this account has been verified (or granted) passwordless
     /// access to the helper in this session; false again after Revoke. The
@@ -492,6 +515,16 @@ final class BatteryMonitor: ObservableObject {
     /// by a check that passes. A write landing (including the repair write
     /// itself) proves nothing about enforcement, so it leaves this alone.
     private var nativeRepairAttempted = false
+    /// True while what powerd enforces may differ from nativeLimitWritten:
+    /// after a health-check mismatch (the target is forgotten so it is
+    /// re-issued), after a launch whose release of a crashed session's
+    /// limit failed, and after a helper install, whose script tolerates a
+    /// failed restore. The next poll then writes its target even when it
+    /// equals the cached one, a nil target included: a release with no
+    /// marker outstanding is a no-op in the helper, whereas skipping it
+    /// because nil looked like "released" would leave the leftover limit
+    /// in force with Auto Charge off, under a health check that passes.
+    private var nativeLimitUnconfirmed = false
     /// Grace period after a native write before a mismatch counts.
     private static let nativeLimitSettleSeconds: TimeInterval = 150
     /// One native-mode helper call, from dispatch to completion. A class so
@@ -531,6 +564,45 @@ final class BatteryMonitor: ObservableObject {
         get { watchdogLock.lock(); defer { watchdogLock.unlock() }; return watchdogSpawnedStorage }
         set { watchdogLock.lock(); defer { watchdogLock.unlock() }; watchdogSpawnedStorage = newValue }
     }
+    /// True from a spawn-watchdog the helper refused (at launch, or a
+    /// retry) until a spawn succeeds; the status line then says a crash
+    /// would leave the current override in place (watchdogMissingWarning).
+    /// Distinct from !watchdogSpawned, which is also true for the moment
+    /// between a nodischarge and the spawn that follows it on the same
+    /// queue. Same lock: written on the SMC queue, read on the main one.
+    private var watchdogSpawnFailedStorage = false
+    private var watchdogSpawnFailed: Bool {
+        get { watchdogLock.lock(); defer { watchdogLock.unlock() }; return watchdogSpawnFailedStorage }
+        set { watchdogLock.lock(); defer { watchdogLock.unlock() }; watchdogSpawnFailedStorage = newValue }
+    }
+    /// True while the launch cleanup's nodischarge (CHIE, the saved sleep
+    /// settings, old watchdogs) has not succeeded, so what a crashed or
+    /// rebooted session left is still in force and nothing of this
+    /// session's would put it back on its own: its discharge and sleep
+    /// hold release only what they armed, and the health check reads
+    /// neither pmset nor the markers. Cleared by any nodischarge or
+    /// restore that succeeds (runSMCWriteViaSudo); refresh retries it
+    /// every launchCleanupRetrySeconds (retryLaunchCleanup). Same lock.
+    private var launchCleanupPendingStorage = false
+    private var launchCleanupPending: Bool {
+        get { watchdogLock.lock(); defer { watchdogLock.unlock() }; return launchCleanupPendingStorage }
+        set { watchdogLock.lock(); defer { watchdogLock.unlock() }; launchCleanupPendingStorage = newValue }
+    }
+    private var launchCleanupRetryAt = Date.distantPast
+    /// Long enough for whatever refused pmset or the SMC at login to have
+    /// recovered; the state machine runs on every poll in between.
+    private static let launchCleanupRetrySeconds: TimeInterval = 120
+    /// How often the CHTE probe is repeated within one activation before
+    /// charge control goes on hold (activateChargeControl), and the pause
+    /// between repeats.
+    private static let chteProbeAttempts = 3
+    private static let chteProbeRetryMicroseconds: UInt32 = 100_000
+    /// The status line's recovery notice: a launch cleanup still pending,
+    /// or a crash watchdog the helper could not start. Nil when neither
+    /// (updateRecoveryWarning).
+    @Published private(set) var recoveryWarning: String?
+    static let launchCleanupWarning = "Restoring the previous session's overrides failed; retrying."
+    static let watchdogMissingWarning = "Crash watchdog could not start; retrying. Overrides would outlive a crash until the next launch."
     /// Sleep-hold intent from the state machine, persisted so a crash or
     /// in-app upgrade mid-hold re-arms after relaunch (launch cleanup always
     /// restores pmset via nodischarge, so without the persisted intent a
@@ -779,10 +851,33 @@ final class BatteryMonitor: ObservableObject {
         // could do: no prompt, no cleanup writes, no watchdog, and nothing
         // to restore at quit. A helper an earlier version installed stays
         // put; if it still answers to this account, Revoke is offered.
+        // One unanswered probe must not decide the mechanism for the whole
+        // session (a CHTE Mac would run on the macOS charge limit): it is
+        // repeated a few times here and, still unanswered, at every poll,
+        // with charge control on hold meanwhile.
+        var chte = io.chargeTerminateKey()
+        var probes = 1
+        while chte == .unknown, probes < Self.chteProbeAttempts {
+            usleep(Self.chteProbeRetryMicroseconds)
+            chte = io.chargeTerminateKey()
+            probes += 1
+        }
         let mechanism = Self.chargeControlMechanism(
-            chteAvailable: io.chargeTerminateAvailable(),
+            chte: chte,
             nativeClientAvailable: io.nativeLimitClientAvailable(),
             nativeLimitsReadable: io.registeredNativeLimits() != nil)
+        let retrying = chargeControlHold == .mechanismUnknown
+        if mechanism == .undetermined {
+            if !retrying {
+                chargeControlHold = .mechanismUnknown
+                AmpereLog.app("Ampere: Charge control on hold: the SMC did not answer the CHTE probe; retrying at every poll")
+            }
+            return true
+        }
+        if retrying {
+            chargeControlHold = nil
+            AmpereLog.app("Ampere: The SMC answered the CHTE probe; taking charge control")
+        }
         nativeLimitMode = mechanism == .nativeLimit
         if mechanism == .unavailable {
             chargeControlHold = .noMechanism
@@ -896,6 +991,14 @@ final class BatteryMonitor: ObservableObject {
             } else {
                 AmpereLog.app("Ampere: Launch cleanup failed (nodischarge=%d, chte=%d)", okDischarge, okChte)
             }
+            // A failed nodischarge leaves what the previous session left
+            // in force; refresh retries it (see launchCleanupPending).
+            launchCleanupPending = !okDischarge
+            launchCleanupRetryAt = io.now().addingTimeInterval(Self.launchCleanupRetrySeconds)
+            // Native mode: a failed release leaves a crashed session's
+            // limit in force with nothing cached, which the first poll must
+            // not take for "released" (see nativeLimitUnconfirmed).
+            nativeLimitUnconfirmed = nativeLimitMode && !okChte
             if !okWatchdog {
                 AmpereLog.app("Ampere: Watchdog spawn failed at launch — crash safety net not installed")
             }
@@ -1206,7 +1309,11 @@ final class BatteryMonitor: ObservableObject {
                     self.sleepHoldIntent = false
                     self.nativeLimitWritten = nil
                     self.nativeLimitIntent = nil
+                    self.nativeLimitUnconfirmed = false
                     self.watchdogSpawned = false
+                    self.watchdogSpawnFailed = false
+                    self.launchCleanupPending = false
+                    self.recoveryWarning = nil
                     self.lastError = nil
                     self.healthWarning = nil
                 } else {
@@ -1313,6 +1420,7 @@ final class BatteryMonitor: ObservableObject {
             // spawn failure fails the install).
             if ok {
                 self?.watchdogSpawned = true
+                self?.watchdogSpawnFailed = false
                 self?.registerCleanupDaemonIfNeeded()
             }
             DispatchQueue.main.async {
@@ -1321,11 +1429,14 @@ final class BatteryMonitor: ObservableObject {
                 if ok {
                     self?.grantAccess()
                     // The install script's restore released any macOS
-                    // charge limit of ours; forget the target so the next
-                    // poll hands it over again instead of waiting for the
-                    // health check to notice.
+                    // charge limit of ours, or failed to (the script
+                    // tolerates that): forget the target and treat what
+                    // powerd holds as unconfirmed, so the next poll writes
+                    // its own, a release included, instead of waiting for
+                    // the health check to notice.
                     self?.nativeLimitWritten = nil
                     self?.nativeLimitIntent = nil
+                    self?.nativeLimitUnconfirmed = true
                     self?.recheckHealth()
                 }
                 completion(ok)
@@ -1377,6 +1488,64 @@ final class BatteryMonitor: ObservableObject {
         return true
     }
 
+    /// Retry a crash-watchdog spawn the helper refused (at launch, or the
+    /// respawn after a nodischarge), before a write that relies on it.
+    /// Runs on the SMC queue. The write goes ahead either way: a CHTE
+    /// value or macOS limit the watchdog cannot put back after a crash is
+    /// restored at the next launch, whereas refusing charge control would
+    /// leave the user with nothing; the status line says the safety net
+    /// is missing meanwhile (watchdogMissingWarning). The discharge
+    /// command spawns its own, and the sleep hold, which does require
+    /// one, has its own retry in refresh.
+    private func retryFailedWatchdogSpawn() {
+        guard watchdogSpawnFailed else { return }
+        if !runSMCWriteViaSudo("spawn-watchdog:\(ProcessInfo.processInfo.processIdentifier)") {
+            AmpereLog.app("Ampere: Watchdog spawn retry failed — crash safety net still missing")
+        }
+    }
+
+    /// Finish a launch cleanup whose nodischarge failed (see
+    /// launchCleanupPending): the same restore, then a fresh watchdog,
+    /// since a nodischarge that succeeds retires the running one. Success
+    /// re-runs refresh so the state machine sees the restored state at
+    /// once; failure waits for the next interval.
+    private func retryLaunchCleanup() {
+        guard isSudoRuleInstalled else { return }
+        autoManageInFlight = true
+        let selfPID = ProcessInfo.processInfo.processIdentifier
+        smcQueue.async { [weak self] in
+            guard let self else { return }
+            let ok = self.runSMCWriteViaSudo("nodischarge")
+            if ok, !self.runSMCWriteViaSudo("spawn-watchdog:\(selfPID)") {
+                AmpereLog.app("Ampere: Watchdog respawn after the launch cleanup retry failed")
+            }
+            DispatchQueue.main.async {
+                self.autoManageInFlight = false
+                if ok {
+                    AmpereLog.app("Ampere: Launch cleanup completed on retry")
+                    self.refresh()
+                } else {
+                    AmpereLog.app("Ampere: Launch cleanup retry failed; next attempt in %d s",
+                                  Int(Self.launchCleanupRetrySeconds))
+                }
+            }
+        }
+    }
+
+    /// The status line's recovery notice, from the flags the helper calls
+    /// maintain: a pending launch cleanup outranks a missing watchdog.
+    private func updateRecoveryWarning() {
+        let warning: String?
+        if launchCleanupPending {
+            warning = Self.launchCleanupWarning
+        } else if watchdogSpawnFailed, isSudoRuleInstalled {
+            warning = Self.watchdogMissingWarning
+        } else {
+            warning = nil
+        }
+        if recoveryWarning != warning { recoveryWarning = warning }
+    }
+
     /// Run a high-level SMC operation via the sudoers helper (no password
     /// prompt). Requires the sudoers helper to be installed.
     @discardableResult
@@ -1386,8 +1555,8 @@ final class BatteryMonitor: ObservableObject {
             return false
         }
         switch op {
-        case .allow:       return runSMCWriteViaSudo("allow")
-        case .inhibit:     return runSMCWriteViaSudo("inhibit")
+        case .allow:       retryFailedWatchdogSpawn(); return runSMCWriteViaSudo("allow")
+        case .inhibit:     retryFailedWatchdogSpawn(); return runSMCWriteViaSudo("inhibit")
         case .discharge:   return startDischarge()
         case .nodischarge: return stopDischarge()
         }
@@ -1396,6 +1565,12 @@ final class BatteryMonitor: ObservableObject {
     private func runSMCWriteViaSudo(_ arg: String) -> Bool {
         let ok = io.writeHelper(arg)
         if let spawned = Self.watchdogSpawned(after: arg, ok: ok) { watchdogSpawned = spawned }
+        if arg.hasPrefix("spawn-watchdog:") {
+            watchdogSpawnFailed = !ok
+        } else if ok, arg.hasPrefix("discharge:") {
+            watchdogSpawnFailed = false
+        }
+        if ok, arg == "nodischarge" || arg == "restore" { launchCleanupPending = false }
         return ok
     }
 
@@ -1449,13 +1624,44 @@ final class BatteryMonitor: ObservableObject {
 
     // MARK: - SMC Read (no root required)
 
-    /// Read a single SMC key and return its raw bytes, or nil on failure.
-    private static func smcReadKey(_ key: String) -> [UInt8]? {
+    /// The SMC's keys endpoint, or MACH_PORT_NULL on a Mac without one.
+    /// The caller releases it.
+    private static func smcService() -> io_service_t {
         let service = IOServiceGetMatchingService(kIOMainPortDefault,
             IOServiceMatching("AppleSMCKeysEndpoint"))
-        let svc = service != MACH_PORT_NULL ? service :
+        return service != MACH_PORT_NULL ? service :
             IOServiceGetMatchingService(kIOMainPortDefault,
                 IOServiceMatching("AppleSMC"))
+    }
+
+    /// Whether the SMC has `key`, from the key-info command's answer, with
+    /// the not-found status told apart from every other failure: an SMC
+    /// that did not answer (the connection refused, an IOKit error, an
+    /// error status) is `unknown`, never `missing`, so a transient failure
+    /// cannot pass for firmware without the key. A Mac with no SMC service
+    /// at all has none of its keys, which is a fact, not a failure.
+    static func smcKeyPresence(_ key: String) -> SMCKeyPresence {
+        let svc = smcService()
+        guard svc != MACH_PORT_NULL else { return .missing }
+        defer { IOObjectRelease(svc) }
+        var conn: io_connect_t = 0
+        guard IOServiceOpen(svc, mach_task_self_, 0, &conn) == kIOReturnSuccess else { return .unknown }
+        defer { IOServiceClose(conn) }
+        var input = SMCKeyData()
+        var output = SMCKeyData()
+        input.key = smcFourCharCode(key)
+        input.data8 = SMCCmd.readKeyInfo
+        let inputSize = MemoryLayout<SMCKeyData>.size
+        var outputSize = MemoryLayout<SMCKeyData>.size
+        guard IOConnectCallStructMethod(conn, SMCCmd.userClientSelector, &input, inputSize,
+                                        &output, &outputSize) == kIOReturnSuccess else { return .unknown }
+        if output.result == SMC.statusKeyNotFound { return .missing }
+        return output.result == 0 && output.keyInfo.dataSize > 0 ? .present : .unknown
+    }
+
+    /// Read a single SMC key and return its raw bytes, or nil on failure.
+    private static func smcReadKey(_ key: String) -> [UInt8]? {
+        let svc = smcService()
         guard svc != MACH_PORT_NULL else { return nil }
         defer { IOObjectRelease(svc) }
 
@@ -2131,9 +2337,25 @@ final class BatteryMonitor: ObservableObject {
             chargeControlHold = nil
             AmpereLog.app("Ampere: Taking over charge control")
             activateChargeControl(atLaunch: false)
+        } else if chargeControlHold == .mechanismUnknown {
+            // The SMC did not answer the CHTE probe last time: ask again.
+            activateChargeControl(atLaunch: false)
         }
-        // A declined takeover prompt: read-only until access is granted.
+        // A declined takeover prompt, or a probe still unanswered:
+        // read-only until access is granted or the SMC answers.
         if chargeControlHold != nil { return }
+        updateRecoveryWarning()
+
+        // A launch cleanup whose restore failed is finished here, one
+        // attempt per interval, while nothing of this session's own has
+        // re-armed the same overrides (their own release restores the
+        // shared markers). The state machine runs on the other ticks.
+        if launchCleanupPending, !autoManageInFlight, !activeDischarging, !sleepHoldActive,
+           io.now() >= launchCleanupRetryAt {
+            launchCleanupRetryAt = io.now().addingTimeInterval(Self.launchCleanupRetrySeconds)
+            retryLaunchCleanup()
+            return
+        }
 
         // Firmware without CHTE: the macOS charge limit does the holding.
         // Everything from here down writes CHTE or CHIE, so it is bypassed.
@@ -2638,7 +2860,7 @@ final class BatteryMonitor: ObservableObject {
         if case .drainTo = intent { draining = b.adapterConnected && b.percentage > chargeUpperBound } else { draining = false }
         if activeDischarging != draining { activeDischarging = draining }
 
-        if target == nativeLimitWritten {
+        if target == nativeLimitWritten, !nativeLimitUnconfirmed {
             // Same target for a new reason (a charge that reached the bound
             // becomes a hold there): no write needed, but the intent must
             // follow so the next poll treats it as the same hold (which
@@ -2651,11 +2873,15 @@ final class BatteryMonitor: ObservableObject {
                                          revision: controlRevision, percentage: b.percentage)
             nativeLimitInFlight = write
             if beforeSleep {
-                smcQueue.sync { write.succeeded = runSMCWriteViaSudo(write.command) }
+                smcQueue.sync {
+                    retryFailedWatchdogSpawn()
+                    write.succeeded = runSMCWriteViaSudo(write.command)
+                }
                 finishNativeLimitWrite(write)
             } else {
                 smcQueue.async { [weak self] in
                     guard let self else { return }
+                    self.retryFailedWatchdogSpawn()
                     write.succeeded = self.runSMCWriteViaSudo(write.command)
                     DispatchQueue.main.async {
                         // Recorded by prepareForSleep already: nothing left
@@ -2685,6 +2911,7 @@ final class BatteryMonitor: ObservableObject {
         if write.succeeded {
             nativeLimitWritten = write.target
             nativeLimitIntent = write.intent
+            nativeLimitUnconfirmed = false
             nativeLimitWrittenAt = io.now()
             lastError = nil
             if let target = write.target {
@@ -2750,11 +2977,14 @@ final class BatteryMonitor: ObservableObject {
                   actualLimit, expectedLimit ?? "none", chie, battery.percentage)
             if !limitMatch {
                 // Re-issue the target on the next tick by forgetting what
-                // was written; the write path logs the outcome.
+                // was written; the write path logs the outcome. Unconfirmed
+                // makes that write unconditional, so an intent that has
+                // since become a release still releases.
                 newWarning = nativeRepairAttempted ? Self.smcMismatchWarning : nil
                 nativeRepairAttempted = true
                 nativeLimitWritten = nil
                 nativeLimitIntent = nil
+                nativeLimitUnconfirmed = true
             } else {
                 newWarning = Self.smcMismatchWarning
             }

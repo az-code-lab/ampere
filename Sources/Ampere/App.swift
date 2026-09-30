@@ -200,7 +200,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         guard let button = statusItem.button else { return }
         let pct = monitor.state?.percentage ?? 0
         let isCharging = effectivelyCharging()
-        let hasWarning = monitor.healthWarning != nil
+        let hasWarning = monitor.healthWarning != nil || monitor.recoveryWarning != nil
         let hasUpdate = monitor.updateAvailable != nil
         let dark = menuBarIsDark
         let showPct = monitor.showMenuBarPercent
@@ -250,7 +250,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     self.animationPct -= 5
                     if self.animationPct < target { self.animationPct = curPct }
                 }
-                let warn = self.monitor.healthWarning != nil
+                let warn = self.monitor.healthWarning != nil || self.monitor.recoveryWarning != nil
                 button.image = self.buildMenuBarIcon(
                     percentage: CGFloat(self.animationPct),
                     hasWarning: warn,
@@ -856,6 +856,10 @@ struct ContentView: View {
                         Text("Charge control: unavailable. This firmware has no CHTE key, and this macOS has no charge limit (System Settings > Battery) to hand a target to; Ampere monitors only.")
                             .font(.system(size: 12))
                             .foregroundColor(.secondary)
+                    } else if monitor.chargeControlHold == .mechanismUnknown {
+                        Text("Charge control: not decided yet. The SMC did not answer when asked for its CHTE key; Ampere asks again at every poll and writes nothing until it does.")
+                            .font(.system(size: 12))
+                            .foregroundColor(.secondary)
                     }
                     HStack {
                         Spacer()
@@ -947,11 +951,14 @@ struct ContentView: View {
             return "Admin access required for charge control. Pause charging or re-enable Auto Charge to grant it."
         case .noMechanism:
             return "Charge control unavailable: this firmware has no CHTE key and this macOS has no charge limit. Monitoring only."
+        case .mechanismUnknown:
+            return "Charge control on hold: the SMC did not answer. Ampere asks again at every poll."
         case nil:
             break
         }
         if let error = monitor.lastError { return error }
         if let warning = monitor.healthWarning { return warning }
+        if let warning = monitor.recoveryWarning { return warning }
         if monitor.activeDischarging {
             // Native mode: the firmware drains to the bound on its own once
             // the macOS charge limit applies (up to a minute after the
@@ -1016,6 +1023,7 @@ struct ContentView: View {
         if monitor.chargeControlHold != nil { return .orange }
         if monitor.lastError != nil { return .red }
         if monitor.healthWarning != nil { return .red }
+        if monitor.recoveryWarning != nil { return .red }
         if monitor.activeDischarging { return .orange }
         // Mirrors statusMessage's sleep-hold branch: same orange treatment
         // as discharge, since both mean "sleep is being overridden".

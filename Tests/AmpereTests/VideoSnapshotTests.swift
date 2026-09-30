@@ -189,7 +189,7 @@ final class VideoSnapshotTests: XCTestCase {
         io.lidClosed = { false }
         io.sleepDisabled = { false }
         io.readKey = { _ in nil }
-        io.chargeTerminateAvailable = { true }
+        io.chargeTerminateKey = { .present }
         io.registeredNativeLimits = { [] }
         io.writeHelper = { _ in XCTFail("helper write during snapshot"); return false }
         io.helperInstalled = { true }

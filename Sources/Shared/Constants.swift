@@ -135,4 +135,12 @@ public enum SMC {
     public static let chteAllowHex    = "0x00 00 00 00"
     public static let chieDischargeHex = "0x08"
     public static let chieNormalHex    = "0x00"
+
+    // MARK: - SMC status (the `result` byte of a reply)
+    /// What the key-info command answers for a key this firmware does not
+    /// have, delivered with kIOReturnSuccess and dataSize 0 (CHTE on
+    /// macOS 27, checked 2026-09-30). It is the only status that proves a
+    /// key absent; every other nonzero status is an error (a bus
+    /// collision, a timeout) that says nothing about the key.
+    public static let statusKeyNotFound: UInt8 = 0x84
 }
