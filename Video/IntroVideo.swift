@@ -1234,17 +1234,18 @@ final class FrameRenderer {
 
 // MARK: - Encoding
 
-func draw(_ image: CGImage, into buffer: CVPixelBuffer) throws {
-    CVPixelBufferLockBaseAddress(buffer, [])
-    defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
-    let width = CVPixelBufferGetWidth(buffer), height = CVPixelBufferGetHeight(buffer)
-    guard let context = CGContext(
-        data: CVPixelBufferGetBaseAddress(buffer), width: width, height: height,
-        bitsPerComponent: 8, bytesPerRow: CVPixelBufferGetBytesPerRow(buffer),
-        space: CGColorSpace(name: CGColorSpace.sRGB)!,
-        bitmapInfo: CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.premultipliedFirst.rawValue
-    ) else { throw VideoError("pixel buffer context failed") }
-    context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+func draw(_ image: CGImage, into buffer: inout CVMutablePixelBuffer) throws {
+    let width = buffer.size.width, height = buffer.size.height
+    try buffer.accessUnsafeMutableRawPlaneBytes { planes in
+        guard planes.count == 1, let plane = planes.first else { throw VideoError("pixel buffer is not one plane") }
+        guard let context = CGContext(
+            data: plane.bytes.baseAddress, width: width, height: height,
+            bitsPerComponent: 8, bytesPerRow: plane.properties.bytesPerRow,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.premultipliedFirst.rawValue
+        ) else { throw VideoError("pixel buffer context failed") }
+        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+    }
 }
 
 func writePNG(_ image: CGImage, to url: URL) throws {
@@ -1354,13 +1355,9 @@ func encode(cues: [Cue], narration: URL, renderer: FrameRenderer, scale: Int, to
             AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2,
         ],
     ])
-    video.expectsMediaDataInRealTime = false
-    let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: video, sourcePixelBufferAttributes: [
-        kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-        kCVPixelBufferWidthKey as String: width,
-        kCVPixelBufferHeightKey as String: height,
-    ])
-    writer.add(video)
+    let frames = writer.inputPixelBufferReceiver(for: video, pixelBufferAttributes: CVPixelBufferCreationAttributes(
+        pixelFormatType: CVPixelFormatType(rawValue: kCVPixelFormatType_32BGRA),
+        size: CVImageSize(width: width, height: height)))
 
     let audio = AVAssetWriterInput(mediaType: .audio, outputSettings: [
         AVFormatIDKey: kAudioFormatMPEG4AAC,
@@ -1368,75 +1365,56 @@ func encode(cues: [Cue], narration: URL, renderer: FrameRenderer, scale: Int, to
         AVNumberOfChannelsKey: 2,
         AVEncoderBitRateKey: 160_000,
     ])
-    audio.expectsMediaDataInRealTime = false
-    writer.add(audio)
+    let samples = writer.inputReceiver(for: audio)
 
     let asset = AVURLAsset(url: narration)
     guard let track = try await asset.loadTracks(withMediaType: .audio).first else {
         throw VideoError("narration track missing")
     }
     let reader = try AVAssetReader(asset: asset)
-    let audioOutput = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
-    reader.add(audioOutput)
+    let narrationSamples = reader.outputProvider(for: AVAssetReaderTrackOutput(track: track, outputSettings: nil))
 
-    guard writer.startWriting() else { throw writer.error ?? VideoError("writer failed to start") }
-    guard reader.startReading() else { throw reader.error ?? VideoError("reader failed to start") }
+    try writer.start()
+    try reader.start()
     writer.startSession(atSourceTime: .zero)
 
     let total = cues.reduce(0) { $0 + Int(($1.duration * Double(fps)).rounded()) }
-    var frame = 0
-    var cueIndex = 0
-    var localFrame = 0
-    var videoDone = false
-    var audioDone = false
-    let started = Date()
-    // Serve whichever input the writer is ready for. The writer interleaves
-    // the tracks by holding one input back until the other catches up, so
-    // blocking on a single input's readiness can deadlock; neither side
-    // ever waits on the other here.
-    while !(videoDone && audioDone) {
-        guard writer.status == .writing else { throw writer.error ?? VideoError("writer stopped") }
-        var progressed = false
-        if !videoDone, video.isReadyForMoreMediaData {
-            if cueIndex < cues.count {
-                let cue = cues[cueIndex]
-                let image = try renderer.render(cue: cue, t: Double(localFrame) / Double(fps))
-                guard let pool = adaptor.pixelBufferPool else { throw VideoError("no pixel buffer pool") }
-                var buffer: CVPixelBuffer?
-                CVPixelBufferPoolCreatePixelBuffer(nil, pool, &buffer)
-                guard let buffer else { throw VideoError("pixel buffer allocation failed") }
-                try draw(image, into: buffer)
-                let pts = CMTime(value: CMTimeValue(frame), timescale: fps)
-                guard adaptor.append(buffer, withPresentationTime: pts) else {
-                    throw writer.error ?? VideoError("video append failed")
+    // Each track is fed from its own task. The writer interleaves the
+    // tracks by holding one input back until the other catches up, so an
+    // append suspends until its input's turn comes, and neither task waits
+    // on the other. Every exit finishes its receiver: a task that stopped
+    // early without that would leave the writer waiting for its input, and
+    // the other task suspended in an append, forever.
+    try await withThrowingTaskGroup(of: Void.self) { group in
+        group.addTask { @MainActor in
+            defer { frames.finish() }
+            // The pool getter keeps its first answer, nil before the writer
+            // has started, so it is read only here.
+            guard let pool = frames.pixelBufferPool else { throw VideoError("no pixel buffer pool") }
+            var frame = 0
+            let started = Date()
+            for cue in cues {
+                for localFrame in 0..<Int((cue.duration * Double(fps)).rounded()) {
+                    try Task.checkCancellation()
+                    let image = try renderer.render(cue: cue, t: Double(localFrame) / Double(fps))
+                    var buffer = try pool.makeMutablePixelBuffer()
+                    try draw(image, into: &buffer)
+                    try await frames.append(CVReadOnlyPixelBuffer(consume buffer), with: CMTime(value: CMTimeValue(frame), timescale: fps))
+                    frame += 1
+                    if frame % (Int(fps) * 10) == 0 || frame == total {
+                        let elapsed = Date().timeIntervalSince(started)
+                        print(String(format: "  %3d%%  frame %d/%d  %.0fs elapsed", frame * 100 / total, frame, total, elapsed))
+                    }
                 }
-                frame += 1
-                localFrame += 1
-                if localFrame >= Int((cue.duration * Double(fps)).rounded()) {
-                    cueIndex += 1
-                    localFrame = 0
-                }
-                if frame % (Int(fps) * 10) == 0 || frame == total {
-                    let elapsed = Date().timeIntervalSince(started)
-                    print(String(format: "  %3d%%  frame %d/%d  %.0fs elapsed", frame * 100 / total, frame, total, elapsed))
-                }
-            } else {
-                video.markAsFinished()
-                videoDone = true
             }
-            progressed = true
         }
-        if !audioDone, audio.isReadyForMoreMediaData {
-            if let sample = audioOutput.copyNextSampleBuffer() {
-                guard audio.append(sample) else { throw writer.error ?? VideoError("audio append failed") }
-            } else {
-                guard reader.status == .completed else { throw reader.error ?? VideoError("narration read failed") }
-                audio.markAsFinished()
-                audioDone = true
+        group.addTask {
+            defer { samples.finish() }
+            while let sample = try await narrationSamples.next() {
+                try await samples.append(sample)
             }
-            progressed = true
         }
-        if !progressed { usleep(1000) }
+        try await group.waitForAll()
     }
     await writer.finishWriting()
     guard writer.status == .completed else { throw writer.error ?? VideoError("writer did not complete") }
