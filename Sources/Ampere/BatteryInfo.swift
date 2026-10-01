@@ -120,6 +120,11 @@ final class BatteryMonitor: ObservableObject {
                                              bundleIdentifier: Bundle.main.bundleIdentifier)
         }
         var cleanupDaemonRegistered: (String) -> Bool = { CleanupDaemon.isRegistered(bundlePath: $0) }
+        /// Asks the account owner to confirm an action that changes who
+        /// can use the Mac (OwnerAuthentication); the reply comes on the
+        /// main queue.
+        var authenticateOwner: (String, @escaping (OwnerAuthentication.Outcome) -> Void) -> Void
+            = OwnerAuthentication.authenticate(reason:completion:)
     }
 
     private let defaults: BatteryPreferences
@@ -200,13 +205,16 @@ final class BatteryMonitor: ObservableObject {
     /// system stays awake too), so the screen does not lock on its own
     /// while the session runs on AC. Off by default. An option of the
     /// session, never a setting of its own: it can only be on while
-    /// keepAwakeEnabled is (setKeepAwakeDisplay refuses otherwise), and
-    /// whatever ends the session (the toggle, the deadline, unplugging)
+    /// keepAwakeEnabled is (requestKeepAwakeDisplay refuses otherwise),
+    /// and whatever ends the session (the toggle, the deadline, unplugging)
     /// turns it off too, so the invariant holds at rest and after a
-    /// restart. The panel confirms it with a warning on the way on (see
-    /// keepAwakeRow). Persisted like the toggle so a restart mid-session
-    /// resumes the same kind of hold; a screen saver that is set to start
-    /// may still start and lock the screen.
+    /// restart. The way on is the panel's warning (keepAwakeRow) and then
+    /// the account owner's authentication (requestKeepAwakeDisplay): it is
+    /// the one switch that changes who can use the Mac, so whoever is at
+    /// an unlocked Mac cannot flip it. Persisted like the toggle so a
+    /// restart mid-session resumes the same kind of hold without asking
+    /// again; a screen saver that is set to start may still start and lock
+    /// the screen.
     @Published var keepAwakeDisplay: Bool {
         didSet { defaults.set(keepAwakeDisplay, forKey: "keepAwakeDisplay") }
     }
@@ -218,6 +226,10 @@ final class BatteryMonitor: ObservableObject {
     /// setKeepAwakeDeadline so the stored value and the expiry timer can't
     /// diverge.
     @Published private(set) var keepAwakeDeadline: Date?
+    /// True while the authentication prompt behind requestKeepAwakeDisplay
+    /// is up. Pure UI state like `sheetVisible`, not persisted: the panel
+    /// disables the warning sheet's buttons for the prompt's duration.
+    @Published private(set) var keepAwakeDisplayAuthenticating = false
     @Published var lastError: String?
     @Published var pinned: Bool = false
     @Published var healthWarning: String?
@@ -1826,13 +1838,70 @@ final class BatteryMonitor: ObservableObject {
         return display ? .display : .system
     }
 
-    /// UI entry point for the display option: an option of the running
-    /// session, so turning it on with the toggle off is refused (the
-    /// button is disabled then, too). Takes effect at once: the held
-    /// assertion is swapped.
-    func setKeepAwakeDisplay(_ on: Bool) {
-        guard on != keepAwakeDisplay, !on || keepAwakeEnabled else { return }
-        keepAwakeDisplay = on
+    /// What the prompt behind requestKeepAwakeDisplay says Ampere is
+    /// trying to do ("Ampere is trying to keep the display on …").
+    static let keepAwakeDisplayReason = "keep the display on so the Mac does not lock on its own"
+
+    /// How a request to turn the display option on ended.
+    enum KeepAwakeDisplayRequest: Equatable {
+        /// The option is on.
+        case on
+        /// The option stays off and there is nothing to explain: the
+        /// owner declined the prompt, or a prompt was already up.
+        case declined
+        /// The option stays off because the system could not confirm the
+        /// owner; the reason in the system's words, for the panel to show.
+        case failed(String)
+        /// Nothing to turn on: no session is running (it may have ended,
+        /// unplugged or expired, while the prompt was up).
+        case noSession
+    }
+
+    /// UI entry point for turning the display option on, the one switch
+    /// on the panel that changes who can use the Mac: the account owner
+    /// authenticates first (io.authenticateOwner: Touch ID, or the
+    /// account password where no sensor is reachable), and the option
+    /// turns on only when that succeeds, with the held assertion swapped
+    /// at once. An option of the running session, so it is refused,
+    /// without a prompt, while the toggle is off (the button is disabled
+    /// then, too); and because the prompt takes as long as the person
+    /// takes, the session is checked again when the answer arrives. One
+    /// prompt at a time: a request while one is up is declined without a
+    /// second prompt. `completion` runs on the main queue, exactly once.
+    func requestKeepAwakeDisplay(completion: @escaping (KeepAwakeDisplayRequest) -> Void) {
+        guard keepAwakeEnabled else { completion(.noSession); return }
+        guard !keepAwakeDisplay else { completion(.on); return }
+        guard !keepAwakeDisplayAuthenticating else { completion(.declined); return }
+        keepAwakeDisplayAuthenticating = true
+        io.authenticateOwner(Self.keepAwakeDisplayReason) { [weak self] outcome in
+            guard let self else { completion(.declined); return }
+            self.keepAwakeDisplayAuthenticating = false
+            switch outcome {
+            case .cancelled:
+                AmpereLog.app("Ampere: Keep Display On declined at the prompt")
+                completion(.declined)
+            case .failed(let why):
+                AmpereLog.app("Ampere: Keep Display On not confirmed: %@", why)
+                completion(.failed(why))
+            case .granted:
+                guard self.keepAwakeEnabled else {
+                    AmpereLog.app("Ampere: Keep Display On confirmed after the session ended; nothing turned on")
+                    completion(.noSession)
+                    return
+                }
+                self.keepAwakeDisplay = true
+                self.reconcileKeepAwake(adapterConnected: self.state?.adapterConnected)
+                AmpereLog.app("Ampere: Keep Display On turned on after owner authentication")
+                completion(.on)
+            }
+        }
+    }
+
+    /// UI entry point for turning the display option off: immediate,
+    /// nothing asked, the held assertion swapped back.
+    func turnOffKeepAwakeDisplay() {
+        guard keepAwakeDisplay else { return }
+        keepAwakeDisplay = false
         reconcileKeepAwake(adapterConnected: state?.adapterConnected)
     }
 

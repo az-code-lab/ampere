@@ -52,6 +52,12 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         /// applies them (`registered` stays as it is).
         var enforcesLimits = true
         var clock = Date()
+        /// What the owner answers at the authentication prompt behind the
+        /// display option; nil leaves the prompt up until answerPrompt.
+        var ownerAnswer: OwnerAuthentication.Outcome? = .granted
+        /// The reason given to each prompt, in order.
+        var prompts: [String] = []
+        private var pendingPrompt: ((OwnerAuthentication.Outcome) -> Void)?
         let preferences = MemoryBatteryPreferences()
         private let lock = NSLock()
         private var commands: [String] = []
@@ -86,6 +92,14 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         func resetChargingKey() {
             lock.lock(); defer { lock.unlock() }
             chte = 0
+        }
+
+        /// The owner answers the prompt that `ownerAnswer = nil` left up.
+        func answerPrompt(_ outcome: OwnerAuthentication.Outcome,
+                          file: StaticString = #filePath, line: UInt = #line) {
+            guard let reply = pendingPrompt else { return XCTFail("No prompt is up", file: file, line: line) }
+            pendingPrompt = nil
+            reply(outcome)
         }
 
         /// Someone else (System Settings, another tool) cleared the limit.
@@ -178,6 +192,10 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
             io.competingInstance = { self.competing }
             io.cleanupDaemonBundlePath = { self.bundlePath }
             io.cleanupDaemonRegistered = { _ in self.daemonRegistered }
+            io.authenticateOwner = { reason, reply in
+                self.prompts.append(reason)
+                if let answer = self.ownerAnswer { reply(answer) } else { self.pendingPrompt = reply }
+            }
             return BatteryMonitor(chargeBoundsLocked: locked, defaults: preferences,
                                   io: io, startMonitoring: startMonitoring)
         }
@@ -1104,19 +1122,88 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         let monitor = hw.monitor()
         XCTAssertTrue(monitor.keepAwakeEnabled)
         XCTAssertTrue(monitor.keepAwakeDisplay, "A restart mid-session resumes the same kind of hold")
-        monitor.setKeepAwakeDisplay(false)
+        XCTAssertEqual(hw.prompts, [], "Resuming the owner's own choice asks nothing")
+        monitor.turnOffKeepAwakeDisplay()
         XCTAssertEqual(hw.preferences.values["keepAwakeDisplay"] as? Bool, false)
         XCTAssertFalse(hw.monitor().keepAwakeDisplay)
     }
 
     func testKeepAwakeDisplay_RefusedWhileTheToggleIsOff() {
         let hw = Hardware(), monitor = hw.monitor()
-        monitor.setKeepAwakeDisplay(true)
-        XCTAssertFalse(monitor.keepAwakeDisplay, "An option of the running session only")
+        var ends: [BatteryMonitor.KeepAwakeDisplayRequest] = []
+        monitor.requestKeepAwakeDisplay { ends.append($0) }
+        XCTAssertEqual(ends, [.noSession], "An option of the running session only")
+        XCTAssertFalse(monitor.keepAwakeDisplay)
         XCTAssertNil(hw.preferences.values["keepAwakeDisplay"])
+        XCTAssertEqual(hw.prompts, [], "Nothing to turn on, so the owner is not asked")
         monitor.setKeepAwake(true)
-        monitor.setKeepAwakeDisplay(true)
+        monitor.requestKeepAwakeDisplay { ends.append($0) }
+        XCTAssertEqual(ends, [.noSession, .on])
         XCTAssertTrue(monitor.keepAwakeDisplay)
+        XCTAssertEqual(hw.prompts, [BatteryMonitor.keepAwakeDisplayReason])
+    }
+
+    func testKeepAwakeDisplay_TurnsOnOnlyWhenTheOwnerAuthenticates() {
+        let hw = Hardware(), monitor = hw.monitor()
+        monitor.setKeepAwake(true)
+        var ends: [BatteryMonitor.KeepAwakeDisplayRequest] = []
+        hw.ownerAnswer = .cancelled
+        monitor.requestKeepAwakeDisplay { ends.append($0) }
+        XCTAssertEqual(ends, [.declined])
+        XCTAssertFalse(monitor.keepAwakeDisplay)
+        XCTAssertNil(hw.preferences.values["keepAwakeDisplay"], "A declined prompt persists nothing")
+        hw.ownerAnswer = .failed("Passcode not set.")
+        monitor.requestKeepAwakeDisplay { ends.append($0) }
+        XCTAssertEqual(ends, [.declined, .failed("Passcode not set.")])
+        XCTAssertFalse(monitor.keepAwakeDisplay)
+        hw.ownerAnswer = .granted
+        monitor.requestKeepAwakeDisplay { ends.append($0) }
+        XCTAssertEqual(ends, [.declined, .failed("Passcode not set."), .on])
+        XCTAssertTrue(monitor.keepAwakeDisplay)
+        XCTAssertEqual(hw.preferences.values["keepAwakeDisplay"] as? Bool, true)
+        XCTAssertFalse(monitor.keepAwakeDisplayAuthenticating)
+        XCTAssertEqual(hw.prompts.count, 3, "Every request prompts afresh")
+        // Already on there is nothing to confirm, and the way off never asks.
+        monitor.requestKeepAwakeDisplay { ends.append($0) }
+        XCTAssertEqual(ends.last, .on)
+        monitor.turnOffKeepAwakeDisplay()
+        XCTAssertFalse(monitor.keepAwakeDisplay)
+        XCTAssertEqual(hw.preferences.values["keepAwakeDisplay"] as? Bool, false)
+        XCTAssertEqual(hw.prompts.count, 3)
+    }
+
+    func testKeepAwakeDisplay_PromptOutlivingTheSessionTurnsNothingOn() {
+        let hw = Hardware(), monitor = hw.monitor()
+        monitor.refresh()
+        monitor.setKeepAwake(true)
+        hw.ownerAnswer = nil
+        var ends: [BatteryMonitor.KeepAwakeDisplayRequest] = []
+        monitor.requestKeepAwakeDisplay { ends.append($0) }
+        XCTAssertTrue(monitor.keepAwakeDisplayAuthenticating)
+        XCTAssertEqual(ends, [])
+        // A second request while the prompt is up gets no second prompt.
+        monitor.requestKeepAwakeDisplay { ends.append($0) }
+        XCTAssertEqual(ends, [.declined])
+        XCTAssertEqual(hw.prompts.count, 1)
+        // Unplugged before the owner answers: the session is over, and a
+        // confirmation that arrives now turns nothing on.
+        hw.connected = false
+        monitor.refresh()
+        XCTAssertFalse(monitor.keepAwakeEnabled)
+        hw.answerPrompt(.granted)
+        XCTAssertEqual(ends, [.declined, .noSession])
+        XCTAssertFalse(monitor.keepAwakeDisplay)
+        XCTAssertFalse(monitor.keepAwakeDisplayAuthenticating)
+        XCTAssertNotEqual(hw.preferences.values["keepAwakeDisplay"] as? Bool, true)
+        // The next session asks again from scratch.
+        hw.connected = true
+        monitor.refresh()
+        monitor.setKeepAwake(true)
+        hw.ownerAnswer = .granted
+        monitor.requestKeepAwakeDisplay { ends.append($0) }
+        XCTAssertEqual(ends.last, .on)
+        XCTAssertTrue(monitor.keepAwakeDisplay)
+        XCTAssertEqual(hw.prompts.count, 2)
     }
 
     func testKeepAwakeDisplay_OffWithoutASessionAtLaunch() {
@@ -1139,7 +1226,7 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
     func testKeepAwake_TurningTheToggleOffTurnsTheDisplayOptionOff() {
         let hw = Hardware(), monitor = hw.monitor()
         monitor.setKeepAwake(true)
-        monitor.setKeepAwakeDisplay(true)
+        monitor.requestKeepAwakeDisplay { _ in }
         monitor.setKeepAwake(false)
         XCTAssertFalse(monitor.keepAwakeDisplay)
         XCTAssertEqual(hw.preferences.values["keepAwakeDisplay"] as? Bool, false)
@@ -1165,7 +1252,7 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         let hw = Hardware(), monitor = hw.monitor()
         monitor.refresh()
         monitor.setKeepAwake(true)
-        monitor.setKeepAwakeDisplay(true)
+        monitor.requestKeepAwakeDisplay { _ in }
         hw.connected = false
         monitor.refresh()
         XCTAssertFalse(monitor.keepAwakeEnabled)
@@ -1199,7 +1286,7 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         let hw = Hardware(), monitor = hw.monitor()
         monitor.refresh()
         monitor.setKeepAwake(true)
-        monitor.setKeepAwakeDisplay(true)
+        monitor.requestKeepAwakeDisplay { _ in }
         hw.unreadable = true
         monitor.refresh()
         XCTAssertTrue(monitor.keepAwakeEnabled, "Unknown is not unplugged")

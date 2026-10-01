@@ -575,6 +575,9 @@ struct ContentView: View {
     @State private var showAbout = false
     /// The warning sheet shown before Keep Awake's display option turns on.
     @State private var confirmKeepAwakeDisplay = false
+    /// Why the authentication behind that sheet could not confirm the
+    /// owner, shown in the sheet; nil until a prompt fails.
+    @State private var keepAwakeDisplayFailure: String?
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
     @State private var pinHovering = false
 
@@ -1188,16 +1191,18 @@ struct ContentView: View {
             // session and turns both off, and plugging back in starts
             // nothing. The display option is an option of the running
             // session, so it is also disabled while the toggle is off, and
-            // confirmed on the way on (the sheet below): it is the one
-            // switch here that changes who can use the Mac, not just
+            // on the way on it is confirmed (the sheet below) and then
+            // the owner authenticates (requestKeepAwakeDisplay): it is the
+            // one switch here that changes who can use the Mac, not just
             // whether it sleeps.
             Toggle(isOn: Binding(
                 get: { monitor.keepAwakeDisplay },
                 set: { on in
                     if on {
+                        keepAwakeDisplayFailure = nil
                         confirmKeepAwakeDisplay = true
                     } else {
-                        monitor.setKeepAwakeDisplay(false)
+                        monitor.turnOffKeepAwakeDisplay()
                     }
                 }
             )) {
@@ -1212,7 +1217,7 @@ struct ContentView: View {
                 ? "Unavailable while Keep Awake is off: turn Keep Awake on first, then turn this on to keep the display on during the session; the Mac will then not lock on its own."
                 : monitor.keepAwakeDisplay
                 ? "On: the display stays on during this Keep Awake session, so the Mac does not lock on its own. Turn off to let the display sleep and the screen lock as usual. Turns off with Keep Awake."
-                : "Off: the display sleeps and the screen locks on its own schedule. Turn on to keep the display on during this Keep Awake session; the Mac will then not lock on its own.")
+                : "Off: the display sleeps and the screen locks on its own schedule. Turn on to keep the display on during this Keep Awake session; the Mac will then not lock on its own. Asks for Touch ID or your password.")
             Picker("", selection: Binding(
                 get: { monitor.keepAwakeMinutes },
                 set: { monitor.setKeepAwakeDuration(minutes: $0) }
@@ -1244,26 +1249,51 @@ struct ContentView: View {
         }
     }
 
-    /// Shown before the display option turns on: what it gives up, and
-    /// what it cannot promise. The option only turns on from its button.
+    /// Shown before the display option turns on: what it gives up, what
+    /// it cannot promise, and that the owner confirms it. The option only
+    /// turns on from its button, and only after the authentication prompt
+    /// (requestKeepAwakeDisplay). The sheet waits for the prompt's answer
+    /// with both buttons disabled (the prompt's own Cancel is the way
+    /// out), and stays up on a declined or failed prompt so the user can
+    /// try again or cancel; sheetVisible pins the popover open for the
+    /// whole of it, prompt included.
     private var keepAwakeDisplayWarning: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Keep the display on?")
                 .font(.headline)
-            Text("While this Keep Awake session runs, the display stays on and the Mac does not lock on its own. Anyone at the Mac can use it until you lock it or the session ends.")
+            Text("While this Keep Awake session runs, the display stays on and the Mac does not lock on its own. Anyone at the Mac can use it until you lock it or the session ends, so turning this on asks for Touch ID or your password first.")
                 .font(.system(size: 12))
             Text("A screen saver that is set to start may still start and lock the screen. Closing the lid, a hot corner, a manual lock, and a lock your organization manages all work as before. Turning Keep Awake off or unplugging the power adapter ends the session and turns this off.")
                 .font(.system(size: 12))
                 .foregroundColor(.secondary)
+            // A line of its own: beside the buttons, a long system
+            // message would squeeze them into truncation.
+            if let why = keepAwakeDisplayFailure {
+                Text(why)
+                    .font(.system(size: 11))
+                    .foregroundColor(.red)
+            }
             HStack {
+                if monitor.keepAwakeDisplayAuthenticating {
+                    ProgressView()
+                        .controlSize(.small)
+                }
                 Spacer()
                 Button("Cancel") { confirmKeepAwakeDisplay = false }
                     .keyboardShortcut(.cancelAction)
+                    .disabled(monitor.keepAwakeDisplayAuthenticating)
                 Button("Keep Display On") {
-                    monitor.setKeepAwakeDisplay(true)
-                    confirmKeepAwakeDisplay = false
+                    keepAwakeDisplayFailure = nil
+                    monitor.requestKeepAwakeDisplay { end in
+                        switch end {
+                        case .on, .noSession: confirmKeepAwakeDisplay = false
+                        case .declined: break
+                        case .failed(let why): keepAwakeDisplayFailure = why
+                        }
+                    }
                 }
                 .keyboardShortcut(.defaultAction)
+                .disabled(monitor.keepAwakeDisplayAuthenticating)
             }
         }
         .padding(20)

@@ -13,6 +13,7 @@ let package = Package(
             linkerSettings: [
                 .linkedFramework("IOKit"),
                 .linkedFramework("AppKit"),
+                .linkedFramework("LocalAuthentication"),
             ]
         ),
         .executableTarget(
