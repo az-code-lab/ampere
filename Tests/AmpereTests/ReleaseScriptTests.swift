@@ -49,9 +49,8 @@ final class ReleaseScriptTests: XCTestCase {
 
     /// The keychain lookup the script picks its signing identity with, lifted
     /// out of its `SIGN_IDENTITY="$( … )"` so a test can run the real pipeline
-    /// against a fabricated keychain. The closing `)"` is matched at a line
-    /// end on purpose: the `sed` inside the substitution holds a `\)"` of its
-    /// own, and the first plain `)"` in the text is that one.
+    /// against a fabricated keychain. Match the closing `)"` at a line end
+    /// so quoted pipeline arguments aren't mistaken for the boundary.
     private func identityLookup() throws -> String? {
         let text = try scriptText()
         guard let open = text.range(of: "SIGN_IDENTITY=\"$("),
@@ -101,7 +100,7 @@ final class ReleaseScriptTests: XCTestCase {
         // Execute only the real preflight. Stop before any signing, build,
         // tag mutation, or publishing; .project.env is an empty fixture.
         let text = try scriptText()
-        let boundary = try XCTUnwrap(text.range(of: "# Match on the certificate"))
+        let boundary = try XCTUnwrap(text.range(of: "# Select the G2 release certificate"))
         let probe = repo.appending(path: "release.sh")
         try (String(text[..<boundary.lowerBound]) + "printf 'guard passed\\n'\n")
             .write(to: probe, atomically: true, encoding: .utf8)
@@ -179,6 +178,11 @@ final class ReleaseScriptTests: XCTestCase {
         // fabricated keychain, with `cat` standing in for the query.
         let lookup = try XCTUnwrap(identityLookup(),
                                    "release.sh no longer looks its signing identity up in the keychain")
+        let configuration = try String(contentsOf: Self.repoRoot.appending(path: ".project.env"), encoding: .utf8)
+        let configured = bash("set -eu\n\(configuration)\nprintf '%s' \"$SIGNING_CERT_FINGERPRINT\"")
+        XCTAssertEqual(configured.status, 0)
+        let fingerprint = configured.output
+        XCTAssertEqual(fingerprint.count, 40)
         XCTAssertTrue(lookup.contains("security find-identity -v -p codesigning"),
                       "the identity comes from somewhere else now: \(lookup)")
 
@@ -187,26 +191,29 @@ final class ReleaseScriptTests: XCTestCase {
         let lookUp = { (keychain: [String]) in
             self.bash("""
                 set -euo pipefail
-                TEAM_ID="H7TH8723VJ"
+                \(configuration)
                 SIGN_IDENTITY="$(\(pipeline))"
                 printf '%s' "$SIGN_IDENTITY"
                 """,
                       stdin: (keychain + [""]).joined(separator: "\n"))
         }
 
-        let development = #"  1) AAAA "Apple Development: Qian Chen (H7TH8723VJ)""#
-        let developerID = #"  2) BBBB "Developer ID Application: Qian Chen (H7TH8723VJ)""#
-        let secondOne = #"  3) CCCC "Developer ID Application: Release Bot (H7TH8723VJ)""#
-        let otherTeam = #"  4) DDDD "Developer ID Application: Qian Chen (ZZZZZZZZZZ)""#
+        let development = "  1) \(fingerprint) \"Apple Development: Qian Chen (H7TH8723VJ)\""
+        let oldDeveloperID = #"  2) E68E6EE9BF85B8F33EB4DCFCC04A6ADDE706302C "Developer ID Application: Qian Chen (H7TH8723VJ)""#
+        let developerID = "  3) \(fingerprint) \"Developer ID Application: Qian Chen (H7TH8723VJ)\""
+        let otherTeam = "  4) \(fingerprint) \"Developer ID Application: Qian Chen (ZZZZZZZZZZ)\""
 
-        // The development certificate is listed FIRST, which is what the old
-        // `grep "$TEAM_ID" | head -1` would have taken.
-        let found = lookUp([development, developerID, secondOne])
-        XCTAssertEqual(found.status, 0)
-        XCTAssertEqual(found.output, "Developer ID Application: Qian Chen (H7TH8723VJ)",
-                       "the lookup picked \"\(found.output)\" — one identity, name only, first match")
+        // Old and new certificates share a name. Always return the new
+        // fingerprint, regardless of ordering or duplicate keychain entries.
+        for keychain in [[development, oldDeveloperID, developerID],
+                         [developerID, oldDeveloperID], [developerID, developerID]] {
+            let found = lookUp(keychain)
+            XCTAssertEqual(found.status, 0)
+            XCTAssertEqual(found.output, fingerprint,
+                           "the lookup must select only the pinned G2 certificate: \(found.output)")
+        }
 
-        for keychain in [[development], [development, otherTeam], []] {
+        for keychain in [[oldDeveloperID], [development], [development, otherTeam], []] {
             let missing = lookUp(keychain)
             XCTAssertEqual(missing.status, 0,
                            "the lookup exited \(missing.status) instead of leaving release.sh to say which certificate is missing")

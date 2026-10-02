@@ -8,7 +8,8 @@
 #   (replaces the tag, the GitHub release, and the cask entry)
 #
 # Prerequisites:
-#   - Xcode with Developer ID certificate
+#   - Xcode and the pinned Developer ID Application certificate with its
+#     private key (import the Application .p12 into each release Mac's login keychain)
 #   - Notarization credentials stored in keychain:
 #     xcrun notarytool store-credentials "Ampere"
 #   - GitHub CLI (gh) authenticated
@@ -45,21 +46,15 @@ if git rev-parse -q --verify "refs/tags/v$VERSION" > /dev/null && [ "$FORCE" != 
     exit 1
 fi
 
-# Match on the certificate NAME, not just the team: an "Apple Development"
-# certificate carries the team id too, and signing a release with it produces
-# a bundle Gatekeeper rejects on every machine that did not build it. Matching
-# the team alone left that to whatever `find-identity` happened to list first.
-#
-# `|| true`, with the emptiness test below as the only error path: a grep that
-# matches nothing exits 1, `set -o pipefail` fails the whole substitution on
-# it, and `set -e` ends the script right here — swallowing the one message
-# that names the certificate that is missing.
+# Select the G2 release certificate by fingerprint: older certificates can
+# have the same name.
+# Keep an empty lookup alive so the error below explains what to import.
 SIGN_IDENTITY="$(security find-identity -v -p codesigning \
-    | grep "Developer ID Application" | grep "$TEAM_ID" \
-    | sed -n '1s/.*"\(.*\)"/\1/p' || true)"
+    | grep -F "Developer ID Application:" | grep -F "($TEAM_ID)" \
+    | awk -v fingerprint="$SIGNING_CERT_FINGERPRINT" '$2 == fingerprint && !found { print $2; found = 1 }' || true)"
 if [ -z "$SIGN_IDENTITY" ]; then
-    echo "ERROR: no \"Developer ID Application\" certificate for team $TEAM_ID in the keychain"
-    echo "       Xcode > Settings > Accounts > Manage Certificates > + > Developer ID Application"
+    echo "ERROR: no valid pinned \"Developer ID Application\" certificate for team $TEAM_ID ($SIGNING_CERT_FINGERPRINT) in the keychain"
+    echo "       Import the new Application certificate and private key (.p12) into this Mac's login keychain, unlock it, and retry."
     exit 1
 fi
 BUILD_DIR="/tmp/${SCHEME}Build"
