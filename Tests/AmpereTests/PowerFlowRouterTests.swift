@@ -6,11 +6,15 @@ import XCTest
 /// The router decides which of the four cases the diagram renders (and
 /// therefore which nodes appear). Two regressions are worth nailing down:
 ///
-/// 1. **AC dead but plugged in** — when the adapter is reported connected
-///    but delivering exactly 0 W, the AC node must not render; routing
-///    must collapse to `.batteryOnly` so we don't draw a dangling "0 W"
-///    plug. (Originally surfaced as a stuck 0 W adapter node next to a
-///    battery that was actually draining.)
+/// 1. **AC dead but plugged in**: when the adapter is reported connected
+///    but delivering exactly 0 W while the battery drains, the AC node must
+///    not render; routing must collapse to `.batteryOnly` so we don't draw
+///    a dangling "0 W" plug. (Originally surfaced as a stuck 0 W adapter
+///    node next to a battery that was actually draining.) The draining
+///    battery is part of the rule: 0 W with the battery idle is the first
+///    registry snapshot after a wake, taken before the SMC sampled the
+///    input rail, and must keep the plug. Routing it to on-battery drew a
+///    Mac on AC as running on its battery.
 ///
 /// 2. **`isCharging` vs current sign disagreement** — during the
 ///    "Discharge to Upper Bound" startup transient, IOKit's `isCharging`
@@ -123,6 +127,36 @@ final class PowerFlowRouterTests: XCTestCase {
         XCTAssertEqual(
             PowerFlowRouter.compute(adapterConnected: true, adapterWatts: 22.0, batteryWatts: nil),
             .acOnly
+        )
+    }
+
+    // MARK: - Unsampled input rail
+
+    /// Regression: a 0 W adapter reading with the battery idle is not a dead
+    /// adapter. It is the first registry snapshot after a wake, published
+    /// before the SMC sampled the input rail (0 W in and 0 A from the
+    /// battery at once, which no running Mac can do), and macOS keeps it
+    /// for about a minute. The router must keep the plug: a Mac on AC was
+    /// drawn as running on its battery. readBattery drops such figures to
+    /// nil before they get here, so this also pins the fallback for any
+    /// caller that still passes the raw zero.
+    func testZeroWatts_BatteryIdle_KeepsAcPlug() {
+        XCTAssertEqual(
+            PowerFlowRouter.compute(adapterConnected: true, adapterWatts: 0.0, batteryWatts: 0.0),
+            .acOnly
+        )
+        XCTAssertEqual(
+            PowerFlowRouter.compute(adapterConnected: true, adapterWatts: 0.0, batteryWatts: nil),
+            .acOnly
+        )
+    }
+
+    /// Charging current with 0 W in is the same contradiction (the charge
+    /// can only come from the adapter), so it stays on the AC branches.
+    func testZeroWatts_BatteryCharging_KeepsAcPlug() {
+        XCTAssertEqual(
+            PowerFlowRouter.compute(adapterConnected: true, adapterWatts: 0.0, batteryWatts: 5.0),
+            .acToBoth
         )
     }
 }

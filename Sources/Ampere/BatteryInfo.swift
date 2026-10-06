@@ -3254,6 +3254,26 @@ final class BatteryMonitor: ObservableObject {
             .takeRetainedValue() as? Bool) ?? false
     }
 
+    /// Whether a registry snapshot's adapter telemetry is a reading that was
+    /// never taken. macOS rewrites the AppleSmartBattery entry about once a
+    /// minute, and the first snapshot after a wake can carry the input rail
+    /// before the SMC has sampled it: 0 W in while the battery supplies
+    /// nothing either. A running Mac draws from the adapter or the battery,
+    /// so that combination cannot be real. readBattery drops the adapter
+    /// figures for it, which the cards show as dashes and the diagram treats
+    /// as a plug delivering an unknown amount, instead of a dead adapter.
+    /// The dead adapter proper, 0 W in with the battery draining, stays a
+    /// measurement: that is what a broken cable or a brick unplugged at the
+    /// wall looks like. Charging current with no input is the same
+    /// contradiction and is dropped too. An unplugged Mac's 0 W is real, and
+    /// a missing dictionary (nil) has nothing to drop. The sign test is
+    /// strict, matching PowerFlowRouter: there is no noise floor. Internal
+    /// so AdapterTelemetryTests can pin it.
+    static func adapterTelemetryUnmeasured(pluggedIn: Bool, adapterWatts: Double?, amperage: Double?) -> Bool {
+        guard pluggedIn, adapterWatts == 0 else { return false }
+        return (amperage ?? 0) >= 0
+    }
+
     static func readBattery() -> BatteryState? {
         guard let snapshot = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
               let sources = IOPSCopyPowerSourcesList(snapshot)?.takeRetainedValue() as? [Any],
@@ -3363,6 +3383,20 @@ final class BatteryMonitor: ObservableObject {
             // live draw, so falling back would surface a constant lie. If
             // PowerTelemetryData is absent (very old Macs), leave nil and the
             // UI shows "—".
+        }
+
+        // The first snapshot after a wake can say 0 W in while the battery
+        // supplies nothing, a reading the SMC had not taken yet rather than
+        // a dead adapter (see adapterTelemetryUnmeasured). Drop the adapter
+        // figures, and the total load read from the same unsampled rail, so
+        // the cards show dashes and the diagram keeps the plug until the
+        // registry entry is rewritten. The battery's own current and voltage
+        // come from the gauge and stay.
+        if Self.adapterTelemetryUnmeasured(pluggedIn: isPluggedIn, adapterWatts: adapterWatts, amperage: amperage) {
+            adapterWatts = nil
+            adapterAmperage = nil
+            adapterVoltage = nil
+            totalLoadWatts = nil
         }
 
         // batteryWatts is only meaningful when we actually read both voltage

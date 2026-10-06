@@ -1891,19 +1891,27 @@ enum PowerFlowRouter {
         adapterWatts: Double?,
         batteryWatts: Double?
     ) -> PowerFlowCase {
-        // nil adapterWatts (very old Macs without PowerTelemetryData) — assume
-        // the cable is delivering an unknown but non-zero amount. A measured
-        // exactly 0 W with the cable plugged in is the "dead adapter" case
-        // (broken cable, brick unplugged at the wall, etc.) and should render
-        // as pure on-battery so we don't draw an empty node.
-        let acDelivering: Bool = (adapterWatts ?? 1) != 0
-        if !adapterConnected || !acDelivering { return .batteryOnly }
+        // nil adapterWatts is assumed to be a cable delivering an unknown but
+        // non-zero amount: very old Macs without PowerTelemetryData, and a
+        // snapshot whose input rail the SMC had not sampled yet (see
+        // BatteryMonitor.adapterTelemetryUnmeasured). A measured exactly 0 W
+        // with the cable plugged in is the "dead adapter" case (broken cable,
+        // brick unplugged at the wall, etc.) only while the battery drains,
+        // which is then the only place the Mac's power can come from; it
+        // renders as pure on-battery so we don't draw an empty node. A 0 W
+        // reading with the battery idle or charging cannot be true (an awake
+        // Mac draws from one or the other), so the plug stays: routing it to
+        // on-battery drew a Mac on AC as running on its battery for the
+        // minute after a wake, until the registry entry was rewritten.
+        if !adapterConnected { return .batteryOnly }
+        let batteryDraining = (batteryWatts ?? 0) < 0
+        if adapterWatts == 0 && batteryDraining { return .batteryOnly }
         // Base direction on batteryWatts' sign — the same raw measurement the
         // Battery Load card displays. Relying on IOKit's `isCharging` here
         // breaks consistency during state transitions (e.g. "Discharge to
         // Upper Bound" startup, where isCharging is already false but the
         // battery is still receiving current).
-        if (batteryWatts ?? 0) < 0 { return .acAndBattery }
+        if batteryDraining { return .acAndBattery }
         if (batteryWatts ?? 0) > 0 { return .acToBoth }
         return .acOnly
     }
