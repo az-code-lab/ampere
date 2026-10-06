@@ -24,6 +24,18 @@ public enum NativeChargeLimit {
     /// Darwin notification the agent observes to reload its preferences
     /// (it logs "Loaded Settings" the moment it is posted).
     public static let reloadNotification = "com.apple.smartcharging.defaultschanged"
+    /// Darwin notification powerd posts, with its state set to 1, when its
+    /// battery-gauging policy starts a charge to full: macOS charges the
+    /// battery to 100% every few weeks while a charge limit is in use, to
+    /// keep the gauge's state-of-charge estimate accurate (powerd's log:
+    /// "Last full charge date was 21.4 days ago, try and charge to full"),
+    /// and sets the state back to 0 when that charge is over. While it is 1
+    /// the agent still registers every target with powerd and powerd
+    /// ignores it ("SOC limit policy suspend due to mitigation active:1"),
+    /// so a hold on the limit holds nothing until it clears. The state is
+    /// public, needs no privileges, and reads 0 until powerd first posts
+    /// the notification after a boot.
+    public static let chargeToFullOverrideNotification = "com.apple.system.powersources.chargingtofulloverride"
     /// The private framework and client class behind System Settings'
     /// Charge Limit, and the manual-charge-limit selectors the helper's
     /// release path calls on it. Their presence is also how the app tells

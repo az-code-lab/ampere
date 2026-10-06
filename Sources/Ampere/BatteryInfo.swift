@@ -4,6 +4,7 @@ import CryptoKit
 import IOKit.ps
 import IOKit.pwr_mgt
 import Shared
+import notify
 
 /// Persistence is injected so integration tests can exercise real callbacks
 /// without changing the user's settings or invoking privileged operations.
@@ -99,6 +100,10 @@ final class BatteryMonitor: ObservableObject {
         /// The targets powerd currently enforces (`pmset -g battlimit`);
         /// nil when the tool could not be run.
         var registeredNativeLimits: () -> [Int]? = BatteryMonitor.readRegisteredNativeLimits
+        /// True while powerd's charge-to-full override is set: macOS is
+        /// charging the battery to 100% to calibrate its gauge and ignores
+        /// the charge limit meanwhile (see nativeChargeToFullOverride).
+        var chargeToFullOverride: () -> Bool = BatteryMonitor.readChargeToFullOverride
         var now: () -> Date = Date.init
         var writeHelper: (String) -> Bool = BatteryMonitor.executeHelper
         var helperInstalled: () -> Bool = {
@@ -176,6 +181,20 @@ final class BatteryMonitor: ObservableObject {
     /// animation targets read this so they can never disagree with the
     /// state machine about where charging will stop.
     var effectiveUpperBound: Int { chargeToFull ? 100 : chargeUpperBound }
+    /// Where the running charge will actually stop, for the ETA label:
+    /// effectiveUpperBound, except during macOS's own calibration charge
+    /// (nativeChargeToFullOverride), which goes to 100 whatever the state
+    /// machine holds at. The state machine keeps reading
+    /// effectiveUpperBound: its hold stands, macOS only ignores it.
+    var chargingTarget: Int { nativeLimitMode && nativeChargeToFullOverride ? 100 : effectiveUpperBound }
+    /// True while macOS's calibration charge is overriding something of
+    /// ours that the panel would otherwise describe as in force: in auto
+    /// mode a hold or a charge to the upper bound, in manual mode a pause.
+    /// A Charge to Full is not overridden; it was going to 100% anyway.
+    var chargeLimitOverridden: Bool {
+        nativeLimitMode && nativeChargeToFullOverride && !chargeToFull
+            && (autoManageEnabled || chargingPaused)
+    }
     /// Show the "77%" text beside the menu bar battery icon; off = icon
     /// only, halving the menu bar footprint. Lives here rather than in
     /// @AppStorage because AppDelegate (not the SwiftUI tree) renders the
@@ -510,6 +529,22 @@ final class BatteryMonitor: ObservableObject {
     /// control is bypassed while it is set, and the firmware, not a poll,
     /// stops the charge at the target.
     @Published private(set) var nativeLimitMode = false
+    /// True while powerd's charge-to-full override is set (io.
+    /// chargeToFullOverride, read at every native-mode poll): macOS is
+    /// charging the battery to 100% to calibrate its gauge, which it does
+    /// every few weeks while a charge limit is in use, and ignores the
+    /// limit until that charge is over. Nothing of ours can stop it, since
+    /// the limit is the only mechanism on this firmware. The state machine
+    /// runs as usual and its hold keeps following the level up, so the
+    /// limit is at the level the battery has reached whenever the override
+    /// clears, and the hold resumes right there (at 100%, as after a
+    /// Charge to Full). What changes while it is set: the status line and
+    /// the About panel say what is happening instead of "holding", the ETA
+    /// aims at full, and the health check reports "suspended" rather than
+    /// a pass on a limit nobody enforces. Whether the calibration charge
+    /// also overrides CHTE on firmware that has it is not known; it is
+    /// only watched in native mode, where the limit is the hold.
+    @Published private(set) var nativeChargeToFullOverride = false
     /// The target last handed to the helper in native mode; nil once
     /// released (the user's own macOS setting is back in force).
     private var nativeLimitWritten: Int?
@@ -2883,6 +2918,7 @@ final class BatteryMonitor: ObservableObject {
     /// check: prepareForSleep needs the target settled before it returns.
     private func nativeRefresh(_ battery: BatteryState?, beforeSleep: Bool = false) {
         guard let b = battery else { return }
+        updateChargeToFullOverride(b)
         // Explicit requests (manual Pause/Resume, cancelling a full charge)
         // apply immediately; the machine below then evaluates against them.
         if let pause = requestedChargingPaused {
@@ -3021,6 +3057,19 @@ final class BatteryMonitor: ObservableObject {
         nativeRefresh(io.battery(), beforeSleep: true)
     }
 
+    /// Track powerd's charge-to-full override (nativeChargeToFullOverride)
+    /// and log each edge with the level it happened at.
+    private func updateChargeToFullOverride(_ battery: BatteryState) {
+        let active = io.chargeToFullOverride()
+        guard active != nativeChargeToFullOverride else { return }
+        nativeChargeToFullOverride = active
+        if active {
+            AmpereLog.app("Ampere: macOS is charging to full to calibrate the battery (charge-to-full override at %d%%); the charge limit is ignored until it ends", battery.percentage)
+        } else {
+            AmpereLog.app("Ampere: macOS calibration charge ended at %d%%; the charge limit applies again", battery.percentage)
+        }
+    }
+
     /// Health check for native mode: the target powerd enforces (read
     /// through `pmset -g battlimit`) must be the one last written, and
     /// CHIE must be clear, since nothing writes it in this mode. The
@@ -3028,7 +3077,12 @@ final class BatteryMonitor: ObservableObject {
     /// the settle window is left unreported rather than flagged. A
     /// mismatch past it is repaired by re-issuing the write (silently the
     /// first time); one that survives a repair shows the warning, the same
-    /// contract as the CHTE repair.
+    /// contract as the CHTE repair. During macOS's calibration charge
+    /// (nativeChargeToFullOverride) the target is registered and ignored,
+    /// and `pmset -g battlimit` shows no sign of that: a pass would say the
+    /// hold is in force, so the check reports "suspended" with the
+    /// registered limit marked as ignored, repairs nothing, and resumes the
+    /// comparison when the override clears.
     private func performNativeHealthCheck(battery: BatteryState) {
         guard let registered = io.registeredNativeLimits(),
               let chieBytes = io.readKey(SMC.keyChargeInhibit), chieBytes.count == 1 else {
@@ -3039,35 +3093,41 @@ final class BatteryMonitor: ObservableObject {
         let chieHex = Self.formatHex(chieBytes)
         let actualLimit = registered.first.map { "\($0)%" } ?? "none"
         let expectedLimit = nativeLimitWritten.map { "\($0)%" }
-        let limitMatch = nativeLimitWritten.map { registered.contains($0) } ?? true
         let chieMatch = chie == SMC.chieNormalInt
-        let settling = nativeLimitWrittenAt.map { io.now().timeIntervalSince($0) < Self.nativeLimitSettleSeconds } ?? false
-        if !limitMatch && settling { return }
+        var limitMatch = nativeLimitWritten.map { registered.contains($0) } ?? true
 
-        let newSMC = "macOS limit=\(actualLimit)\n\(SMC.keyChargeInhibit)=\(chieHex)"
+        var newSMC = "macOS limit=\(actualLimit)\n\(SMC.keyChargeInhibit)=\(chieHex)"
         let newStatus: String
         var newExpected = ""
         var newWarning: String?
-        if limitMatch && chieMatch {
-            newStatus = "pass"
-            nativeRepairAttempted = false
+        if nativeChargeToFullOverride && chieMatch {
+            newStatus = "suspended"
+            newSMC = "macOS limit=\(actualLimit) (ignored by macOS)\n\(SMC.keyChargeInhibit)=\(chieHex)"
+            limitMatch = true
         } else {
-            newStatus = "FAIL"
-            newExpected = "macOS limit=\(expectedLimit ?? "none")\n\(SMC.keyChargeInhibit)=\(SMC.chieNormalHex)"
-            AmpereLog.app("Ampere: Health check failed — macOS limit=%@ expected=%@ CHIE=%d charge=%d%%",
-                  actualLimit, expectedLimit ?? "none", chie, battery.percentage)
-            if !limitMatch {
-                // Re-issue the target on the next tick by forgetting what
-                // was written; the write path logs the outcome. Unconfirmed
-                // makes that write unconditional, so an intent that has
-                // since become a release still releases.
-                newWarning = nativeRepairAttempted ? Self.smcMismatchWarning : nil
-                nativeRepairAttempted = true
-                nativeLimitWritten = nil
-                nativeLimitIntent = nil
-                nativeLimitUnconfirmed = true
+            let settling = nativeLimitWrittenAt.map { io.now().timeIntervalSince($0) < Self.nativeLimitSettleSeconds } ?? false
+            if !limitMatch && settling { return }
+            if limitMatch && chieMatch {
+                newStatus = "pass"
+                nativeRepairAttempted = false
             } else {
-                newWarning = Self.smcMismatchWarning
+                newStatus = "FAIL"
+                newExpected = "macOS limit=\(expectedLimit ?? "none")\n\(SMC.keyChargeInhibit)=\(SMC.chieNormalHex)"
+                AmpereLog.app("Ampere: Health check failed — macOS limit=%@ expected=%@ CHIE=%d charge=%d%%",
+                      actualLimit, expectedLimit ?? "none", chie, battery.percentage)
+                if !limitMatch {
+                    // Re-issue the target on the next tick by forgetting what
+                    // was written; the write path logs the outcome. Unconfirmed
+                    // makes that write unconditional, so an intent that has
+                    // since become a release still releases.
+                    newWarning = nativeRepairAttempted ? Self.smcMismatchWarning : nil
+                    nativeRepairAttempted = true
+                    nativeLimitWritten = nil
+                    nativeLimitIntent = nil
+                    nativeLimitUnconfirmed = true
+                } else {
+                    newWarning = Self.smcMismatchWarning
+                }
             }
         }
         let changed = lastHealthCheckStatus != newStatus
@@ -3104,6 +3164,25 @@ final class BatteryMonitor: ObservableObject {
         } catch {
             return nil
         }
+    }
+
+    /// The state of powerd's charge-to-full override notification
+    /// (NativeChargeLimit.chargeToFullOverrideNotification): true while
+    /// macOS's calibration charge runs. The token is registered the first
+    /// time it is read and kept; a registration the system refuses reads as
+    /// no override and is tried again at the next poll. Main thread only,
+    /// like every other read the poll makes.
+    private static var chargeToFullOverrideToken: Int32?
+    private static func readChargeToFullOverride() -> Bool {
+        if chargeToFullOverrideToken == nil {
+            var token: Int32 = 0
+            // 0 is NOTIFY_STATUS_OK.
+            guard notify_register_check(NativeChargeLimit.chargeToFullOverrideNotification, &token) == 0 else { return false }
+            chargeToFullOverrideToken = token
+        }
+        guard let token = chargeToFullOverrideToken else { return false }
+        var state: UInt64 = 0
+        return notify_get_state(token, &state) == 0 && state != 0
     }
 
     /// Format raw SMC bytes as hex string, e.g. "0x01 00 00 00".

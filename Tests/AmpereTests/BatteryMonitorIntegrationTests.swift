@@ -51,6 +51,9 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         /// False: the helper's native-limit writes succeed but powerd never
         /// applies them (`registered` stays as it is).
         var enforcesLimits = true
+        /// True: powerd's charge-to-full override is set (macOS is charging
+        /// to full to calibrate the battery and ignores every limit).
+        var chargeToFullOverride = false
         var clock = Date()
         /// What the owner answers at the authentication prompt behind the
         /// display option; nil leaves the prompt up until answerPrompt.
@@ -174,6 +177,7 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
                 self.lock.lock(); defer { self.lock.unlock() }
                 return self.limitsReadable ? self.registered : nil
             }
+            io.chargeToFullOverride = { self.chargeToFullOverride }
             io.now = { self.clock }
             io.writeHelper = write
             io.helperInstalled = { self.installed }
@@ -777,6 +781,88 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         drainCallbacks()
         XCTAssertFalse(monitor.activeDischarging)
         XCTAssertEqual(hw.writes.filter { $0.hasPrefix("native-limit:") }, ["native-limit:60"])
+    }
+
+    /// macOS's own calibration charge: powerd sets its charge-to-full
+    /// override, charges the battery to 100%, and ignores the limit
+    /// meanwhile, while still registering every target it is handed. The
+    /// panel must not call that a hold (the status line and the ETA read
+    /// the published flag and chargingTarget), the health check must not
+    /// pass on a limit nobody enforces, and the hold must keep following
+    /// the level up so that when the override clears the limit is where
+    /// the battery is and the hold resumes there, as after Charge to Full.
+    func testNativeMode_MacOSCalibrationChargeOverridesTheHold() {
+        let hw = Hardware()
+        hw.percentage = 47
+        let monitor = nativeMonitor(hw)
+        XCTAssertEqual(hw.writes.last, "native-limit:47")
+        XCTAssertTrue(monitor.chargingPaused)
+        for _ in 0..<5 { monitor.refresh() }
+        drainCallbacks()
+        XCTAssertEqual(monitor.lastHealthCheckStatus, "pass")
+        XCTAssertEqual(monitor.lastHealthCheckSMC, "macOS limit=47%\nCHIE=0x00")
+        XCTAssertFalse(monitor.nativeChargeToFullOverride)
+        XCTAssertFalse(monitor.chargeLimitOverridden)
+        XCTAssertEqual(monitor.chargingTarget, 60)
+
+        // The override begins and the level starts climbing.
+        hw.chargeToFullOverride = true
+        hw.percentage = 48
+        monitor.refresh()
+        XCTAssertTrue(monitor.nativeChargeToFullOverride, "Read on the poll that saw it")
+        XCTAssertTrue(monitor.chargeLimitOverridden)
+        XCTAssertEqual(monitor.chargingTarget, 100, "The ETA aims at full")
+        awaitCondition { hw.writes.last == "native-limit:48" }
+        drainCallbacks()
+        monitor.refresh()
+        drainCallbacks()
+        XCTAssertEqual(monitor.lastHealthCheckStatus, "suspended")
+        XCTAssertEqual(monitor.lastHealthCheckSMC, "macOS limit=48% (ignored by macOS)\nCHIE=0x00")
+        XCTAssertEqual(monitor.lastHealthCheckExpected, "")
+        XCTAssertNil(monitor.healthWarning)
+        XCTAssertTrue(monitor.chargingPaused, "The state machine's hold stands; only macOS ignores it")
+        XCTAssertFalse(monitor.chargeToUpperBound)
+
+        // Full. The hold has followed the level there.
+        hw.percentage = 100
+        monitor.refresh()
+        awaitCondition { hw.writes.last == "native-limit:100" }
+        drainCallbacks()
+        monitor.refresh()
+        drainCallbacks()
+        XCTAssertEqual(monitor.lastHealthCheckSMC, "macOS limit=100% (ignored by macOS)\nCHIE=0x00")
+
+        // The override clears: the limit applies again, at the level the
+        // battery is at, and the hold resumes there with discharge off.
+        hw.chargeToFullOverride = false
+        monitor.refresh()
+        drainCallbacks()
+        XCTAssertFalse(monitor.nativeChargeToFullOverride)
+        XCTAssertFalse(monitor.chargeLimitOverridden)
+        XCTAssertEqual(monitor.chargingTarget, 60)
+        XCTAssertEqual(monitor.lastHealthCheckStatus, "pass")
+        XCTAssertEqual(monitor.lastHealthCheckSMC, "macOS limit=100%\nCHIE=0x00")
+        XCTAssertTrue(monitor.chargingPaused)
+        XCTAssertFalse(monitor.activeDischarging)
+        XCTAssertEqual(hw.writes.filter { $0.hasPrefix("native-limit:") },
+                       ["native-limit:47", "native-limit:48", "native-limit:100"])
+    }
+
+    /// A Charge to Full is not overridden by the calibration charge: both
+    /// go to 100, so the panel keeps describing the user's own request.
+    func testNativeMode_CalibrationChargeDoesNotOverrideAChargeToFull() {
+        let hw = Hardware()
+        hw.percentage = 50
+        let monitor = nativeMonitor(hw)
+        monitor.setChargeToFull(true)
+        awaitCondition { hw.writes.last == "native-limit:100" }
+        drainCallbacks()
+        hw.chargeToFullOverride = true
+        monitor.refresh()
+        drainCallbacks()
+        XCTAssertTrue(monitor.nativeChargeToFullOverride)
+        XCTAssertFalse(monitor.chargeLimitOverridden)
+        XCTAssertEqual(monitor.chargingTarget, 100)
     }
 
     func testNativeMode_AboveUpperWithoutDischargeHoldsWhereItIs() {

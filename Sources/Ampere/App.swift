@@ -800,7 +800,8 @@ struct ContentView: View {
                             Text(monitor.lastHealthCheckStatus)
                                 .font(.system(size: 12, weight: .semibold))
                                 .foregroundColor(monitor.lastHealthCheckStatus == "pass" ? .green
-                                    : monitor.lastHealthCheckStatus == "FAIL" ? .red : .primary)
+                                    : monitor.lastHealthCheckStatus == "FAIL" ? .red
+                                    : monitor.lastHealthCheckStatus == "suspended" ? .orange : .primary)
                         }
                         Spacer()
                         Link(destination: URL(string: "https://amperebattery.app/tech.html#health")!) {
@@ -855,6 +856,13 @@ struct ContentView: View {
                         Text("Charge control: macOS charge limit (this firmware has no CHTE key).")
                             .font(.system(size: 12))
                             .foregroundColor(.secondary)
+                        // macOS's own calibration charge, which that limit
+                        // cannot stop (BatteryMonitor.nativeChargeToFullOverride).
+                        if monitor.nativeChargeToFullOverride, monitor.state?.adapterConnected == true {
+                            Text("macOS is charging the battery to full to calibrate its gauge, as it does every few weeks under a charge limit, and ignores the limit until it finishes. Ampere then holds at the level reached; Discharge to Upper Bound brings it back down.")
+                                .font(.system(size: 12))
+                                .foregroundColor(.orange)
+                        }
                     } else if monitor.chargeControlHold == .noMechanism {
                         Text("Charge control: unavailable. This firmware has no CHTE key, and this macOS has no charge limit (System Settings > Battery) to hand a target to; Ampere monitors only.")
                             .font(.system(size: 12))
@@ -962,6 +970,15 @@ struct ContentView: View {
         if let error = monitor.lastError { return error }
         if let warning = monitor.healthWarning { return warning }
         if let warning = monitor.recoveryWarning { return warning }
+        // macOS's own calibration charge (BatteryMonitor.
+        // nativeChargeToFullOverride): the limit that does the holding on
+        // this firmware is ignored until it ends, so neither "holding" nor
+        // "charging to 70%" would be true, and nothing of ours can stop it.
+        if monitor.chargeLimitOverridden && state.adapterConnected {
+            return monitor.autoManageEnabled
+                ? "Auto: overridden — macOS is charging to full to calibrate the battery"
+                : "Pause overridden — macOS is charging to full to calibrate the battery"
+        }
         if monitor.activeDischarging {
             // Native mode: the firmware drains to the bound on its own once
             // the macOS charge limit applies (up to a minute after the
@@ -1027,6 +1044,10 @@ struct ContentView: View {
         if monitor.lastError != nil { return .red }
         if monitor.healthWarning != nil { return .red }
         if monitor.recoveryWarning != nil { return .red }
+        // Mirrors statusMessage's override branch: orange, like the other
+        // states where something other than the user's setting has the
+        // battery.
+        if monitor.chargeLimitOverridden && state.adapterConnected { return .orange }
         if monitor.activeDischarging { return .orange }
         // Mirrors statusMessage's sleep-hold branch: same orange treatment
         // as discharge, since both mean "sleep is being overridden".
@@ -1723,9 +1744,10 @@ extension BatteryMonitor {
             amperage: state.amperage,
             autoManageEnabled: autoManageEnabled,
             activeDischarging: activeDischarging,
-            // Effective bound: while charge-to-full is active the charging
-            // target is 100, which also selects the "to full" suffix.
-            upperBound: effectiveUpperBound
+            // Where the charge stops: 100 while charge-to-full is active
+            // and during macOS's calibration charge, which also selects the
+            // "to full" suffix; otherwise the upper bound.
+            upperBound: chargingTarget
         )
         return eta.isEmpty ? state.timeRemaining : eta
     }
