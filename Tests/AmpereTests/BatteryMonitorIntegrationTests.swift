@@ -791,6 +791,9 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
     /// pass on a limit nobody enforces, and the hold must keep following
     /// the level up so that when the override clears the limit is where
     /// the battery is and the hold resumes there, as after Charge to Full.
+    /// Full does not end the override (powerd lifts it by the clock, about
+    /// 12 hours after it began): the panel then says the charge is done
+    /// and the wait is on (nativeCalibrationChargeDone), still suspended.
     func testNativeMode_MacOSCalibrationChargeOverridesTheHold() {
         let hw = Hardware()
         hw.percentage = 47
@@ -803,6 +806,7 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         XCTAssertEqual(monitor.lastHealthCheckSMC, "macOS limit=47%\nCHIE=0x00")
         XCTAssertFalse(monitor.nativeChargeToFullOverride)
         XCTAssertFalse(monitor.chargeLimitOverridden)
+        XCTAssertFalse(monitor.nativeCalibrationChargeDone)
         XCTAssertEqual(monitor.chargingTarget, 60)
 
         // The override begins and the level starts climbing.
@@ -812,6 +816,7 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         XCTAssertTrue(monitor.nativeChargeToFullOverride, "Read on the poll that saw it")
         XCTAssertTrue(monitor.chargeLimitOverridden)
         XCTAssertEqual(monitor.chargingTarget, 100, "The ETA aims at full")
+        XCTAssertFalse(monitor.nativeCalibrationChargeDone, "Not full yet")
         awaitCondition { hw.writes.last == "native-limit:48" }
         drainCallbacks()
         monitor.refresh()
@@ -831,6 +836,10 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         monitor.refresh()
         drainCallbacks()
         XCTAssertEqual(monitor.lastHealthCheckSMC, "macOS limit=100% (ignored by macOS)\nCHIE=0x00")
+        XCTAssertEqual(monitor.lastHealthCheckStatus, "suspended", "Full battery or not, nobody enforces the limit")
+        XCTAssertTrue(monitor.nativeChargeToFullOverride, "Full does not end the override; powerd lifts it by the clock")
+        XCTAssertTrue(monitor.chargeLimitOverridden)
+        XCTAssertTrue(monitor.nativeCalibrationChargeDone, "The charge is done and the wait is on")
 
         // The override clears: the limit applies again, at the level the
         // battery is at, and the hold resumes there with discharge off.
@@ -839,6 +848,7 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         drainCallbacks()
         XCTAssertFalse(monitor.nativeChargeToFullOverride)
         XCTAssertFalse(monitor.chargeLimitOverridden)
+        XCTAssertFalse(monitor.nativeCalibrationChargeDone)
         XCTAssertEqual(monitor.chargingTarget, 60)
         XCTAssertEqual(monitor.lastHealthCheckStatus, "pass")
         XCTAssertEqual(monitor.lastHealthCheckSMC, "macOS limit=100%\nCHIE=0x00")
@@ -863,6 +873,27 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         XCTAssertTrue(monitor.nativeChargeToFullOverride)
         XCTAssertFalse(monitor.chargeLimitOverridden)
         XCTAssertEqual(monitor.chargingTarget, 100)
+    }
+
+    /// A worn battery's BMS can end the calibration charge below a
+    /// displayed 100%: the gauge's fully-charged flag, not the percentage,
+    /// says the charge is done, as for every other bound at 100.
+    func testNativeMode_CalibrationChargeDoneWhenFullyChargedBelow100() {
+        let hw = Hardware()
+        hw.percentage = 50
+        let monitor = nativeMonitor(hw)
+        hw.chargeToFullOverride = true
+        hw.percentage = 99
+        monitor.refresh()
+        awaitCondition { hw.writes.last == "native-limit:99" }
+        drainCallbacks()
+        XCTAssertTrue(monitor.chargeLimitOverridden)
+        XCTAssertFalse(monitor.nativeCalibrationChargeDone)
+        hw.full = true
+        monitor.refresh()
+        drainCallbacks()
+        XCTAssertTrue(monitor.nativeCalibrationChargeDone)
+        XCTAssertTrue(monitor.chargeLimitOverridden, "Done is not over: the override stands until powerd's next check")
     }
 
     func testNativeMode_AboveUpperWithoutDischargeHoldsWhereItIs() {

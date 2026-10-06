@@ -857,9 +857,13 @@ struct ContentView: View {
                             .font(.system(size: 12))
                             .foregroundColor(.secondary)
                         // macOS's own calibration charge, which that limit
-                        // cannot stop (BatteryMonitor.nativeChargeToFullOverride).
+                        // cannot stop (BatteryMonitor.nativeChargeToFullOverride),
+                        // and the wait for powerd's clock once the battery is
+                        // full (nativeCalibrationChargeDone).
                         if monitor.nativeChargeToFullOverride, monitor.state?.adapterConnected == true {
-                            Text("macOS is charging the battery to full to calibrate its gauge, as it does every few weeks under a charge limit, and ignores the limit until it finishes. Ampere then holds at the level reached; Discharge to Upper Bound brings it back down.")
+                            Text(monitor.nativeCalibrationChargeDone
+                                ? "The calibration charge is done: the battery is full and resting. macOS keeps ignoring the charge limit until its next policy check, about 12 hours after the charge began, later if the Mac sleeps through it; nothing ends it sooner, a restart included. Ampere then holds at the level reached; Discharge to Upper Bound brings it back down."
+                                : "macOS is charging the battery to full to calibrate its gauge, as it does every few weeks under a charge limit, and ignores the limit until it finishes. Ampere then holds at the level reached; Discharge to Upper Bound brings it back down.")
                                 .font(.system(size: 12))
                                 .foregroundColor(.orange)
                         }
@@ -974,7 +978,16 @@ struct ContentView: View {
         // nativeChargeToFullOverride): the limit that does the holding on
         // this firmware is ignored until it ends, so neither "holding" nor
         // "charging to 70%" would be true, and nothing of ours can stop it.
+        // Once the battery is full the charge is done but the override is
+        // not: powerd lifts it by the clock, about 12 hours after it began
+        // (nativeCalibrationChargeDone), so the line says that instead of
+        // "charging to full" for a battery that is full and resting.
         if monitor.chargeLimitOverridden && state.adapterConnected {
+            if monitor.nativeCalibrationChargeDone {
+                return monitor.autoManageEnabled
+                    ? "Auto: overridden — calibration charge done, macOS lifts the override within about 12 hours"
+                    : "Pause overridden — calibration charge done, macOS lifts the override within about 12 hours"
+            }
             return monitor.autoManageEnabled
                 ? "Auto: overridden — macOS is charging to full to calibrate the battery"
                 : "Pause overridden — macOS is charging to full to calibrate the battery"

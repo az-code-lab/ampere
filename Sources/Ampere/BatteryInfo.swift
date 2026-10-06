@@ -545,6 +545,15 @@ final class BatteryMonitor: ObservableObject {
     /// also overrides CHTE on firmware that has it is not known; it is
     /// only watched in native mode, where the limit is the hold.
     @Published private(set) var nativeChargeToFullOverride = false
+    /// True while that override is set and the battery already reports
+    /// full (fullyCharged, or 100%): the calibration charge is done and
+    /// the wait is on. powerd lifts the override by the clock, at its next
+    /// policy check about 12 hours after the charge began (later if the
+    /// Mac sleeps through the hourly alarm that runs it), not when the
+    /// battery fills, so the limit stays ignored for hours with the
+    /// battery full and resting; the status line and the About panel say
+    /// so instead of "charging to full". Logged once per override.
+    @Published private(set) var nativeCalibrationChargeDone = false
     /// The target last handed to the helper in native mode; nil once
     /// released (the user's own macOS setting is back in force).
     private var nativeLimitWritten: Int?
@@ -3058,15 +3067,24 @@ final class BatteryMonitor: ObservableObject {
     }
 
     /// Track powerd's charge-to-full override (nativeChargeToFullOverride)
-    /// and log each edge with the level it happened at.
+    /// and, within it, whether the battery has reached full
+    /// (nativeCalibrationChargeDone), logging each edge with the level it
+    /// happened at.
     private func updateChargeToFullOverride(_ battery: BatteryState) {
         let active = io.chargeToFullOverride()
-        guard active != nativeChargeToFullOverride else { return }
-        nativeChargeToFullOverride = active
-        if active {
-            AmpereLog.app("Ampere: macOS is charging to full to calibrate the battery (charge-to-full override at %d%%); the charge limit is ignored until it ends", battery.percentage)
-        } else {
-            AmpereLog.app("Ampere: macOS calibration charge ended at %d%%; the charge limit applies again", battery.percentage)
+        if active != nativeChargeToFullOverride {
+            nativeChargeToFullOverride = active
+            if active {
+                AmpereLog.app("Ampere: macOS is charging to full to calibrate the battery (charge-to-full override at %d%%); the charge limit is ignored until it ends", battery.percentage)
+            } else {
+                AmpereLog.app("Ampere: macOS calibration charge ended at %d%%; the charge limit applies again", battery.percentage)
+            }
+        }
+        let done = active && Self.reachedBound(100, percentage: battery.percentage, fullyCharged: battery.fullyCharged)
+        guard done != nativeCalibrationChargeDone else { return }
+        nativeCalibrationChargeDone = done
+        if done {
+            AmpereLog.app("Ampere: macOS calibration charge reached full at %d%%; macOS lifts its override at its next policy check, about 12 hours after the charge began", battery.percentage)
         }
     }
 
