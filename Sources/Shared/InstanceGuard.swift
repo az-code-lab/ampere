@@ -9,7 +9,8 @@ import Darwin
 /// that started first keeps control; a later one stands by until it is gone.
 ///
 /// Shared with the helper, whose cleanup job must not uninstall anything
-/// while a copy of the app is still running.
+/// while a copy of the app still runs from somewhere on disk, and waits
+/// for a copy deleted while running to quit (see executableLocation).
 public enum InstanceGuard {
     public struct Instance: Equatable {
         public let pid: pid_t
@@ -67,6 +68,37 @@ public enum InstanceGuard {
             let start = entry.kp_proc.p_un.__p_starttime
             return Instance(pid: entry.kp_proc.p_pid, uid: entry.kp_eproc.e_ucred.cr_uid,
                             startSeconds: start.tv_sec, startMicroseconds: start.tv_usec)
+        }
+    }
+
+    /// Where a running process's executable is, as the kernel names it.
+    public enum ExecutableLocation: Equatable {
+        /// On disk at this path: the kernel follows a rename, so a bundle
+        /// moved while the app runs answers with its new location.
+        case at(String)
+        /// The process runs on, but its executable was deleted from under
+        /// it: the kernel can no longer name the file (ENOENT).
+        case deleted
+        /// The process exited since it was listed (ESRCH).
+        case exited
+        /// The kernel did not say (any other error).
+        case unknown
+    }
+
+    /// The executable `pid` runs, through `proc_pidpath`. Verified on
+    /// macOS 27 with a process whose executable was moved, then trashed,
+    /// then deleted while it ran: the path followed each move, and the
+    /// deletion made the lookup fail with "no such file or directory".
+    /// The cleanup job tells a moved copy of the app from a deleted one by
+    /// this (see CleanupDaemon.verdict).
+    public static func executableLocation(of pid: pid_t) -> ExecutableLocation {
+        var buffer = [CChar](repeating: 0, count: 4 * Int(PATH_MAX))
+        let length = proc_pidpath(pid, &buffer, UInt32(buffer.count))
+        if length > 0 { return .at(String(cString: buffer)) }
+        switch errno {
+        case ENOENT: return .deleted
+        case ESRCH: return .exited
+        default: return .unknown
         }
     }
 

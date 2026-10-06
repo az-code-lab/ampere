@@ -87,13 +87,37 @@ final class CleanupDaemonTests: XCTestCase {
     }
 
     func testAMissingBundleCountsAsAnUninstallOnlyWhenItIsReallyGone() {
-        XCTAssertTrue(CleanupDaemon.shouldUninstall(bundleExists: false, parentExists: true, appRunning: false))
-        XCTAssertFalse(CleanupDaemon.shouldUninstall(bundleExists: true, parentExists: true, appRunning: false),
-                       "still installed")
-        XCTAssertFalse(CleanupDaemon.shouldUninstall(bundleExists: false, parentExists: false, appRunning: false),
-                       "volume not mounted")
-        XCTAssertFalse(CleanupDaemon.shouldUninstall(bundleExists: false, parentExists: true, appRunning: true),
-                       "moved while running")
+        typealias Location = InstanceGuard.ExecutableLocation
+        let moved = "/Users/me/Applications/Ampere.app/Contents/MacOS/Ampere"
+        let trashed = "/Users/me/.Trash/Ampere.app/Contents/MacOS/Ampere"
+        let onDisk: Set<String> = [moved, trashed]
+        func verdict(parent: Bool = true, _ running: [Location]) -> CleanupDaemon.Verdict {
+            CleanupDaemon.verdict(parentExists: parent, runningFrom: running, exists: { onDisk.contains($0) })
+        }
+        XCTAssertEqual(verdict([]), .uninstall)
+        XCTAssertEqual(verdict(parent: false, []), .keep("its volume is not mounted"))
+        XCTAssertEqual(verdict([.exited]), .uninstall, "a copy that exited since it was listed does not count")
+        // Moved while running: it re-registers the job on relaunch.
+        XCTAssertEqual(verdict([.at(moved)]), .keep("a copy of Ampere is running from \(moved)"))
+        XCTAssertEqual(verdict([.deleted, .at(moved)]), .keep("a copy of Ampere is running from \(moved)"))
+        // Deleted from under itself, trashed, or at a path that is gone: on
+        // its way out, so the job waits for it to quit.
+        XCTAssertEqual(verdict([.deleted]), .awaitQuit)
+        XCTAssertEqual(verdict([.at(trashed)]), .awaitQuit)
+        XCTAssertEqual(verdict([.at("/Applications/Ampere.app/Contents/MacOS/Ampere")]), .awaitQuit)
+        XCTAssertEqual(verdict([.exited, .deleted]), .awaitQuit)
+        // A copy the kernel cannot place: nothing is removed.
+        XCTAssertEqual(verdict([.unknown]), .keep("a copy of Ampere is running"))
+        XCTAssertEqual(verdict([.deleted, .unknown]), .keep("a copy of Ampere is running"))
+    }
+
+    func testTrashFoldersAreRecognized() {
+        XCTAssertTrue(CleanupDaemon.isInTrash("/Users/me/.Trash/Ampere.app/Contents/MacOS/Ampere"))
+        XCTAssertTrue(CleanupDaemon.isInTrash("/Volumes/Data/.Trashes/501/Ampere.app/Contents/MacOS/Ampere"))
+        XCTAssertFalse(CleanupDaemon.isInTrash("/Applications/Ampere.app/Contents/MacOS/Ampere"))
+        XCTAssertFalse(CleanupDaemon.isInTrash("/Users/me/Trash/Ampere.app/Contents/MacOS/Ampere"),
+                       "a folder merely named Trash")
+        XCTAssertFalse(CleanupDaemon.isInTrash("/Users/me/.Trashed/Ampere.app/Contents/MacOS/Ampere"))
     }
 
     func testTheGracePeriodStartsWhenTheBundleIsFirstSeenMissingAndAnySightingEndsIt() {

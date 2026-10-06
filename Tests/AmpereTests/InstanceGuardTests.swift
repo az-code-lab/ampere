@@ -29,4 +29,23 @@ final class InstanceGuardTests: XCTestCase {
         // app's instances and must never yield, whatever else is running.
         XCTAssertNil(InstanceGuard.competingInstance())
     }
+
+    /// The two answers a test can produce: this process runs from a file on
+    /// disk, and a process that has exited is reported as such. A moved or
+    /// deleted executable needs a long-running process that is not a
+    /// platform binary (macOS kills a copied system tool), so those two
+    /// answers were verified by hand on macOS 27 (see executableLocation).
+    func testExecutableLocationNamesThisProcessAndReportsAnExitedOne() throws {
+        guard case .at(let path) = InstanceGuard.executableLocation(of: getpid()) else {
+            return XCTFail("the test host's executable is on disk")
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: path), path)
+        XCTAssertFalse(CleanupDaemon.isInTrash(path))
+
+        let finished = Process()
+        finished.executableURL = URL(fileURLWithPath: "/usr/bin/true")
+        try finished.run()
+        finished.waitUntilExit()
+        XCTAssertEqual(InstanceGuard.executableLocation(of: finished.processIdentifier), .exited)
+    }
 }

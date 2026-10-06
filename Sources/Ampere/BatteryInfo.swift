@@ -1672,6 +1672,16 @@ final class BatteryMonitor: ObservableObject {
     }
 
     /// Read a single SMC key and return its raw bytes, or nil on failure.
+    /// Each step checks both answers, as the helper's write does: the IOKit
+    /// return says whether the kernel took the call, and `output.result` is
+    /// the SMC's own status (0 = success; 0x84 = key not found), which
+    /// arrives with kIOReturnSuccess. Without the second check a read the
+    /// SMC refused would hand back the zeroed buffer, and four zero bytes
+    /// read as CHTE allow and CHIE normal: a health check would pass on a
+    /// state nobody read, or fail and repair a key that never drifted, and
+    /// the temperature would read 0 °C. A refused read now takes the same
+    /// path as one the kernel refused, and the health check logs that it
+    /// was skipped.
     private static func smcReadKey(_ key: String) -> [UInt8]? {
         let svc = smcService()
         guard svc != MACH_PORT_NULL else { return nil }
@@ -1690,7 +1700,8 @@ final class BatteryMonitor: ObservableObject {
         var output = SMCKeyData()
         input.key = smcKey
         input.data8 = SMCCmd.readKeyInfo
-        guard IOConnectCallStructMethod(conn, SMCCmd.userClientSelector, &input, inputSize, &output, &outputSize) == kIOReturnSuccess else { return nil }
+        guard IOConnectCallStructMethod(conn, SMCCmd.userClientSelector, &input, inputSize, &output, &outputSize) == kIOReturnSuccess,
+              output.result == 0 else { return nil }
 
         let dataSize = output.keyInfo.dataSize
         guard dataSize > 0 && dataSize <= SMCKeyData.bytesCapacity else { return nil }
@@ -1702,7 +1713,8 @@ final class BatteryMonitor: ObservableObject {
         input.data8 = SMCCmd.readKey
         output = SMCKeyData()
         outputSize = MemoryLayout<SMCKeyData>.size
-        guard IOConnectCallStructMethod(conn, SMCCmd.userClientSelector, &input, inputSize, &output, &outputSize) == kIOReturnSuccess else { return nil }
+        guard IOConnectCallStructMethod(conn, SMCCmd.userClientSelector, &input, inputSize, &output, &outputSize) == kIOReturnSuccess,
+              output.result == 0 else { return nil }
 
         var raw = output.bytes
         return withUnsafeBytes(of: &raw) { Array($0.prefix(Int(dataSize))) }
@@ -3514,10 +3526,16 @@ final class BatteryMonitor: ObservableObject {
     /// below then stops any in-flight discharge (via its !autoDischargeEnabled
     /// branch) before the state machine issues the allow.
     ///
-    /// Deactivating mid-charge mirrors the charge-to-upper toggle: inhibit
-    /// immediately; the next state-machine cycle restores the rule-1/3
-    /// default for the current level (including charge-to-upper if below
-    /// the lower bound).
+    /// Deactivating mid-charge mirrors the charge-to-upper toggle: clear the
+    /// intent, inhibit immediately, and let the next state-machine cycle
+    /// restore the rule-1/3 default for the current level: a hold between
+    /// the bounds, charge-to-upper below the lower bound. A charge-to-upper
+    /// armed before the full charge (rule 1 at a plug-in below the lower
+    /// bound, or its toggle) goes with it: the full charge superseded it,
+    /// and its row is hidden while the full charge runs, so the user has no
+    /// way to see it. Left armed, it would have the cycle after the inhibit
+    /// allow again, and the cancel would not stick: the panel would show the
+    /// charge stopping and resuming toward the upper bound within a second.
     func setChargeToFull(_ on: Bool) {
         if on {
             if autoDischargeEnabled { autoDischargeEnabled = false }
@@ -3526,6 +3544,7 @@ final class BatteryMonitor: ObservableObject {
             refresh()
         } else {
             chargeToFull = false
+            chargeToUpperBound = false
             inhibitCharging()
         }
     }

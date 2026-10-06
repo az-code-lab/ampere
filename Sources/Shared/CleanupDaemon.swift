@@ -3,8 +3,9 @@ import Foundation
 /// Nothing runs when the app is dragged to the Trash, and `brew uninstall`
 /// only removes the bundle, so the privileged files would outlive the app.
 /// A root launchd job watches the installed bundle path instead: once the
-/// bundle has been gone for the grace period and no copy of Ampere is
-/// running, it has the helper restore the system and remove every
+/// bundle has been gone for the grace period and no copy of Ampere runs
+/// from anywhere on disk (one deleted from under itself is waited for,
+/// see verdict), it has the helper restore the system and remove every
 /// privileged artifact, the job included.
 ///
 /// The app registers the job through the helper (`register-daemon:<path>`)
@@ -98,11 +99,46 @@ public enum CleanupDaemon {
         return bundleIdentifier == AppConstants.appBundleIdentifier
     }
 
+    /// What the job does once the bundle has stayed missing for a grace
+    /// period.
+    public enum Verdict: Equatable {
+        /// Restore the system and remove every artifact.
+        case uninstall
+        /// Leave everything installed, for this reason (logged).
+        case keep(String)
+        /// Every running copy is on its way out: wait, then look again.
+        case awaitQuit
+    }
+
     /// A missing bundle is an uninstall only while its parent directory is
     /// still there (an unmounted volume proves nothing) and no copy of the
-    /// app is running: a running copy was moved, not removed, and it
-    /// re-registers the job with its new path at the next launch.
-    public static func shouldUninstall(bundleExists: Bool, parentExists: Bool, appRunning: Bool) -> Bool {
-        parentExists && !bundleExists && !appRunning
+    /// app runs from anywhere on disk. Where each running copy's executable
+    /// is tells a move from a removal. A copy whose executable still exists
+    /// outside a Trash folder was moved, not removed: the job keeps
+    /// everything, and the copy re-registers the job with its new path at
+    /// its next launch. A copy whose executable is gone (deleted while
+    /// running, as `rm -rf` and some uninstallers do; Finder refuses) or
+    /// now sits in a Trash folder is being uninstalled: the job waits for
+    /// it to quit, since quitting changes no watched path and would
+    /// otherwise leave the helper installed until the next boot, and then
+    /// looks at the bundle again. A copy the kernel cannot place keeps
+    /// everything, the conservative reading; one that exited since it was
+    /// listed does not count.
+    public static func verdict(parentExists: Bool, runningFrom locations: [InstanceGuard.ExecutableLocation],
+                               exists: (String) -> Bool) -> Verdict {
+        guard parentExists else { return .keep("its volume is not mounted") }
+        let running = locations.filter { $0 != .exited }
+        guard !running.isEmpty else { return .uninstall }
+        if running.contains(.unknown) { return .keep("a copy of Ampere is running") }
+        for case .at(let path) in running where exists(path) && !isInTrash(path) {
+            return .keep("a copy of Ampere is running from \(path)")
+        }
+        return .awaitQuit
+    }
+
+    /// Whether `path` lies in a Trash folder: an account's `.Trash`, or a
+    /// volume's `.Trashes`.
+    public static func isInTrash(_ path: String) -> Bool {
+        path.split(separator: "/").contains { $0 == ".Trash" || $0 == ".Trashes" }
     }
 }

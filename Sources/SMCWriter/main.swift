@@ -911,7 +911,10 @@ if action == "uninstall" || action == "purge" {
 // "uninstall-if-missing:PATH" — the cleanup job's entry point, run by
 // launchd at boot and whenever PATH changes. Uninstall only once the
 // bundle has been missing for a whole grace period (see
-// CleanupDaemon.stayedMissing) and is really gone (shouldUninstall).
+// CleanupDaemon.stayedMissing) and is really gone (CleanupDaemon.verdict).
+// A copy of Ampere deleted from under itself while running is waited for:
+// every grace period the job looks again, and once that copy has quit and
+// the bundle has stayed missing for one more period, it uninstalls.
 // stderr goes nowhere under launchd, so outcomes go to the unified log;
 // a run that finds the bundle in place exits quietly.
 if action.hasPrefix("uninstall-if-missing:") {
@@ -921,20 +924,29 @@ if action.hasPrefix("uninstall-if-missing:") {
         exit(1)
     }
     let fileManager = FileManager.default
-    guard CleanupDaemon.stayedMissing(exists: { fileManager.fileExists(atPath: bundlePath) },
-                                      wait: { _ = sleep($0) }) else { exit(0) }
-    let parentExists = fileManager.fileExists(atPath: (bundlePath as NSString).deletingLastPathComponent)
-    let appRunning = !InstanceGuard.runningInstances().isEmpty
-    guard CleanupDaemon.shouldUninstall(bundleExists: false, parentExists: parentExists,
-                                        appRunning: appRunning) else {
-        AmpereLog.helper("Ampere cleanup: %@ is missing but %@; leaving the helper installed", bundlePath,
-              parentExists ? "a copy of Ampere is running" : "its volume is not mounted")
-        exit(0)
+    var waiting = false
+    while true {
+        guard CleanupDaemon.stayedMissing(exists: { fileManager.fileExists(atPath: bundlePath) },
+                                          wait: { _ = sleep($0) }) else { exit(0) }
+        let parentExists = fileManager.fileExists(atPath: (bundlePath as NSString).deletingLastPathComponent)
+        let running = InstanceGuard.runningInstances().map { InstanceGuard.executableLocation(of: $0.pid) }
+        switch CleanupDaemon.verdict(parentExists: parentExists, runningFrom: running,
+                                     exists: { fileManager.fileExists(atPath: $0) }) {
+        case .keep(let reason):
+            AmpereLog.helper("Ampere cleanup: %@ is missing but %@; leaving the helper installed", bundlePath, reason)
+            exit(0)
+        case .awaitQuit:
+            if !waiting {
+                AmpereLog.helper("Ampere cleanup: %@ is gone, but a copy of Ampere deleted while running has not quit; waiting", bundlePath)
+            }
+            waiting = true
+        case .uninstall:
+            AmpereLog.helper("Ampere cleanup: %@ is gone; restoring the system and removing the helper", bundlePath)
+            let status = performUninstall(asCleanupJob: true, userData: true)
+            AmpereLog.helper("Ampere cleanup: uninstall exited with status %d", status)
+            exit(status)
+        }
     }
-    AmpereLog.helper("Ampere cleanup: %@ is gone; restoring the system and removing the helper", bundlePath)
-    let status = performUninstall(asCleanupJob: true, userData: true)
-    AmpereLog.helper("Ampere cleanup: uninstall exited with status %d", status)
-    exit(status)
 }
 
 // One-shot commands

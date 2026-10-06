@@ -9,7 +9,8 @@ import XCTest
 /// and how many it is in use on, are read from the server's answers and
 /// survive a relaunch; the window's words follow them, and opening the window
 /// checks the registration so the Macs in use are current; a verify answer
-/// that lands after this copy deregistered changes nothing; a full key's
+/// that lands after this copy deregistered changes nothing, even once it has
+/// registered again to the same email; a full key's
 /// refusal reaches the user in the server's words; a registration a verify
 /// ended keeps saying why until the next attempt; and register names the
 /// product so another app's key is never bound.
@@ -254,6 +255,8 @@ final class RegistrationTests: XCTestCase {
         }
         let registration = RegistrationManager(defaults: defaults, deviceSerial: Self.serial)
         XCTAssertTrue(register(registration, email: "ada@example.com", key: "AMP-A"))
+        // What a check sent now would carry back with its answer.
+        let asked = registration.registrationGeneration
         let deregistered = expectation(description: "deregistered")
         registration.deregister { _ in deregistered.fulfill() }
         wait(for: [deregistered], timeout: 5)
@@ -261,18 +264,57 @@ final class RegistrationTests: XCTestCase {
         XCTAssertNil(registration.deviceCount, "a Mac off the key keeps no count of the key's Macs")
 
         let lateValid: [String: Any] = ["valid": true, "license": ["name": "Ada", "max_devices": 5, "device_count": 3]]
-        registration.applyVerification(lateValid, askedAs: "ada@example.com")
+        registration.applyVerification(lateValid, askedUnder: asked)
         XCTAssertFalse(registration.isRegistered, "a late yes does not register a deregistered copy again")
         XCTAssertNil(registration.deviceCount)
-        registration.applyVerification(["valid": false], askedAs: "ada@example.com")
+        registration.applyVerification(["valid": false], askedUnder: asked)
         XCTAssertNil(registration.lastError, "a deliberate deregistration is not reported as a lapse")
         XCTAssertFalse(RegistrationManager(defaults: defaults, deviceSerial: Self.serial).isRegistered)
 
-        // Registered again, to another address: an answer asked as the old
-        // one still changes nothing.
+        // Registered again, to another address: an answer asked under the
+        // old registration still changes nothing.
         XCTAssertTrue(register(registration, email: "bob@example.com", key: "AMP-B"))
-        registration.applyVerification(lateValid, askedAs: "ada@example.com")
+        registration.applyVerification(lateValid, askedUnder: asked)
         XCTAssertEqual(registration.deviceCount, 2, "the count stays the one this registration's own answer gave")
+    }
+
+    /// Deregistered and registered again to the same email while a check of
+    /// the first registration was still on the wire, and the server answered
+    /// it after the deregistration: "not valid" is true of the registration
+    /// it was asked about and false of the one this copy now holds. Taken for
+    /// the new one, it would end it, report a lapse, and (through the bounds
+    /// lock) reset the charge bounds. The registration's own check still
+    /// ends it, and a check that only refreshes the key's facts does not
+    /// invalidate another in flight.
+    func testAStaleNotValidCannotEndARegistrationMadeAgainToTheSameEmail() {
+        LicenseServerStub.answer = { path in
+            path.hasSuffix("/deregister")
+                ? (200, #""License deregistered""#)
+                : (200, #"{"product":"ampere","email":"ada@example.com","name":"Ada","max_devices":5,"device_count":1}"#)
+        }
+        let registration = RegistrationManager(defaults: defaults, deviceSerial: Self.serial)
+        XCTAssertTrue(register(registration, email: "ada@example.com", key: "AMP-A"))
+        let asked = registration.registrationGeneration
+        let deregistered = expectation(description: "deregistered")
+        registration.deregister { _ in deregistered.fulfill() }
+        wait(for: [deregistered], timeout: 5)
+        XCTAssertTrue(register(registration, email: "ada@example.com", key: "AMP-A"))
+        XCTAssertNotEqual(registration.registrationGeneration, asked)
+
+        registration.applyVerification(["valid": false], askedUnder: asked)
+        XCTAssertTrue(registration.isRegistered, "the answer is about the registration that ended, not this one")
+        XCTAssertNil(registration.lastError)
+        XCTAssertTrue(RegistrationManager(defaults: defaults, deviceSerial: Self.serial).isRegistered)
+
+        let current = registration.registrationGeneration
+        registration.applyVerification(["valid": true, "license": ["name": "Ada B.", "max_devices": 5, "device_count": 2]],
+                                       askedUnder: current)
+        XCTAssertEqual(registration.name, "Ada B.")
+        XCTAssertEqual(registration.registrationGeneration, current, "refreshing the key's facts is not a new registration")
+
+        registration.applyVerification(["valid": false], askedUnder: current)
+        XCTAssertFalse(registration.isRegistered, "the current registration's own check still ends it")
+        XCTAssertEqual(registration.lastError, RegistrationManager.lapsedMessage)
     }
 
     // MARK: Helpers

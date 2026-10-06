@@ -213,6 +213,28 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         wait(for: [done], timeout: 3)
     }
 
+    /// Charge to Full started on top of a charge to the upper bound (armed by
+    /// rule 1 at a plug-in below the lower bound, or by its toggle) and
+    /// cancelled between the bounds: the cancel clears the earlier intent
+    /// too, so the inhibit holds. Left armed, the cycle after the inhibit
+    /// would allow again and charging would resume toward the upper bound.
+    func testCancelFullChargeClearsAnEarlierChargeToUpper() {
+        let hw = Hardware(), monitor = hw.monitor()
+        monitor.chargeToUpperBound = true
+        monitor.setChargeToFull(true)
+        drainCallbacks()
+        XCTAssertEqual(hw.writes, [], "charging is already allowed; the full charge only raises the target")
+        monitor.setChargeToFull(false)
+        awaitCondition { monitor.chargingPaused && hw.writes.count >= 1 }
+        for _ in 0..<2 { monitor.refresh() }
+        drainCallbacks()
+        XCTAssertEqual(hw.writes, ["inhibit"])
+        XCTAssertTrue(monitor.chargingPaused)
+        XCTAssertFalse(monitor.chargeToUpperBound)
+        XCTAssertFalse(monitor.chargeToFull)
+        XCTAssertEqual(hw.preferences.values["chargeToUpperBound"] as? Bool, false)
+    }
+
     func testCancelFullChargeWhileAllowIsInFlight() {
         let hw = Hardware(), monitor = hw.monitor()
         monitor.chargingPaused = true
@@ -842,6 +864,28 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         drainCallbacks()
         XCTAssertEqual(monitor.lastHealthCheckStatus, "pass")
         XCTAssertNil(monitor.healthWarning)
+    }
+
+    /// The same cancel through the macOS charge limit: a full charge started
+    /// on top of a charge to the upper bound settles on a hold at the
+    /// current level, not on the upper bound.
+    func testNativeMode_CancelFullChargeClearsAnEarlierChargeToUpper() {
+        let hw = Hardware()
+        hw.percentage = 50
+        let monitor = nativeMonitor(hw)
+        monitor.chargeToUpperBound = true
+        monitor.refresh()
+        awaitCondition { hw.writes.last == "native-limit:60" }
+        monitor.setChargeToFull(true)
+        awaitCondition { hw.writes.last == "native-limit:100" }
+        monitor.setChargeToFull(false)
+        awaitCondition { hw.writes.last == "native-limit:50" }
+        for _ in 0..<2 { monitor.refresh() }
+        drainCallbacks()
+        XCTAssertEqual(Array(hw.writes.suffix(3)), ["native-limit:60", "native-limit:100", "native-limit:50"])
+        XCTAssertTrue(monitor.chargingPaused)
+        XCTAssertFalse(monitor.chargeToUpperBound)
+        XCTAssertFalse(monitor.chargeToFull)
     }
 
     func testNativeMode_CancelledFullChargeIsHeldWhenItsWriteCompletes() {

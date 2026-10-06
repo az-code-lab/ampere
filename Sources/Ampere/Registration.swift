@@ -85,6 +85,13 @@ final class RegistrationManager: ObservableObject {
     @Published private(set) var isBusy = false
     @Published var lastError: String?
 
+    /// How many times a registration has begun or ended on this copy: up by
+    /// one at each register, deregister, and verify that ends it. A verify
+    /// answer carries the count it was asked under and is applied only while
+    /// that count stands (see applyVerification). Internal, not private, so
+    /// tests can hand applyVerification a count of their own.
+    private(set) var registrationGeneration = 0
+
     let deviceSerial: String?
 
     /// Where the state persists: the app's standard defaults, or a scratch
@@ -227,23 +234,29 @@ final class RegistrationManager: ObservableObject {
     /// network failures leave it untouched.
     func verify() {
         guard isRegistered, !email.isEmpty, let serial = deviceSerial else { return }
-        let asked = email
+        let asked = registrationGeneration
         post("/api/pub/license/verify",
              body: ["email": email, "device_serial": serial, "product": Self.product,
                     "app_version": Self.appVersion, "macos_version": Self.macOSVersion]) { [weak self] result in
             guard let self, case .success(let json) = result else { return }
-            self.applyVerification(json, askedAs: asked)
+            self.applyVerification(json, askedUnder: asked)
         }
     }
 
     /// A verify answer, applied only while the registration it was asked
-    /// about still stands. An answer that lands after this copy deregistered
+    /// about still stands: the one in force when it was sent, told by the
+    /// generation count. An answer that lands after this copy deregistered
     /// (Deregister clicked while the window's own check was still on the
-    /// wire), or after it registered to another email, speaks of a
-    /// registration this copy no longer holds, and changes nothing: without
-    /// this, a late "valid" would mark a deregistered copy registered again.
-    func applyVerification(_ json: [String: Any], askedAs asked: String) {
-        guard isRegistered, email == asked, let valid = json["valid"] as? Bool else { return }
+    /// wire) speaks of a registration this copy no longer holds, and changes
+    /// nothing: without this, a late "valid" would mark a deregistered copy
+    /// registered again. The count, not the email, is what identifies the
+    /// registration, so an answer to the old one cannot act on a new one
+    /// made to the same email either: a late "not valid", from a server that
+    /// answered after the deregistration it was racing, would otherwise end
+    /// the new registration, report a lapse, and reset the charge bounds.
+    func applyVerification(_ json: [String: Any], askedUnder generation: Int) {
+        guard isRegistered, generation == registrationGeneration,
+              let valid = json["valid"] as? Bool else { return }
         if !valid {
             AmpereLog.app("Ampere: Registration no longer valid, switching to unregistered")
             setState(registered: false, deviceCount: .some(nil))
@@ -327,6 +340,11 @@ final class RegistrationManager: ObservableObject {
     /// is itself an answer (.some(nil) clears it).
     private func setState(registered: Bool, email: String? = nil, key: String? = nil,
                           name: String? = nil, maxDevices: Int? = nil, deviceCount: Int?? = nil) {
+        // A registration begins or ends: the register call (email and key
+        // given) and every change of the active flag. A verify that only
+        // refreshes the name or the Macs in use leaves the count alone, so
+        // two checks in flight at once cannot discard each other's answer.
+        if registered != isRegistered || email != nil || key != nil { registrationGeneration &+= 1 }
         if let email { self.email = email; defaults.set(email, forKey: Self.emailDefaultsKey) }
         if let name { self.name = name; defaults.set(name, forKey: Self.nameDefaultsKey) }
         if let key { self.licenseKey = key; defaults.set(key, forKey: Self.keyDefaultsKey) }
