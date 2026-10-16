@@ -2979,11 +2979,18 @@ final class BatteryMonitor: ObservableObject {
             // The mismatch resolves right after the discharge stops — its
             // stop path restores sleep and removes the markers, so a later
             // release is a clean no-op. A pending cleanup (cleanupPending)
-            // holds nothing back: its retry restores a hold armed meanwhile
-            // along with everything else and forgets it, and the refresh
-            // that follows arms it again (retryCleanup).
+            // holds nothing back from arming: its retry restores a hold
+            // armed meanwhile along with everything else and forgets it,
+            // and the refresh that follows arms it again (retryCleanup). A
+            // release does wait for that cleanup: the leftover it has to
+            // put back may include CHIE, and sleep re-enabled while CHIE is
+            // set is the clamshell blackout the helper's own restore
+            // refuses (HelperRecovery clears CHIE before it restores
+            // sleep). The cleanup's nodischarge releases the hold in that
+            // order, and its completion forgets the flag.
             let holdOpNeeded = !activeDischarging
                 && decision.newState.sleepHold != sleepHoldActive
+                && !(cleanupPending && !decision.newState.sleepHold)
             if (decision.action != .none || holdOpNeeded || wakeReassertPending), !autoManageInFlight {
                 autoManageInFlight = true
                 let reassert = wakeReassertPending
