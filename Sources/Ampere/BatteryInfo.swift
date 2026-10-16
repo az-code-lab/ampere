@@ -269,6 +269,9 @@ final class BatteryMonitor: ObservableObject {
         /// key and this macOS has no charge limit to hand a target to (see
         /// chargeControlMechanism). Nothing is written, no helper is
         /// installed, and nothing needs restoring; the panel monitors only.
+        /// refresh asks again at every poll, since a `pmset -g battlimit`
+        /// that failed for a moment must not pass for a macOS without the
+        /// limit (see activateChargeControl).
         case noMechanism
         /// The SMC did not answer the CHTE probe when this instance took
         /// charge control (see ChargeControlMechanism.undetermined).
@@ -316,6 +319,11 @@ final class BatteryMonitor: ObservableObject {
     enum ChargeControlMechanism: Equatable {
         case chargeTerminateKey
         case nativeLimit
+        /// Neither answered: no CHTE key, and no macOS charge limit that
+        /// `pmset -g battlimit` can read. Not final: decided again at
+        /// every poll (see activateChargeControl), since a pmset that
+        /// could not run for a moment must not pass for a macOS without
+        /// the limit.
         case unavailable
         /// The SMC did not answer the CHTE probe, so neither branch can be
         /// taken yet: not the key (its writes fail on firmware without it)
@@ -664,39 +672,52 @@ final class BatteryMonitor: ObservableObject {
         get { watchdogLock.lock(); defer { watchdogLock.unlock() }; return watchdogSpawnFailedStorage }
         set { watchdogLock.lock(); defer { watchdogLock.unlock() }; watchdogSpawnFailedStorage = newValue }
     }
-    /// True while the launch cleanup's nodischarge (CHIE, the saved sleep
-    /// settings, old watchdogs) has not succeeded, so what a crashed or
-    /// rebooted session left is still in force and nothing of this
-    /// session's would put it back on its own: its discharge and sleep
-    /// hold release only what they armed, and the health check reads
-    /// neither pmset nor the markers. Cleared by any nodischarge or
-    /// restore that succeeds (runSMCWriteViaSudo); refresh retries it
-    /// every launchCleanupRetrySeconds (retryLaunchCleanup). Same lock.
-    private var launchCleanupPendingStorage = false
-    private var launchCleanupPending: Bool {
-        get { watchdogLock.lock(); defer { watchdogLock.unlock() }; return launchCleanupPendingStorage }
-        set { watchdogLock.lock(); defer { watchdogLock.unlock() }; launchCleanupPendingStorage = newValue }
+    /// True while a nodischarge that must succeed (CHIE, the saved sleep
+    /// settings, old watchdogs) has not: the launch cleanup's, so what a
+    /// crashed or rebooted session left is still in force, or the rollback
+    /// of a discharge start the helper refused part-way (startDischarge),
+    /// so what that start armed is. Nothing of this session's would put
+    /// either back on its own: its discharge and sleep hold release only
+    /// what they armed, and the health check reads neither pmset nor the
+    /// markers. Cleared by any nodischarge or restore that succeeds
+    /// (runSMCWriteViaSudo); refresh retries it every cleanupRetrySeconds
+    /// (retryCleanup), at the very next poll when the previous interval
+    /// has already passed. Same lock.
+    private var cleanupPendingStorage = false
+    private var cleanupPending: Bool {
+        get { watchdogLock.lock(); defer { watchdogLock.unlock() }; return cleanupPendingStorage }
+        set { watchdogLock.lock(); defer { watchdogLock.unlock() }; cleanupPendingStorage = newValue }
     }
-    private var launchCleanupRetryAt = Date.distantPast
+    private var cleanupRetryAt = Date.distantPast
     /// True while the restore a license hold called for has not succeeded
     /// (releaseChargeControl): retried from refresh while the hold lasts,
-    /// at launchCleanupRetrySeconds, and once more at quit.
+    /// at cleanupRetrySeconds, and once more at quit.
     private var chargeControlReleasePending = false
     private var chargeControlReleaseRetryAt = Date.distantPast
     /// Long enough for whatever refused pmset or the SMC at login to have
     /// recovered; the state machine runs on every poll in between.
-    private static let launchCleanupRetrySeconds: TimeInterval = 120
+    private static let cleanupRetrySeconds: TimeInterval = 120
     /// How often the CHTE probe is repeated within one activation before
     /// charge control goes on hold (activateChargeControl), and the pause
     /// between repeats.
     private static let chteProbeAttempts = 3
     private static let chteProbeRetryMicroseconds: UInt32 = 100_000
-    /// The status line's recovery notice: a launch cleanup still pending,
-    /// or a crash watchdog the helper could not start. Nil when neither
-    /// (updateRecoveryWarning).
+    /// The status line's recovery notice: a cleanup still pending (the
+    /// launch restore, or the rollback of a failed discharge start), a
+    /// sleep hold the helper did not apply, or a crash watchdog it could
+    /// not start. Nil when none (updateRecoveryWarning).
     @Published private(set) var recoveryWarning: String?
-    static let launchCleanupWarning = "Restoring the previous session's overrides failed; retrying."
+    static let cleanupWarning = "Restoring the discharge and sleep overrides failed; retrying."
+    static let sleepHoldFailedWarning = "Keeping the Mac awake failed; retrying. If it sleeps, the charge pauses until wake."
     static let watchdogMissingWarning = "Crash watchdog could not start; retrying. Overrides would outlive a crash until the next launch."
+    /// True from a sleep hold that was wanted and not applied (the helper
+    /// refused hold-sleep, the CHTE write before it failed, or it waited
+    /// for a crash watchdog) until one applies or the intent clears. The
+    /// status line then says the Mac may sleep, and what happens if it
+    /// does (prepareForSleep pauses the charge). Main queue only.
+    private var sleepHoldFailed = false {
+        didSet { if oldValue != sleepHoldFailed { updateRecoveryWarning() } }
+    }
     /// Sleep-hold intent from the state machine, persisted so a crash or
     /// in-app upgrade mid-hold re-arms after relaunch (launch cleanup always
     /// restores pmset via nodischarge, so without the persisted intent a
@@ -966,7 +987,9 @@ final class BatteryMonitor: ObservableObject {
         // One unanswered probe must not decide the mechanism for the whole
         // session (a CHTE Mac would run on the macOS charge limit): it is
         // repeated a few times here and, still unanswered, at every poll,
-        // with charge control on hold meanwhile.
+        // with charge control on hold meanwhile. Nor may one failed pmset
+        // read: a Mac found with no mechanism is probed again at every
+        // poll as well (refresh).
         var chte = io.chargeTerminateKey()
         var probes = 1
         while chte == .unknown, probes < Self.chteProbeAttempts {
@@ -978,25 +1001,39 @@ final class BatteryMonitor: ObservableObject {
             chte: chte,
             nativeClientAvailable: io.nativeLimitClientAvailable(),
             nativeLimitsReadable: io.registeredNativeLimits() != nil)
-        let retrying = chargeControlHold == .mechanismUnknown
+        let previousHold = chargeControlHold
         if mechanism == .undetermined {
-            if !retrying {
+            if previousHold != .mechanismUnknown {
                 chargeControlHold = .mechanismUnknown
                 AmpereLog.app("Ampere: Charge control on hold: the SMC did not answer the CHTE probe; retrying at every poll")
             }
             return true
         }
-        if retrying {
-            chargeControlHold = nil
-            AmpereLog.app("Ampere: The SMC answered the CHTE probe; taking charge control")
-        }
-        nativeLimitMode = mechanism == .nativeLimit
         if mechanism == .unavailable {
-            chargeControlHold = .noMechanism
-            accountAuthorized = isSudoRuleInstalled && !io.helperStale() && io.helperAuthorized()
-            AmpereLog.app("Ampere: Charge control unavailable: this firmware has no CHTE key and this macOS has no charge limit; monitoring only")
+            // Not final either: `pmset -g battlimit` can fail for a moment
+            // like any process (the cleanup retry allows for the same in
+            // pmset), and taking that for a macOS without the charge limit
+            // would leave a macOS 27 Mac without charge control for the
+            // session. refresh probes again at every poll; a Mac with
+            // neither mechanism pays an SMC probe and a class lookup per
+            // poll, and pmset is never run there (the class check fails
+            // first). The hold and its log line are set once.
+            if previousHold != .noMechanism {
+                nativeLimitMode = false
+                chargeControlHold = .noMechanism
+                accountAuthorized = isSudoRuleInstalled && !io.helperStale() && io.helperAuthorized()
+                AmpereLog.app("Ampere: Charge control unavailable: this firmware has no CHTE key and this macOS has no charge limit; monitoring only, probing again at every poll")
+            }
             return true
         }
+        if previousHold == .mechanismUnknown {
+            chargeControlHold = nil
+            AmpereLog.app("Ampere: The SMC answered the CHTE probe; taking charge control")
+        } else if previousHold == .noMechanism {
+            chargeControlHold = nil
+            AmpereLog.app("Ampere: A charge-control mechanism answered; taking charge control")
+        }
+        nativeLimitMode = mechanism == .nativeLimit
         // Install/update the helper or authorize this macOS account.
         // brew uninstall would have removed the helper; a fresh app build
         // would have a different helper binary. The install prompts for
@@ -1104,9 +1141,9 @@ final class BatteryMonitor: ObservableObject {
                 AmpereLog.app("Ampere: Launch cleanup failed (nodischarge=%d, chte=%d)", okDischarge, okChte)
             }
             // A failed nodischarge leaves what the previous session left
-            // in force; refresh retries it (see launchCleanupPending).
-            launchCleanupPending = !okDischarge
-            launchCleanupRetryAt = io.now().addingTimeInterval(Self.launchCleanupRetrySeconds)
+            // in force; refresh retries it (see cleanupPending).
+            cleanupPending = !okDischarge
+            cleanupRetryAt = io.now().addingTimeInterval(Self.cleanupRetrySeconds)
             // Native mode: a failed release leaves a crashed session's
             // limit in force with nothing cached, which the first poll must
             // not take for "released" (see nativeLimitUnconfirmed).
@@ -1182,11 +1219,11 @@ final class BatteryMonitor: ObservableObject {
     /// queued; what this instance believes is written follows on the main
     /// queue, behind that write's own completion, and only while the hold
     /// still stands (a registration meanwhile resets it itself). A restore
-    /// that fails is retried from refresh every launchCleanupRetrySeconds
+    /// that fails is retried from refresh every cleanupRetrySeconds
     /// while the hold lasts, and once more at quit; the watchdog, which a
     /// failed restore leaves running, covers a crash meanwhile.
     private func releaseChargeControl() {
-        chargeControlReleaseRetryAt = io.now().addingTimeInterval(Self.launchCleanupRetrySeconds)
+        chargeControlReleaseRetryAt = io.now().addingTimeInterval(Self.cleanupRetrySeconds)
         guard isSudoRuleInstalled else {
             chargeControlReleasePending = false
             return
@@ -1201,7 +1238,7 @@ final class BatteryMonitor: ObservableObject {
             }
         } else {
             AmpereLog.app("Ampere: Restore failed with charge control on hold; retrying in %d s",
-                          Int(Self.launchCleanupRetrySeconds))
+                          Int(Self.cleanupRetrySeconds))
         }
     }
 
@@ -1213,6 +1250,7 @@ final class BatteryMonitor: ObservableObject {
         chargingPaused = false
         activeDischarging = false
         sleepHoldActive = false
+        sleepHoldFailed = false
         requestedChargingPaused = nil
         nativeLimitWritten = nil
         nativeLimitIntent = nil
@@ -1249,11 +1287,18 @@ final class BatteryMonitor: ObservableObject {
         guard isSudoRuleInstalled, let battery = io.battery(), battery.adapterConnected else { return }
         let pause: Bool
         if autoManageEnabled {
-            // Between bounds, pause until wake. Full-charge and below-lower
-            // sessions may charge through sleep, as documented.
-            pause = Self.reachedBound(effectiveUpperBound, percentage: battery.percentage,
-                                      fullyCharged: battery.fullyCharged)
-                || (!chargeToFull && battery.percentage >= chargeLowerBound)
+            // Pause until wake, at the upper bound and anywhere below it.
+            // Between the bounds that is the documented pre-sleep pause.
+            // Below the lower bound the sleep hold is meant to keep the Mac
+            // awake, so a sleep that begins there means the hold is not in
+            // force (the helper refused it, it waited for a watchdog,
+            // another tool cleared it, or the user forced the sleep):
+            // pausing leaves the battery low until wake, where the charge
+            // resumes; charging on would run past the upper bound with
+            // nobody awake to stop it. Only a full charge runs through
+            // sleep, as documented: its ceiling is 100%.
+            pause = !chargeToFull
+                || Self.reachedBound(100, percentage: battery.percentage, fullyCharged: battery.fullyCharged)
         } else if let requested = requestedChargingPaused {
             pause = requested
         } else {
@@ -1503,13 +1548,14 @@ final class BatteryMonitor: ObservableObject {
                     self.chargingPaused = false
                     self.activeDischarging = false
                     self.sleepHoldActive = false
+                    self.sleepHoldFailed = false
                     self.sleepHoldIntent = false
                     self.nativeLimitWritten = nil
                     self.nativeLimitIntent = nil
                     self.nativeLimitUnconfirmed = false
                     self.watchdogSpawned = false
                     self.watchdogSpawnFailed = false
-                    self.launchCleanupPending = false
+                    self.cleanupPending = false
                     self.recoveryWarning = nil
                     self.lastError = nil
                     self.healthWarning = nil
@@ -1660,15 +1706,32 @@ final class BatteryMonitor: ObservableObject {
         // Clean up any stale watchdog/CHIE/sleep state first
         guard runSMCWriteViaSudo("nodischarge") else { return false }
 
-        let ok = runSMCWriteViaSudo("discharge:\(ProcessInfo.processInfo.processIdentifier)")
-        if ok {
+        if runSMCWriteViaSudo("discharge:\(ProcessInfo.processInfo.processIdentifier)") {
             AmpereLog.app("Ampere: discharge daemon started")
-        } else if !runSMCWriteViaSudo("spawn-watchdog:\(ProcessInfo.processInfo.processIdentifier)") {
-            // The successful nodischarge retired the previous watchdog.
-            // Restore crash recovery even if discharge could not start.
+            return true
+        }
+        // A start the helper refused part-way can leave its overrides in
+        // force: the sleep override alone when the CHIE write failed and
+        // the helper's own restore failed too, or CHIE and the sleep
+        // override when its watchdog spawn and then the CHIE rollback
+        // failed. The caller leaves activeDischarging false for a failed
+        // start, so none of the stop paths would ever release them: put
+        // them back here, and when that fails as well leave it to the
+        // cleanup retry in refresh (cleanupPending), which runs while the
+        // app is alive rather than waiting for a watchdog at exit.
+        if runSMCWriteViaSudo("nodischarge") {
+            AmpereLog.app("Ampere: Discharge start failed; its overrides were put back")
+        } else {
+            cleanupPending = true
+            AmpereLog.app("Ampere: Discharge start failed and putting its overrides back failed; retrying")
+        }
+        // The successful nodischarge retired the previous watchdog, and a
+        // failed start spawns none. Restore crash recovery even if
+        // discharge could not start.
+        if !runSMCWriteViaSudo("spawn-watchdog:\(ProcessInfo.processInfo.processIdentifier)") {
             AmpereLog.app("Ampere: Watchdog respawn after failed discharge start also failed")
         }
-        return ok
+        return false
     }
 
     /// Stop discharge: clear CHIE, restore sleep, retire the watchdog, then re-spawn
@@ -1702,12 +1765,12 @@ final class BatteryMonitor: ObservableObject {
         }
     }
 
-    /// Finish a launch cleanup whose nodischarge failed (see
-    /// launchCleanupPending): the same restore, then a fresh watchdog,
-    /// since a nodischarge that succeeds retires the running one. Success
-    /// re-runs refresh so the state machine sees the restored state at
-    /// once; failure waits for the next interval.
-    private func retryLaunchCleanup() {
+    /// Finish a cleanup whose nodischarge failed (see cleanupPending): the
+    /// same restore, then a fresh watchdog, since a nodischarge that
+    /// succeeds retires the running one. Success re-runs refresh so the
+    /// state machine sees the restored state at once; failure waits for
+    /// the next interval.
+    private func retryCleanup() {
         guard isSudoRuleInstalled else { return }
         autoManageInFlight = true
         let selfPID = ProcessInfo.processInfo.processIdentifier
@@ -1720,22 +1783,26 @@ final class BatteryMonitor: ObservableObject {
             DispatchQueue.main.async {
                 self.autoManageInFlight = false
                 if ok {
-                    AmpereLog.app("Ampere: Launch cleanup completed on retry")
+                    AmpereLog.app("Ampere: Cleanup completed on retry")
                     self.refresh()
                 } else {
-                    AmpereLog.app("Ampere: Launch cleanup retry failed; next attempt in %d s",
-                                  Int(Self.launchCleanupRetrySeconds))
+                    AmpereLog.app("Ampere: Cleanup retry failed; next attempt in %d s",
+                                  Int(Self.cleanupRetrySeconds))
                 }
             }
         }
     }
 
     /// The status line's recovery notice, from the flags the helper calls
-    /// maintain: a pending launch cleanup outranks a missing watchdog.
+    /// maintain: a pending cleanup outranks a sleep hold not applied, which
+    /// outranks a missing watchdog (a hold skipped for want of one raises
+    /// both, and the hold is what the user is about to rely on).
     private func updateRecoveryWarning() {
         let warning: String?
-        if launchCleanupPending {
-            warning = Self.launchCleanupWarning
+        if cleanupPending {
+            warning = Self.cleanupWarning
+        } else if sleepHoldFailed {
+            warning = Self.sleepHoldFailedWarning
         } else if watchdogSpawnFailed, isSudoRuleInstalled {
             warning = Self.watchdogMissingWarning
         } else {
@@ -1768,7 +1835,7 @@ final class BatteryMonitor: ObservableObject {
         } else if ok, arg.hasPrefix("discharge:") {
             watchdogSpawnFailed = false
         }
-        if ok, arg == "nodischarge" || arg == "restore" { launchCleanupPending = false }
+        if ok, arg == "nodischarge" || arg == "restore" { cleanupPending = false }
         return ok
     }
 
@@ -2632,23 +2699,25 @@ final class BatteryMonitor: ObservableObject {
             AmpereLog.app("Ampere: Taking over charge control%@", registered ? " (a license was registered)" : "")
             if registered { resumeAfterHold() }
             activateChargeControl(atLaunch: false)
-        } else if chargeControlHold == .mechanismUnknown {
-            // The SMC did not answer the CHTE probe last time: ask again.
+        } else if chargeControlHold == .mechanismUnknown || chargeControlHold == .noMechanism {
+            // The SMC did not answer the CHTE probe last time, or nothing
+            // answered at all: ask again (see activateChargeControl).
             activateChargeControl(atLaunch: false)
         }
-        // A declined takeover prompt, or a probe still unanswered:
-        // read-only until access is granted or the SMC answers.
+        // A declined takeover prompt, a probe still unanswered, or still
+        // no mechanism: read-only until access is granted or one answers.
         if chargeControlHold != nil { return }
         updateRecoveryWarning()
 
-        // A launch cleanup whose restore failed is finished here, one
-        // attempt per interval, while nothing of this session's own has
-        // re-armed the same overrides (their own release restores the
-        // shared markers). The state machine runs on the other ticks.
-        if launchCleanupPending, !autoManageInFlight, !activeDischarging, !sleepHoldActive,
-           io.now() >= launchCleanupRetryAt {
-            launchCleanupRetryAt = io.now().addingTimeInterval(Self.launchCleanupRetrySeconds)
-            retryLaunchCleanup()
+        // A cleanup whose restore failed (the launch's, or a failed
+        // discharge start's rollback) is finished here, one attempt per
+        // interval, while nothing of this session's own has re-armed the
+        // same overrides (their own release restores the shared markers).
+        // The state machine runs on the other ticks.
+        if cleanupPending, !autoManageInFlight, !activeDischarging, !sleepHoldActive,
+           io.now() >= cleanupRetryAt {
+            cleanupRetryAt = io.now().addingTimeInterval(Self.cleanupRetrySeconds)
+            retryCleanup()
             return
         }
 
@@ -2740,6 +2809,13 @@ final class BatteryMonitor: ObservableObject {
                             self.activeDischarging = true
                             AmpereLog.app("Ampere: Auto-discharge started at %d%%, target %d%%", pct, upper)
                             self.refresh()
+                        } else {
+                            // A rollback that failed set cleanupPending
+                            // (startDischarge): say so now, not at the next
+                            // poll. No refresh: the start would be retried
+                            // at once and tight-loop while the helper
+                            // keeps refusing.
+                            self.updateRecoveryWarning()
                         }
                     }
                 }
@@ -2850,6 +2926,8 @@ final class BatteryMonitor: ObservableObject {
                 AmpereLog.app("Ampere: Sleep-hold intent %@ at %d%%",
                       decision.newState.sleepHold ? "armed" : "cleared", b.percentage)
             }
+            // A hold no longer wanted leaves nothing to warn about.
+            if sleepHoldFailed, !decision.newState.sleepHold { sleepHoldFailed = false }
 
             if autoManageEnabled, b.adapterConnected, lastError != nil { lastError = nil }
             // Manual mode: the specific "no adapter" error becomes irrelevant
@@ -2934,6 +3012,11 @@ final class BatteryMonitor: ObservableObject {
                             AmpereLog.app("Ampere: Sleep hold %@ at %d%%",
                                   next.sleepHold ? "engaged" : "released", pct)
                         }
+                        // A hold wanted and not applied is retried next
+                        // tick; until it lands the status line says so, and
+                        // a sleep meanwhile pauses the charge
+                        // (prepareForSleep).
+                        if holdOpNeeded { self.sleepHoldFailed = next.sleepHold && !holdApplied }
                         if ok {
                             self.chargingPaused = next.chargingPaused
                             // The hardware operation completed even if the

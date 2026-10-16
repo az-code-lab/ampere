@@ -944,7 +944,7 @@ struct ContentView: View {
                                 .foregroundColor(.orange)
                         }
                     } else if monitor.chargeControlHold == .noMechanism {
-                        Text("Charge control: unavailable. This firmware has no CHTE key, and this macOS has no charge limit (System Settings > Battery) to hand a target to; Ampere monitors only.")
+                        Text("Charge control: unavailable. This firmware has no CHTE key, and this macOS has no charge limit (System Settings > Battery) to hand a target to; Ampere monitors only, and checks again at every poll.")
                             .font(.system(size: 12))
                             .foregroundColor(.secondary)
                     } else if monitor.chargeControlHold == .mechanismUnknown {
@@ -1045,7 +1045,7 @@ struct ContentView: View {
         case .accessDeclined:
             return "Admin access required for charge control. Pause charging or re-enable Auto Charge to grant it."
         case .noMechanism:
-            return "Charge control unavailable: this firmware has no CHTE key and this macOS has no charge limit. Monitoring only."
+            return "Charge control unavailable: this firmware has no CHTE key and this macOS has no charge limit. Monitoring only; Ampere checks again at every poll."
         case .mechanismUnknown:
             return "Charge control on hold: the SMC did not answer. Ampere asks again at every poll."
         case .unlicensed:

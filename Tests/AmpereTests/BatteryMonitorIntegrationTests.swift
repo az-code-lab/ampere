@@ -694,6 +694,90 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         XCTAssertTrue(monitor.sleepHoldActive)
     }
 
+    /// The hold is what keeps a below-lower charge from running past the
+    /// upper bound in sleep. While the helper refuses it, the status line
+    /// says so, and a sleep that begins anyway pauses the charge like one
+    /// between the bounds; wake resumes it and tries the hold again.
+    func testASleepHoldTheHelperRefusedWarnsAndPausesTheChargeAtSleep() {
+        let hw = Hardware()
+        hw.percentage = 30
+        hw.fail("hold-sleep")
+        let monitor = hw.monitor(startMonitoring: true)
+        awaitCondition { hw.writes.contains("hold-sleep") }
+        drainCallbacks()
+        XCTAssertEqual(hw.writes, ["nodischarge", "allow", "spawn-watchdog:\(pid)", "hold-sleep"])
+        XCTAssertTrue(monitor.chargeToUpperBound)
+        XCTAssertFalse(monitor.sleepHoldActive)
+        XCTAssertEqual(monitor.recoveryWarning, BatteryMonitor.sleepHoldFailedWarning)
+        // The lid closes before the retry: the Mac sleeps, so the charge
+        // pauses rather than charging to full with nobody awake.
+        monitor.prepareForSleep()
+        XCTAssertEqual(hw.writes.last, "inhibit")
+        XCTAssertFalse(monitor.chargingPaused, "The pre-sleep pause leaves the state alone, as between the bounds")
+        monitor.resumeAfterWake()
+        awaitCondition { hw.writes.count >= 7 }
+        drainCallbacks()
+        XCTAssertEqual(Array(hw.writes.suffix(2)), ["allow", "hold-sleep"],
+                       "Wake resumes the charge and tries the hold again")
+        XCTAssertEqual(monitor.recoveryWarning, BatteryMonitor.sleepHoldFailedWarning)
+        // Nothing left to hold: unplugging clears the intent on a tick with
+        // no helper call, and the warning with it.
+        let before = hw.writes.count
+        hw.connected = false
+        monitor.refresh()
+        drainCallbacks()
+        XCTAssertNil(monitor.recoveryWarning)
+        XCTAssertEqual(hw.writes.count, before, "A hold never applied has nothing to release")
+        // Plugged in again with pmset answering: the hold engages and no
+        // warning returns.
+        hw.connected = true
+        hw.stopFailing("hold-sleep")
+        monitor.refresh()
+        awaitCondition { monitor.sleepHoldActive }
+        drainCallbacks()
+        XCTAssertNil(monitor.recoveryWarning)
+    }
+
+    /// A discharge start the helper refuses part-way can leave CHIE or the
+    /// sleep override in force, and activeDischarging stays false, so no
+    /// stop path would release them. The app puts them back at once, and a
+    /// rollback that fails too joins the cleanup retry.
+    func testAFailedDischargeStartPutsItsOverridesBackAndRetriesWhenThatFails() {
+        let hw = Hardware()
+        hw.percentage = 70
+        hw.preferences.values["autoDischargeEnabled"] = true
+        let discharge = "discharge:\(pid)"
+        hw.fail(discharge)
+        let monitor = hw.monitor(startMonitoring: true)
+        awaitCondition { hw.writes.count >= 7 }
+        drainCallbacks()
+        XCTAssertEqual(hw.writes, ["nodischarge", "inhibit", "spawn-watchdog:\(pid)",
+                                   "nodischarge", discharge, "nodischarge", "spawn-watchdog:\(pid)"],
+                       "The failed start is rolled back before the watchdog is respawned")
+        XCTAssertFalse(monitor.activeDischarging)
+        XCTAssertNil(monitor.recoveryWarning)
+        // The rollback fails as well: the cleanup retry takes over.
+        let gate = hw.blockNext(discharge)
+        monitor.refresh()
+        XCTAssertEqual(gate.entered.wait(timeout: .now() + 3), .success)
+        hw.fail("nodischarge")
+        gate.release.signal()
+        awaitCondition { hw.writes.count >= 11 }
+        drainCallbacks()
+        XCTAssertEqual(Array(hw.writes.suffix(4)), ["nodischarge", discharge, "nodischarge", "spawn-watchdog:\(pid)"])
+        XCTAssertEqual(monitor.recoveryWarning, BatteryMonitor.cleanupWarning)
+        // The helper answers again: the retry restores, respawns the
+        // watchdog, and the discharge starts on the refresh that follows.
+        hw.stopFailing("nodischarge")
+        hw.stopFailing(discharge)
+        hw.clock = hw.clock.addingTimeInterval(130)
+        monitor.refresh()
+        awaitCondition { monitor.activeDischarging }
+        drainCallbacks()
+        XCTAssertEqual(Array(hw.writes.suffix(4)), ["nodischarge", "spawn-watchdog:\(pid)", "nodischarge", discharge])
+        XCTAssertNil(monitor.recoveryWarning)
+    }
+
     func testStandsByForAnEarlierInstanceAndTakesOverWhenItQuits() {
         let hw = Hardware()
         hw.competing = "Ampere running as alice"
@@ -1256,6 +1340,30 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         XCTAssertTrue(monitor.accountAuthorized, "A helper an earlier version installed is still this account's to revoke")
     }
 
+    /// `pmset -g battlimit` can fail for a moment like any process. That
+    /// must not pass for a macOS without the charge limit for the whole
+    /// session: the decision is made again at every poll.
+    func testNoMechanism_APmsetReadThatRecoversTakesChargeControlAtALaterPoll() {
+        let hw = Hardware()
+        hw.percentage = 50
+        hw.chteMissing = true
+        hw.limitsReadable = false
+        let monitor = hw.monitor(startMonitoring: true)
+        drainCallbacks()
+        XCTAssertEqual(monitor.chargeControlHold, .noMechanism)
+        for _ in 0..<2 { monitor.refresh() }
+        drainCallbacks()
+        XCTAssertEqual(monitor.chargeControlHold, .noMechanism)
+        XCTAssertEqual(hw.writes, [], "Still nothing while pmset keeps failing")
+        hw.limitsReadable = true
+        monitor.refresh()
+        awaitCondition { hw.writes.count >= 3 }
+        XCTAssertNil(monitor.chargeControlHold)
+        XCTAssertTrue(monitor.nativeLimitMode)
+        XCTAssertEqual(Array(hw.writes.prefix(3)), ["nodischarge", "native-limit-release", "spawn-watchdog:\(pid)"],
+                       "Activation runs as it would have at launch")
+    }
+
     func testMechanism_CHTEWinsWhereBothExist() {
         let hw = Hardware()
         hw.percentage = 50
@@ -1316,7 +1424,7 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         let monitor = hw.monitor(startMonitoring: true)
         drainCallbacks()
         XCTAssertEqual(hw.writes, ["nodischarge", "inhibit", "spawn-watchdog:\(pid)"])
-        XCTAssertEqual(monitor.recoveryWarning, BatteryMonitor.launchCleanupWarning)
+        XCTAssertEqual(monitor.recoveryWarning, BatteryMonitor.cleanupWarning)
         // The next polls run the state machine, not the retry.
         for _ in 0..<2 { monitor.refresh() }
         drainCallbacks()
@@ -1327,7 +1435,7 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         awaitCondition { hw.writes.count == 4 }
         drainCallbacks()
         XCTAssertEqual(hw.writes.last, "nodischarge")
-        XCTAssertEqual(monitor.recoveryWarning, BatteryMonitor.launchCleanupWarning)
+        XCTAssertEqual(monitor.recoveryWarning, BatteryMonitor.cleanupWarning)
         monitor.refresh()
         drainCallbacks()
         XCTAssertEqual(hw.writes.count, 4, "Not again before the next interval")
