@@ -785,12 +785,12 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
     }
 
     /// A leftover CHIE from a start whose rollback keeps failing drains the
-    /// battery below the lower bound, where a charge would arm a sleep
-    /// hold. The cleanup retry waits for no hold to be active, so a hold
-    /// armed meanwhile would block it for as long as the battery stayed
-    /// low: no hold is armed while a cleanup is pending, a sleep meanwhile
-    /// pauses the charge, and the hold arms once the cleanup lands.
-    func testAPendingCleanupIsNotBlockedByANewSleepHold() {
+    /// battery below the lower bound, where the charge arms a sleep hold as
+    /// usual. The hold must not stand in the cleanup's way, or the cleanup
+    /// would wait for as long as the leftover kept the battery low: the
+    /// retry runs with the hold engaged, its restore releases the hold, and
+    /// the refresh that follows arms it again.
+    func testAPendingCleanupRunsDespiteANewSleepHoldAndReArmsIt() {
         let hw = Hardware()
         hw.percentage = 80
         hw.preferences.values["autoDischargeEnabled"] = true
@@ -805,28 +805,91 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         XCTAssertTrue(hw.dischargeApplied, "The helper applied CHIE, failed, and its rollback failed too")
         XCTAssertFalse(monitor.activeDischarging)
         // Auto Discharge is turned off, and the leftover CHIE drains the
-        // battery below the lower bound while the helper keeps refusing.
+        // battery below the lower bound while the helper keeps refusing:
+        // the due retry fails, and the charge then arms its hold as usual.
         monitor.autoDischargeEnabled = false
         hw.percentage = 30
-        for _ in 0..<3 { monitor.refresh() }
-        drainCallbacks()
-        XCTAssertTrue(monitor.chargeToUpperBound)
-        XCTAssertFalse(hw.writes.contains("hold-sleep"), "No hold while the cleanup is pending")
-        XCTAssertFalse(monitor.sleepHoldActive)
-        XCTAssertEqual(monitor.recoveryWarning, BatteryMonitor.cleanupWarning)
-        // A sleep meanwhile pauses the charge, like any sleep without a hold.
-        monitor.prepareForSleep()
-        XCTAssertEqual(hw.writes.last, "inhibit")
-        monitor.resumeAfterWake()
-        drainCallbacks()
-        // The helper answers again: the due retry restores, and the hold
-        // arms on the refresh that follows.
-        hw.stopFailing("nodischarge")
         hw.clock = hw.clock.addingTimeInterval(130)
+        monitor.refresh()
+        awaitCondition { hw.writes.filter { $0 == "nodischarge" }.count == 4 }
+        drainCallbacks()
+        XCTAssertEqual(monitor.recoveryWarning, BatteryMonitor.cleanupWarning)
         monitor.refresh()
         awaitCondition { monitor.sleepHoldActive }
         drainCallbacks()
-        XCTAssertFalse(hw.dischargeApplied, "The outstanding CHIE cleanup landed")
+        XCTAssertTrue(monitor.chargeToUpperBound)
+        XCTAssertEqual(Array(hw.writes.suffix(2)), ["allow", "hold-sleep"],
+                       "A pending cleanup does not keep the Mac from being held awake")
+        // The helper answers again: the retry runs with the hold engaged,
+        // its restore releases the hold, and the refresh that follows arms
+        // it again.
+        hw.stopFailing("nodischarge")
+        hw.clock = hw.clock.addingTimeInterval(130)
+        monitor.refresh()
+        awaitCondition { !hw.dischargeApplied && hw.writes.last == "hold-sleep" }
+        drainCallbacks()
+        XCTAssertEqual(Array(hw.writes.suffix(3)), ["nodischarge", "spawn-watchdog:\(pid)", "hold-sleep"])
+        XCTAssertTrue(monitor.sleepHoldActive)
+        XCTAssertNil(monitor.recoveryWarning)
+        XCTAssertEqual(hw.writes.filter { $0 == discharge }.count, 1, "Discharge was off: no new start")
+    }
+
+    /// The hold can already be engaged when a discharge start fails: the
+    /// battery reads above the upper bound at a poll before the state
+    /// machine released the hold, the start's first nodischarge releases it
+    /// at the helper, and the app's flag goes stale. If the helper then
+    /// refuses the release too until the leftover CHIE has drained the
+    /// battery below the lower bound, the flag matches the intent again and
+    /// nothing would ever correct it. The cleanup retry must not wait for
+    /// it: the restore lands, the flag is forgotten, and the hold re-arms.
+    func testAPendingCleanupIsNotBlockedByAStaleSleepHoldFlag() {
+        let hw = Hardware()
+        hw.percentage = 30
+        hw.preferences.values["autoDischargeEnabled"] = true
+        hw.dischargeFailsAfterApplying = true
+        let monitor = hw.monitor(startMonitoring: true)
+        awaitCondition { monitor.sleepHoldActive }
+        drainCallbacks()
+        XCTAssertEqual(hw.writes, ["nodischarge", "allow", "spawn-watchdog:\(pid)", "hold-sleep"])
+        hw.percentage = 80
+        let discharge = "discharge:\(pid)"
+        let gate = hw.blockNext(discharge)
+        monitor.refresh()
+        XCTAssertEqual(gate.entered.wait(timeout: .now() + 3), .success)
+        hw.fail("nodischarge")
+        hw.fail("release-sleep-hold")
+        gate.release.signal()
+        awaitCondition { monitor.recoveryWarning == BatteryMonitor.cleanupWarning }
+        XCTAssertTrue(hw.dischargeApplied)
+        XCTAssertTrue(monitor.sleepHoldActive, "Stale: the start's own nodischarge released the hold")
+        // Auto Discharge is turned off (a start is otherwise tried again at
+        // every poll above the bound). At the bound the state machine
+        // inhibits and asks for the release, which the helper refuses.
+        monitor.autoDischargeEnabled = false
+        monitor.refresh()
+        awaitCondition { hw.writes.contains("release-sleep-hold") }
+        drainCallbacks()
+        XCTAssertTrue(monitor.chargingPaused)
+        XCTAssertTrue(monitor.sleepHoldActive)
+        // The leftover CHIE drains the battery below the lower bound: the
+        // charge wants a hold, which the stale flag says is in force, so
+        // no hold op is issued any more.
+        hw.percentage = 30
+        monitor.refresh()
+        awaitCondition { !monitor.chargingPaused }
+        drainCallbacks()
+        XCTAssertTrue(monitor.chargeToUpperBound)
+        XCTAssertTrue(monitor.sleepHoldActive)
+        // The helper answers again: the due retry restores regardless of
+        // the flag, forgets the hold, and the refresh that follows arms it.
+        hw.stopFailing("nodischarge")
+        hw.stopFailing("release-sleep-hold")
+        hw.clock = hw.clock.addingTimeInterval(130)
+        monitor.refresh()
+        awaitCondition { !hw.dischargeApplied && hw.writes.last == "hold-sleep" }
+        drainCallbacks()
+        XCTAssertEqual(Array(hw.writes.suffix(3)), ["nodischarge", "spawn-watchdog:\(pid)", "hold-sleep"])
+        XCTAssertTrue(monitor.sleepHoldActive)
         XCTAssertNil(monitor.recoveryWarning)
         XCTAssertEqual(hw.writes.filter { $0 == discharge }.count, 1, "Discharge was off: no new start")
     }

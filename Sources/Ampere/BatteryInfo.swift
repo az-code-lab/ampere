@@ -1767,9 +1767,10 @@ final class BatteryMonitor: ObservableObject {
 
     /// Finish a cleanup whose nodischarge failed (see cleanupPending): the
     /// same restore, then a fresh watchdog, since a nodischarge that
-    /// succeeds retires the running one. Success re-runs refresh so the
-    /// state machine sees the restored state at once; failure waits for
-    /// the next interval.
+    /// succeeds retires the running one. Success forgets a sleep hold the
+    /// restore released and re-runs refresh, so the state machine sees the
+    /// restored state at once and arms the hold again while still wanted;
+    /// failure waits for the next interval.
     private func retryCleanup() {
         guard isSudoRuleInstalled else { return }
         autoManageInFlight = true
@@ -1784,6 +1785,13 @@ final class BatteryMonitor: ObservableObject {
                 self.autoManageInFlight = false
                 if ok {
                     AmpereLog.app("Ampere: Cleanup completed on retry")
+                    // The restore put the sleep settings back, a hold of
+                    // ours included: the refresh below arms it again while
+                    // the state machine still wants it.
+                    if self.sleepHoldActive {
+                        self.sleepHoldActive = false
+                        AmpereLog.app("Ampere: The cleanup released the sleep hold; re-arming while still wanted")
+                    }
                     self.refresh()
                 } else {
                     AmpereLog.app("Ampere: Cleanup retry failed; next attempt in %d s",
@@ -2711,11 +2719,17 @@ final class BatteryMonitor: ObservableObject {
 
         // A cleanup whose restore failed (the launch's, or a failed
         // discharge start's rollback) is finished here, one attempt per
-        // interval, while nothing of this session's own has re-armed the
-        // same overrides (their own release restores the shared markers;
-        // no new hold is armed while this is pending, see holdOpNeeded).
-        // The state machine runs on the other ticks.
-        if cleanupPending, !autoManageInFlight, !activeDischarging, !sleepHoldActive,
+        // interval, never during a discharge of this session's own (its
+        // stop path owns the markers then). A sleep hold of this session's
+        // does not stand in the way: the restore releases it along with
+        // everything else, and retryCleanup then forgets it, so the refresh
+        // that follows arms it again while still wanted. Waiting for the
+        // hold instead would wait forever when a leftover CHIE keeps the
+        // battery below the lower bound, where the hold is wanted for as
+        // long as the charge lasts, or when the flag is stale because the
+        // helper refused the release. The state machine runs on the other
+        // ticks.
+        if cleanupPending, !autoManageInFlight, !activeDischarging,
            io.now() >= cleanupRetryAt {
             cleanupRetryAt = io.now().addingTimeInterval(Self.cleanupRetrySeconds)
             retryCleanup()
@@ -2964,18 +2978,12 @@ final class BatteryMonitor: ObservableObject {
             // here would re-enable sleep mid-CHIE (the clamshell blackout).
             // The mismatch resolves right after the discharge stops — its
             // stop path restores sleep and removes the markers, so a later
-            // release is a clean no-op. Nor is a hold armed while a cleanup
-            // is pending (cleanupPending): the nodischarge it waits for
-            // restores the shared markers, undoing a hold armed meanwhile,
-            // and the retry itself waits for no hold to be active, so a
-            // hold armed here would block the cleanup for as long as a
-            // leftover CHIE kept the battery below the lower bound. The
-            // hold arms on the refresh that follows the cleanup; a sleep
-            // meanwhile pauses the charge (prepareForSleep). A release is
-            // never held back.
+            // release is a clean no-op. A pending cleanup (cleanupPending)
+            // holds nothing back: its retry restores a hold armed meanwhile
+            // along with everything else and forgets it, and the refresh
+            // that follows arms it again (retryCleanup).
             let holdOpNeeded = !activeDischarging
                 && decision.newState.sleepHold != sleepHoldActive
-                && !(decision.newState.sleepHold && cleanupPending)
             if (decision.action != .none || holdOpNeeded || wakeReassertPending), !autoManageInFlight {
                 autoManageInFlight = true
                 let reassert = wakeReassertPending
