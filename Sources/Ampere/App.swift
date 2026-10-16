@@ -1294,7 +1294,7 @@ struct ContentView: View {
             // lock while the feature is withheld, like the bounds row's.
             Image(systemName: locked ? "lock.fill" : "cup.and.saucer.fill")
                 .font(.system(size: 14))
-                .foregroundColor(locked ? .orange : monitor.keepAwakeEnabled ? .accentColor : .secondary)
+                .foregroundColor(!locked && monitor.keepAwakeEnabled ? .accentColor : .secondary)
                 .frame(width: 26)
             Text("Keep Awake")
                 .font(.system(size: 13, weight: .semibold))
@@ -1305,24 +1305,19 @@ struct ContentView: View {
             }
             Spacer()
             if locked {
-                // Keep Awake is a paid feature: the controls make way for the
-                // link to the registration window, as the bounds row's do,
-                // and the same orange call as the Registration row's.
-                Button(action: {
-                    NotificationCenter.default.post(name: .ampereShowRegistrationWindow, object: nil)
-                }) {
-                    Text("Buy a license to use")
-                        .font(.system(size: 12))
-                        .foregroundColor(.orange)
-                }
-                .buttonStyle(.plain)
+                // Keep Awake is a paid feature: the controls make way for
+                // the Unlock… button the bounds row ends in too (a quiet
+                // text control, not a sales line; the owner's call,
+                // 2026-10-16). The lock stays grey for the same reason: a
+                // free license is nothing to put right.
+                UnlockButton()
             } else {
                 keepAwakeControls(onPower: onPower)
             }
         }
         .padding(.horizontal, 16)
         .help(locked
-            ? "Keep Awake needs a paid license: it keeps the Mac awake while a power adapter is connected, for a chosen duration, with an option to keep the display on. Click the link to open the registration window; a paid license also unlocks custom charge bounds."
+            ? "Keep Awake needs a paid license: it keeps the Mac awake while a power adapter is connected, for a chosen duration, with an option to keep the display on. Unlock… opens the registration window; a paid license also unlocks custom charge bounds."
             : !onPower
             ? "Unavailable on battery: the Mac sleeps normally. Connect a power adapter to turn Keep Awake on; unplugging ends a session, and plugging back in does not restart it."
             : monitor.keepAwakeEnabled
@@ -2406,7 +2401,7 @@ struct BatteryRangeSlider: View {
     /// BatteryMonitor.chargeBoundsLocked): both draggers are drawn as usual,
     /// since the range they mark is in force, but ignore drags, keep the
     /// arrow cursor, and say why in their tooltips. The panel puts a
-    /// ChargeBoundsLockRow with the registration link beneath the slider.
+    /// ChargeBoundsLockRow with its Unlock… button beneath the slider.
     var locked: Bool = false
 
     private let batteryHeight: CGFloat = 28
@@ -2554,10 +2549,11 @@ struct BatteryRangeSlider: View {
 
 /// Shown beneath the range slider while the bounds are locked (a free
 /// license; an unregistered copy has no slider, its charge control being on
-/// hold): names the lock and links to the registration window, where the
-/// way to a paid license is. Same layout as the toggle rows it sits among
-/// (icon in a 26pt column, semibold label, trailing control) and the same
-/// orange call as the settings' Registration row.
+/// hold): names the lock and ends in the Unlock… button (UnlockButton),
+/// which opens the registration window, where the way to a paid license
+/// is. Same layout as the toggle rows it sits among (icon in a 26pt
+/// column, semibold label, trailing control), and as quiet: a grey lock
+/// and a text button, since a free license is nothing to put right.
 struct ChargeBoundsLockRow: View {
     let lower: Int
     let upper: Int
@@ -2566,21 +2562,34 @@ struct ChargeBoundsLockRow: View {
         HStack {
             Image(systemName: "lock.fill")
                 .font(.system(size: 14))
-                .foregroundColor(.orange)
+                .foregroundColor(.secondary)
                 .frame(width: 26)
             Text("Charge Bounds")
                 .font(.system(size: 13, weight: .semibold))
             Spacer()
-            Button(action: {
-                NotificationCenter.default.post(name: .ampereShowRegistrationWindow, object: nil)
-            }) {
-                Text("Buy a license to change")
-                    .font(.system(size: 12))
-                    .foregroundColor(.orange)
-            }
-            .buttonStyle(.plain)
+            UnlockButton()
         }
-        .help("Charge bounds are locked at the default \(lower) to \(upper)% on a free license; a paid license lets you set your own. Click the link to open the registration window.")
+        .help("Charge bounds are locked at the default \(lower) to \(upper)% on a free license; a paid license lets you set your own. Unlock… opens the registration window.")
+    }
+}
+
+// MARK: - Unlock Button
+
+/// The trailing control of a row whose feature a free license withholds
+/// (ChargeBoundsLockRow, the Keep Awake row): "Unlock…", in the panel's
+/// quiet text-button style (FooterButtonStyle, as the settings' Revoke),
+/// opening the registration window, where a paid license is explained and
+/// bought. One word rather than a "Buy a license to…" line (the owner's
+/// call, 2026-10-16): the lock in the row's icon column says what is
+/// withheld, and the tooltips say why. Only a free license ever shows it;
+/// an unregistered copy has no panel.
+struct UnlockButton: View {
+    var body: some View {
+        Button("Unlock…") {
+            NotificationCenter.default.post(name: .ampereShowRegistrationWindow, object: nil)
+        }
+        .buttonStyle(FooterButtonStyle())
+        .help("Opens the registration window, where a paid license is explained and bought: it unlocks custom charge bounds and Keep Awake")
     }
 }
 
@@ -2623,7 +2632,10 @@ struct RegistrationView: View {
         }
         .textSelection(.enabled)
         .padding(20)
-        .frame(width: 440)
+        // Wide enough for the unregistered face's four buttons (Get Free
+        // License, Buy a License…, Quit Ampere, Register) at full length:
+        // at 440 the first two truncated to "Get Free Lice…".
+        .frame(width: 500)
         .onChange(of: focus) {
             if let focus { lastFocus = focus }
         }
