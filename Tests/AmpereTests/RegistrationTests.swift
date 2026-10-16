@@ -1,4 +1,5 @@
 import XCTest
+import Combine
 @testable import Ampere
 
 /// The registration client against a license server of the test's own. A
@@ -317,7 +318,171 @@ final class RegistrationTests: XCTestCase {
         XCTAssertEqual(registration.lastError, RegistrationManager.lapsedMessage)
     }
 
+    // MARK: The free license (the owner's call, 2026-10-16)
+
+    /// The server says which kind a key is with every answer (`is_trial`,
+    /// the field DBClient's trial travels under). Unsaid, or nonsense, means
+    /// bought: a paid registration can never be read as a free one.
+    func testLicenseFacts_ReadWhetherTheKeyIsFree() throws {
+        XCTAssertTrue(try facts(#"{"name":"Ada","max_devices":1,"is_trial":true}"#).isFree)
+        XCTAssertFalse(try facts(#"{"name":"Ada","max_devices":5,"is_trial":false}"#).isFree)
+        for unsaid in [#"{"name":"Ada","max_devices":5}"#, #"{"is_trial":null}"#, #"{"is_trial":"yes"}"#] {
+            XCTAssertFalse(try facts(unsaid).isFree, unsaid)
+        }
+    }
+
+    func testTier_FollowsTheRegistrationAndTheKind() {
+        XCTAssertEqual(RegistrationManager.tier(registered: false, free: false), .unlicensed)
+        XCTAssertEqual(RegistrationManager.tier(registered: false, free: true), .unlicensed,
+                       "a free key the copy is not registered to allows nothing")
+        XCTAssertEqual(RegistrationManager.tier(registered: true, free: true), .free)
+        XCTAssertEqual(RegistrationManager.tier(registered: true, free: false), .paid)
+    }
+
+    /// Existing paid users: a registration made by a build from before the
+    /// free license stored no kind. It is a paid one, since every key before
+    /// then was bought, so the update locks nothing: not the bounds, not
+    /// Keep Awake. The first verify after the update says so too, and a
+    /// server that says nothing of the kind leaves it paid.
+    func testARegistrationFromAnEarlierBuild_IsAPaidOne() {
+        defaults.set(true, forKey: "registration.active")
+        defaults.set("ada@example.com", forKey: "registration.email")
+        defaults.set("AMP-AAAAA-BBBBB", forKey: "registration.licenseKey")
+        let registration = RegistrationManager(defaults: defaults, deviceSerial: Self.serial)
+        XCTAssertTrue(registration.isRegistered)
+        XCTAssertFalse(registration.isFree)
+        XCTAssertEqual(registration.tier, .paid)
+
+        var tiers: [LicenseTier] = []
+        let subscription = registration.tierPublisher.sink { tiers.append($0) }
+        defer { subscription.cancel() }
+        waitUntil(!tiers.isEmpty)
+        XCTAssertEqual(tiers, [.paid], "the publisher opens with the tier in force")
+
+        LicenseServerStub.answer = { _ in (200, #"{"valid":true,"license":{"product":"ampere","email":"ada@example.com","name":"Ada","max_devices":5,"device_count":1,"is_trial":false}}"#) }
+        registration.verify()
+        waitUntil(registration.maxDevices == 5)
+        XCTAssertEqual(registration.tier, .paid)
+        LicenseServerStub.answer = { _ in (200, #"{"valid":true,"license":{"product":"ampere","email":"ada@example.com","name":"Ada King","max_devices":5}}"#) }
+        registration.verify()
+        waitUntil(registration.name == "Ada King")
+        XCTAssertEqual(registration.tier, .paid, "a server that says nothing of the kind leaves a paid key paid")
+        waitUntil(false, timeout: 0.2)
+        XCTAssertEqual(tiers, [.paid], "nothing of this moved the tier")
+        XCTAssertEqual(RegistrationManager(defaults: defaults, deviceSerial: Self.serial).tier, .paid)
+    }
+
+    /// The free license, end to end: asked for with a name and an address,
+    /// the key comes by mail and never in the answer; entered, it registers
+    /// through the ordinary register call and the copy is on the free tier;
+    /// the daily check that ends it says so in the free license's words.
+    func testRequestFreeLicense_MailsTheKey_AndTheKeyRegistersTheFreeTier() {
+        LicenseServerStub.answer = { path in
+            path.hasSuffix("/trial")
+                ? (200, #"{"product":"ampere","email":"ada@example.com","name":"Ada Lovelace","device_serial":"C02TEST12345","max_devices":1,"device_count":0,"is_trial":true,"status":"available"}"#)
+                : (200, #"{"license_key":"AMP-FREE1-00001","product":"ampere","email":"ada@example.com","name":"Ada Lovelace","device_serial":"C02TEST12345","max_devices":1,"device_count":1,"is_trial":true,"status":"active"}"#)
+        }
+        let registration = RegistrationManager(defaults: defaults, deviceSerial: Self.serial)
+        var tiers: [LicenseTier] = []
+        // Each tier must arrive once the registration's own properties agree
+        // with it: a subscriber that saw them mid-change would act, and let
+        // the window draw, the old state (see tierPublisher).
+        var deliveredMidChange = false
+        let subscription = registration.tierPublisher.sink { tier in
+            tiers.append(tier)
+            if registration.tier != tier { deliveredMidChange = true }
+        }
+        defer { subscription.cancel() }
+
+        // A form with nothing of the free license's in it asks nothing.
+        XCTAssertFalse(requestFreeLicense(registration, name: "  ", email: "ada@example.com"))
+        XCTAssertEqual(registration.lastError, "Enter your name and the email address the free license should be issued to")
+        XCTAssertTrue(LicenseServerStub.calls.isEmpty)
+
+        XCTAssertTrue(requestFreeLicense(registration, name: " Ada Lovelace ", email: " Ada@Example.com "))
+        XCTAssertFalse(registration.isRegistered, "the key is in the mail, not in the answer")
+        XCTAssertTrue(registration.isFree)
+        XCTAssertEqual(registration.licenseKey, "")
+        XCTAssertEqual(registration.email, "ada@example.com")
+        XCTAssertEqual(registration.name, "Ada Lovelace")
+        XCTAssertNil(registration.lastError)
+        XCTAssertEqual(registration.tier, .unlicensed)
+        let asked = LicenseServerStub.calls.last
+        XCTAssertEqual(asked?.path, "/api/pub/license/trial")
+        XCTAssertEqual(asked?.body["name"] as? String, "Ada Lovelace")
+        XCTAssertEqual(asked?.body["email"] as? String, "ada@example.com")
+        XCTAssertEqual(asked?.body["device_serial"] as? String, Self.serial)
+        XCTAssertEqual(asked?.body["product"] as? String, "ampere")
+        XCTAssertNotNil(asked?.body["app_version"], "the version says this build takes the key from its mailbox")
+        XCTAssertEqual(asked?.body.count, 5, "and nothing more goes along")
+        // What the window says meanwhile, and after a launch.
+        XCTAssertTrue(RegistrationManager.pendingFreeKeyMessage(email: registration.email).contains("emailed to ada@example.com"))
+        let waiting = RegistrationManager(defaults: defaults, deviceSerial: Self.serial)
+        XCTAssertTrue(waiting.isFree && !waiting.isRegistered && waiting.licenseKey.isEmpty)
+
+        // The key, entered from the mail, registers like any key.
+        XCTAssertTrue(register(registration, email: "ada@example.com", key: "amp-free1-00001"))
+        XCTAssertTrue(registration.isRegistered)
+        XCTAssertTrue(registration.isFree)
+        XCTAssertEqual(registration.tier, .free)
+        XCTAssertEqual(registration.maxDevices, 1)
+        XCTAssertEqual(LicenseServerStub.calls.last?.path, "/api/pub/license/register")
+        XCTAssertEqual(LicenseServerStub.calls.last?.body["license_key"] as? String, "AMP-FREE1-00001")
+        XCTAssertEqual(RegistrationManager(defaults: defaults, deviceSerial: Self.serial).tier, .free, "kept for the next launch")
+
+        // Off the key (released, or this Mac deregistered elsewhere): the
+        // check ends it in the free license's words, the key stays in the
+        // form, and the window keeps saying why until the next attempt.
+        LicenseServerStub.answer = { _ in (200, #"{"valid":false}"#) }
+        registration.verify()
+        waitUntil(!registration.isRegistered)
+        XCTAssertEqual(registration.tier, .unlicensed)
+        XCTAssertTrue(registration.isFree)
+        XCTAssertEqual(registration.licenseKey, "AMP-FREE1-00001")
+        XCTAssertEqual(registration.lastError, RegistrationManager.freeLapsedMessage)
+        registration.windowOpened()
+        XCTAssertEqual(registration.lastError, RegistrationManager.freeLapsedMessage)
+        waitUntil(tiers.count == 3)
+        XCTAssertEqual(tiers, [.unlicensed, .free, .unlicensed], "each change once: the publisher drops repeats")
+        XCTAssertFalse(deliveredMidChange, "every tier arrived after the registration had changed, never during")
+    }
+
+    /// A refusal — the address or this Mac already had one, a mail that
+    /// could not go — reaches the user in the server's words and changes
+    /// nothing. A paid key registered afterwards is a paid registration:
+    /// the kind follows the key, not the request that came before.
+    func testRequestFreeLicense_ARefusalIsShownInTheServersWords_AndAPaidKeyIsPaid() {
+        let refused = "A free license was already issued to this email address."
+        LicenseServerStub.answer = { path in
+            path.hasSuffix("/trial")
+                ? (403, "\"\(refused)\"")
+                : (200, #"{"license_key":"AMP-PAID1-00001","product":"ampere","email":"ada@example.com","name":"Ada","max_devices":5,"device_count":1,"is_trial":false}"#)
+        }
+        let registration = RegistrationManager(defaults: defaults, deviceSerial: Self.serial)
+        XCTAssertFalse(requestFreeLicense(registration, name: "Ada", email: "ada@example.com"))
+        XCTAssertEqual(registration.lastError, refused)
+        XCTAssertFalse(registration.isFree)
+        XCTAssertFalse(registration.isRegistered)
+
+        XCTAssertTrue(register(registration, email: "ada@example.com", key: "AMP-PAID1-00001"))
+        XCTAssertEqual(registration.tier, .paid)
+        XCTAssertNil(registration.lastError)
+    }
+
     // MARK: Helpers
+
+    /// Asks for a free license and waits for the answer, which arrives on
+    /// the main queue.
+    private func requestFreeLicense(_ registration: RegistrationManager, name: String, email: String) -> Bool {
+        let answered = expectation(description: "free license answered")
+        var result = false
+        registration.requestFreeLicense(name: name, email: email) { mailed in
+            result = mailed
+            answered.fulfill()
+        }
+        wait(for: [answered], timeout: 5)
+        return result
+    }
 
     private func facts(_ json: String) throws -> LicenseFacts {
         let object = try JSONSerialization.jsonObject(with: Data(json.utf8))

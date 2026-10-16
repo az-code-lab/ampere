@@ -49,8 +49,10 @@ final class KeepAwakeTests: XCTestCase {
 
     // MARK: - When a session ends on its own
 
-    private func end(enabled: Bool = true, ac: Bool? = true, deadline: Date? = nil) -> BatteryMonitor.KeepAwakeSessionEnd? {
-        BatteryMonitor.keepAwakeSessionEnd(enabled: enabled, adapterConnected: ac, deadline: deadline, now: now)
+    private func end(enabled: Bool = true, ac: Bool? = true, deadline: Date? = nil,
+                     locked: Bool = false) -> BatteryMonitor.KeepAwakeSessionEnd? {
+        BatteryMonitor.keepAwakeSessionEnd(enabled: enabled, adapterConnected: ac, deadline: deadline, now: now,
+                                           locked: locked)
     }
 
     func testSessionEnd_RunningSessionOnACKeepsRunning() {
@@ -110,9 +112,9 @@ final class KeepAwakeTests: XCTestCase {
     // MARK: - Which assertion (the display option)
 
     private func assertion(enabled: Bool = true, display: Bool, ac: Bool = true,
-                           deadline: Date? = nil) -> BatteryMonitor.KeepAwakeAssertion? {
+                           deadline: Date? = nil, locked: Bool = false) -> BatteryMonitor.KeepAwakeAssertion? {
         BatteryMonitor.keepAwakeAssertion(enabled: enabled, display: display, adapterConnected: ac,
-                                          deadline: deadline, now: now)
+                                          deadline: deadline, now: now, locked: locked)
     }
 
     func testAssertion_DisplayOptionPicksTheDisplayKind() {
@@ -132,5 +134,31 @@ final class KeepAwakeTests: XCTestCase {
         XCTAssertEqual(BatteryMonitor.KeepAwakeAssertion.display.type as String, "PreventUserIdleDisplaySleep")
         XCTAssertNotEqual(BatteryMonitor.KeepAwakeAssertion.system.name, BatteryMonitor.KeepAwakeAssertion.display.name,
                           "pmset -g assertions must tell the two apart")
+    }
+
+    // MARK: - The paid license (keepAwakeLocked)
+
+    /// Keep Awake is a paid feature: without the paid license nothing is
+    /// held, whatever the switch, the adapter and the deadline say; with it
+    /// (the default, so every rule above is a paid copy's) all is as before.
+    func testLocked_NeverDesired() {
+        XCTAssertFalse(BatteryMonitor.keepAwakeAssertionDesired(
+            enabled: true, adapterConnected: true, deadline: nil, now: now, locked: true))
+        XCTAssertFalse(BatteryMonitor.keepAwakeAssertionDesired(
+            enabled: true, adapterConnected: true, deadline: now.addingTimeInterval(3600), now: now, locked: true))
+        XCTAssertNil(assertion(display: true, locked: true))
+        XCTAssertNil(assertion(display: false, locked: true))
+        XCTAssertEqual(assertion(display: false, locked: false), .system)
+    }
+
+    /// Losing the paid license mid-session ends the session, ahead of the
+    /// deadline and the adapter, and even while the adapter state is
+    /// unknown; a copy with no session has nothing to end.
+    func testSessionEnd_LosingThePaidLicenseEndsTheSession() {
+        XCTAssertEqual(end(locked: true), .locked)
+        XCTAssertEqual(end(ac: false, deadline: now, locked: true), .locked)
+        XCTAssertEqual(end(ac: nil, locked: true), .locked)
+        XCTAssertNil(end(enabled: false, locked: true))
+        XCTAssertNil(end(locked: false), "a paid license changes nothing")
     }
 }

@@ -66,11 +66,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // button with no action and are no-ops, which is the right behavior
         // until the popover is wired up below.
         // RegistrationManager first (cheap: defaults reads and a timer). The
-        // monitor's init locks the charge bounds to the defaults for an
-        // unregistered copy, and that has to be settled before its
-        // launch-time inhibit/allow decision reads the lower bound.
+        // monitor's init reads the license tier: it locks the charge bounds
+        // to the defaults unless the key is a paid one, withholds Keep
+        // Awake, and leaves charge control on hold for an unregistered
+        // copy, all settled before its launch-time decisions.
         registration = RegistrationManager()
-        monitor = BatteryMonitor(chargeBoundsLocked: !registration.isRegistered)
+        monitor = BatteryMonitor(license: registration.tier)
 
         // 3. Wire the button to togglePopover and refresh the icon with real
         // data. Done after monitor is ready so updateMenuBarIcon can read it.
@@ -99,17 +100,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 self?.popover.behavior = (pinned || sheetVisible) ? .applicationDefined : .transient
             }
 
-        // Custom charge bounds are the licensed feature: mirror the
-        // registration state into the monitor's lock. Fires for the initial
-        // value too (a no-op, init already applied it) and for every later
-        // flip, whether from the registration window or a daily verify that
-        // finds this Mac off its key (released under My Licenses, or replaced
-        // on a one-Mac key) or the license ended or revoked. The reset must
+        // What the license allows is the monitor's to act on: mirror the
+        // registration's tier into it. Fires for the initial value too (a
+        // no-op, init already applied it) and for every later change,
+        // whether from the registration window (a free or a paid key
+        // registered, Deregister This Mac) or a daily verify that finds this
+        // Mac off its key (released under My Licenses, or replaced on a
+        // one-Mac key) or the license ended or revoked. The bounds reset,
+        // the end of a Keep Awake session and the charge-control hold must
         // not depend on the panel being open, hence here and not in the view.
-        registrationObserver = registration.$isRegistered
-            .removeDuplicates()
-            .sink { [weak self] registered in
-                self?.monitor.chargeBoundsLocked = !registered
+        registrationObserver = registration.tierPublisher
+            .sink { [weak self] tier in
+                guard let self else { return }
+                self.monitor.licenseTier = tier
+                self.applyLicenseGate(tier: tier)
             }
 
         // The panel's Registration row posts this; the window is owned here.
@@ -172,6 +176,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var lastIconDark: Bool = false
     private var lastIconShowPct: Bool = true
     private var lastIconPanelAnchored: Bool = false
+    private var lastIconGated: Bool = false
+    /// The icon's hover text while the copy is gated at the registration window.
+    private static let gatedToolTip = "Ampere needs a license: register one (a free license takes a name and an email address), or quit. Click to open the registration window."
     /// Whether the last rendered title occupied its full width (visible or
     /// clear glyphs, as opposed to the empty icon-only title).
     private var lastTitleWide = true
@@ -204,6 +211,27 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let hasUpdate = monitor.updateAvailable != nil
         let dark = menuBarIsDark
         let showPct = monitor.showMenuBarPercent
+
+        // Gated (no license): an empty outline with no level and no percent,
+        // the animation stopped, and a tooltip that says what to do. Drawn
+        // once per appearance; the regular path below redraws in full once
+        // the gate lifts (lastIconPct is reset so its skip guard fails).
+        if licenseGated {
+            if !lastIconGated || dark != lastIconDark {
+                animationTimer?.invalidate()
+                animationTimer = nil
+                button.image = Self.renderMenuBarIcon(percentage: 0, hasWarning: false, hasUpdate: false,
+                                                      darkMenuBar: dark, gated: true)
+                button.attributedTitle = NSAttributedString(string: "")
+                lastTitleWide = false
+                lastIconGated = true
+                lastIconDark = dark
+                lastIconPct = -1
+            }
+            if button.toolTip != Self.gatedToolTip { button.toolTip = Self.gatedToolTip }
+            return
+        }
+        lastIconGated = false
 
         // Refresh the hover tooltip before the render-skip guard below: the
         // status line's ETA ticks along even when nothing the icon renders
@@ -316,6 +344,40 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         return lines.isEmpty ? nil : lines.joined(separator: "\n")
     }
 
+    /// True while the copy has no license: it is held at the registration
+    /// window, where the choice is to register (a free license takes a name
+    /// and an email address) or to quit (the owner's call, 2026-10-16).
+    /// While it holds, the window cannot be closed and stands in for the
+    /// panel: the menu bar item opens it, the icon is an empty outline, and
+    /// nothing else of the app is reachable. Entered at launch and the
+    /// moment a registration lapses; left the moment a key registers, after
+    /// which the window closes like any other. The monitor's own hold
+    /// (ChargeControlHold.unlicensed) sees to it that nothing is written
+    /// meanwhile.
+    ///
+    /// Stored, not read off the registration: the tier sink that sets it
+    /// runs while the registration's own properties still hold their old
+    /// values (a published property emits before it changes), so the
+    /// delivered tier is the only thing that is current there.
+    private var licenseGated = false
+
+    /// Bring the window up and take the panel down when the gate engages;
+    /// let the window close again when it lifts. Run for the initial tier
+    /// at launch and for every change after (the tier sink).
+    private func applyLicenseGate(tier: LicenseTier) {
+        licenseGated = tier == .unlicensed
+        if licenseGated {
+            // The panel, attached or torn off, goes; the window takes its
+            // place. (A sheet keeps the popover open until it is dismissed,
+            // see popoverShouldClose; the window still comes up in front.)
+            if popover.isShown { popover.performClose(nil) }
+            showRegistrationWindow()
+        }
+        // Not closable while gated: the way out is a key, or Quit.
+        registrationWindow?.styleMask = licenseGated ? [.titled] : [.titled, .closable]
+        updateMenuBarIcon()
+    }
+
     private func showRegistrationWindow() {
         // Already open: just bring it forward — replacing the content view
         // mid-flight would wipe whatever the user has typed.
@@ -327,7 +389,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         popover.performClose(nil)
         let window = registrationWindow ?? {
             let window = NSWindow(contentRect: .zero,
-                                  styleMask: [.titled, .closable],
+                                  styleMask: licenseGated ? [.titled] : [.titled, .closable],
                                   backing: .buffered, defer: false)
             window.title = "Ampere Registration"
             // Reused across opens; a fresh RegistrationView is installed
@@ -336,11 +398,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             registrationWindow = window
             return window
         }()
-        window.contentViewController = NSHostingController(
-            rootView: RegistrationView(registration: registration) { [weak self] in
-                self?.registrationWindow?.close()
-            }
-        )
+        // A hosting view that takes the first click (FirstMouseHostingView),
+        // with the sizing NSHostingController gives a window's content: the
+        // window follows the view as the form changes.
+        let content = FirstMouseHostingView(rootView: RegistrationView(registration: registration) { [weak self] in
+            self?.registrationWindow?.close()
+        })
+        content.sizingOptions = [.minSize, .intrinsicContentSize, .maxSize]
+        window.contentView = content
+        window.setContentSize(content.fittingSize)
         window.center()
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
@@ -348,6 +414,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     @objc private func togglePopover() {
         guard let button = statusItem.button else { return }
+        // Gated (no license): the registration window stands in for the panel.
+        if licenseGated {
+            showRegistrationWindow()
+            return
+        }
         if popover.isShown {
             popover.performClose(nil)
         } else {
@@ -496,7 +567,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// erase the badge's blue and the warning's orange. Those variants render
     /// non-template, picking the battery color from `darkMenuBar` manually.
     static func renderMenuBarIcon(percentage: CGFloat, hasWarning: Bool,
-                                  hasUpdate: Bool, darkMenuBar: Bool) -> NSImage {
+                                  hasUpdate: Bool, darkMenuBar: Bool, gated: Bool = false) -> NSImage {
         let battW: CGFloat = 24
         let battH: CGFloat = 11
         let capW: CGFloat = 2.8
@@ -510,16 +581,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             : (hasUpdate ? (darkMenuBar ? .white : .black) : .black)
         let battY = (totalH - battH) / 2
 
-        // Battery outline
+        // Battery outline. Gated (no license, see AppDelegate.licenseGated):
+        // the outline alone, dimmed, and nothing inside it.
+        let outlineAlpha: CGFloat = gated ? 0.35 : 0.7
         let bodyRect = NSRect(x: 0.5, y: battY + 0.5, width: battW - 1, height: battH - 1)
         let path = NSBezierPath(roundedRect: bodyRect, xRadius: 2, yRadius: 2)
-        color.withAlphaComponent(0.7).setStroke()
+        color.withAlphaComponent(outlineAlpha).setStroke()
         path.lineWidth = 1
         path.stroke()
 
         // Battery cap
         let capRect = NSRect(x: battW, y: battY + battH * 0.3, width: capW, height: battH * 0.4)
-        color.withAlphaComponent(0.7).setFill()
+        color.withAlphaComponent(outlineAlpha).setFill()
         NSBezierPath(roundedRect: capRect, xRadius: 0.8, yRadius: 0.8).fill()
 
         // Fill level. Clamp to [0, fillMaxW] because the animation timer
@@ -528,7 +601,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // past the outlined boundary.
         let inset: CGFloat = 2
         let fillMaxW = battW - 1 - inset * 2
-        let fillW = min(fillMaxW, max(0, fillMaxW * percentage / 100))
+        let fillW = gated ? 0 : min(fillMaxW, max(0, fillMaxW * percentage / 100))
         let fillRect = NSRect(x: 0.5 + inset, y: battY + 0.5 + inset,
                               width: fillW, height: battH - 1 - inset * 2)
         color.setFill()
@@ -646,8 +719,11 @@ struct ContentView: View {
             statusGrid(state)
 
             // Both mode sections write to the SMC; neither is offered while
-            // another Ampere process holds charge control or this Mac has no
-            // mechanism to hold a charge (the status line says which).
+            // another Ampere process holds charge control, this Mac has no
+            // mechanism to hold a charge, or the copy has no license (the
+            // status line says which; a copy with no license is held at the
+            // registration window and shows this panel only while a sheet
+            // keeps it from closing).
             if !monitor.controlsUnavailable {
                 if !monitor.autoManageEnabled && state.adapterConnected {
                     Divider().padding(.horizontal)
@@ -875,6 +951,10 @@ struct ContentView: View {
                         Text("Charge control: not decided yet. The SMC did not answer when asked for its CHTE key; Ampere asks again at every poll and writes nothing until it does.")
                             .font(.system(size: 12))
                             .foregroundColor(.secondary)
+                    } else if monitor.chargeControlHold == .unlicensed {
+                        Text("Charge control: on hold until this copy is registered. A free license is enough; a paid license adds custom charge bounds and Keep Awake.")
+                            .font(.system(size: 12))
+                            .foregroundColor(.secondary)
                     }
                     HStack {
                         Spacer()
@@ -968,6 +1048,8 @@ struct ContentView: View {
             return "Charge control unavailable: this firmware has no CHTE key and this macOS has no charge limit. Monitoring only."
         case .mechanismUnknown:
             return "Charge control on hold: the SMC did not answer. Ampere asks again at every poll."
+        case .unlicensed:
+            return "Charge control needs a license: register one in the registration window, or quit"
         case nil:
             break
         }
@@ -1204,13 +1286,15 @@ struct ContentView: View {
 
     private func keepAwakeRow() -> some View {
         let onPower = monitor.state?.adapterConnected ?? false
+        let locked = monitor.keepAwakeLocked
         return HStack {
             // Bare glyph in the shared 26 pt frame like the other main-panel
             // rows (the *.circle.fill family is the settings section's).
-            // Coffee cup: the universal keep-awake metaphor (caffeinate).
-            Image(systemName: "cup.and.saucer.fill")
+            // Coffee cup: the universal keep-awake metaphor (caffeinate). A
+            // lock while the feature is withheld, like the bounds row's.
+            Image(systemName: locked ? "lock.fill" : "cup.and.saucer.fill")
                 .font(.system(size: 14))
-                .foregroundColor(monitor.keepAwakeEnabled ? .accentColor : .secondary)
+                .foregroundColor(locked ? .orange : monitor.keepAwakeEnabled ? .accentColor : .secondary)
                 .frame(width: 26)
             Text("Keep Awake")
                 .font(.system(size: 13, weight: .semibold))
@@ -1220,60 +1304,26 @@ struct ContentView: View {
                     .foregroundColor(.secondary)
             }
             Spacer()
-            // Both switches are AC-only and disabled (not hidden) on
-            // battery, where a session cannot exist: unplugging ends the
-            // session and turns both off, and plugging back in starts
-            // nothing. The display option is an option of the running
-            // session, so it is also disabled while the toggle is off, and
-            // on the way on it is confirmed (the sheet below) and then
-            // the owner authenticates (requestKeepAwakeDisplay): it is the
-            // one switch here that changes who can use the Mac, not just
-            // whether it sleeps.
-            Toggle(isOn: Binding(
-                get: { monitor.keepAwakeDisplay },
-                set: { on in
-                    if on {
-                        keepAwakeDisplayFailure = nil
-                        confirmKeepAwakeDisplay = true
-                    } else {
-                        monitor.turnOffKeepAwakeDisplay()
-                    }
+            if locked {
+                // Keep Awake is a paid feature: the controls make way for the
+                // link to the registration window, as the bounds row's do,
+                // and the same orange call as the Registration row's.
+                Button(action: {
+                    NotificationCenter.default.post(name: .ampereShowRegistrationWindow, object: nil)
+                }) {
+                    Text("Buy a license to use")
+                        .font(.system(size: 12))
+                        .foregroundColor(.orange)
                 }
-            )) {
-                Image(systemName: "display")
+                .buttonStyle(.plain)
+            } else {
+                keepAwakeControls(onPower: onPower)
             }
-            .toggleStyle(.button)
-            .controlSize(.small)
-            .disabled(!onPower || !monitor.keepAwakeEnabled)
-            .help(!onPower
-                ? "Unavailable on battery: the display sleeps and the screen locks on its own schedule. Connect a power adapter and turn Keep Awake on to keep the display on during the session."
-                : !monitor.keepAwakeEnabled
-                ? "Unavailable while Keep Awake is off: turn Keep Awake on first, then turn this on to keep the display on during the session; the Mac will then not lock on its own."
-                : monitor.keepAwakeDisplay
-                ? "On: the display stays on during this Keep Awake session, so the Mac does not lock on its own. Turn off to let the display sleep and the screen lock as usual. Turns off with Keep Awake."
-                : "Off: the display sleeps and the screen locks on its own schedule. Turn on to keep the display on during this Keep Awake session; the Mac will then not lock on its own. Asks for Touch ID or your password.")
-            Picker("", selection: Binding(
-                get: { monitor.keepAwakeMinutes },
-                set: { monitor.setKeepAwakeDuration(minutes: $0) }
-            )) {
-                ForEach(BatteryMonitor.keepAwakeDurations, id: \.self) { minutes in
-                    Text(BatteryMonitor.keepAwakeDurationLabel(minutes)).tag(minutes)
-                }
-            }
-            .pickerStyle(.menu)
-            .controlSize(.small)
-            .fixedSize()
-            .help("How long a keep-awake session lasts; Forever holds until toggled off. Changing it while on restarts the countdown from now.")
-            Toggle("", isOn: Binding(
-                get: { monitor.keepAwakeEnabled },
-                set: { monitor.setKeepAwake($0) }
-            ))
-            .toggleStyle(.switch)
-            .controlSize(.small)
-            .disabled(!onPower)
         }
         .padding(.horizontal, 16)
-        .help(!onPower
+        .help(locked
+            ? "Keep Awake needs a paid license: it keeps the Mac awake while a power adapter is connected, for a chosen duration, with an option to keep the display on. Click the link to open the registration window; a paid license also unlocks custom charge bounds."
+            : !onPower
             ? "Unavailable on battery: the Mac sleeps normally. Connect a power adapter to turn Keep Awake on; unplugging ends a session, and plugging back in does not restart it."
             : monitor.keepAwakeEnabled
             ? "On: keeping the Mac awake for the selected duration. \(monitor.keepAwakeDisplay ? "The display is kept on too, so the Mac does not lock on its own." : "The display still sleeps on its own schedule.") Turn off to allow normal sleep; unplugging the power adapter ends the session too."
@@ -1281,6 +1331,63 @@ struct ContentView: View {
         .sheet(isPresented: $confirmKeepAwakeDisplay) {
             keepAwakeDisplayWarning
         }
+    }
+
+    /// The row's controls while Keep Awake is offered (a paid license):
+    /// the display option, the duration, the switch.
+    @ViewBuilder
+    private func keepAwakeControls(onPower: Bool) -> some View {
+        // Both switches are AC-only and disabled (not hidden) on
+        // battery, where a session cannot exist: unplugging ends the
+        // session and turns both off, and plugging back in starts
+        // nothing. The display option is an option of the running
+        // session, so it is also disabled while the toggle is off, and
+        // on the way on it is confirmed (the sheet below) and then
+        // the owner authenticates (requestKeepAwakeDisplay): it is the
+        // one switch here that changes who can use the Mac, not just
+        // whether it sleeps.
+        Toggle(isOn: Binding(
+            get: { monitor.keepAwakeDisplay },
+            set: { on in
+                if on {
+                    keepAwakeDisplayFailure = nil
+                    confirmKeepAwakeDisplay = true
+                } else {
+                    monitor.turnOffKeepAwakeDisplay()
+                }
+            }
+        )) {
+            Image(systemName: "display")
+        }
+        .toggleStyle(.button)
+        .controlSize(.small)
+        .disabled(!onPower || !monitor.keepAwakeEnabled)
+        .help(!onPower
+            ? "Unavailable on battery: the display sleeps and the screen locks on its own schedule. Connect a power adapter and turn Keep Awake on to keep the display on during the session."
+            : !monitor.keepAwakeEnabled
+            ? "Unavailable while Keep Awake is off: turn Keep Awake on first, then turn this on to keep the display on during the session; the Mac will then not lock on its own."
+            : monitor.keepAwakeDisplay
+            ? "On: the display stays on during this Keep Awake session, so the Mac does not lock on its own. Turn off to let the display sleep and the screen lock as usual. Turns off with Keep Awake."
+            : "Off: the display sleeps and the screen locks on its own schedule. Turn on to keep the display on during this Keep Awake session; the Mac will then not lock on its own. Asks for Touch ID or your password.")
+        Picker("", selection: Binding(
+            get: { monitor.keepAwakeMinutes },
+            set: { monitor.setKeepAwakeDuration(minutes: $0) }
+        )) {
+            ForEach(BatteryMonitor.keepAwakeDurations, id: \.self) { minutes in
+                Text(BatteryMonitor.keepAwakeDurationLabel(minutes)).tag(minutes)
+            }
+        }
+        .pickerStyle(.menu)
+        .controlSize(.small)
+        .fixedSize()
+        .help("How long a keep-awake session lasts; Forever holds until toggled off. Changing it while on restarts the countdown from now.")
+        Toggle("", isOn: Binding(
+            get: { monitor.keepAwakeEnabled },
+            set: { monitor.setKeepAwake($0) }
+        ))
+        .toggleStyle(.switch)
+        .controlSize(.small)
+        .disabled(!onPower)
     }
 
     /// Shown before the display option turns on: what it gives up, what
@@ -1419,7 +1526,7 @@ struct ContentView: View {
             .padding(.top, 2)
             .background(WindowDragBlocker())
 
-            // Custom bounds are the licensed feature. The slider stays fully
+            // Custom bounds are the paid feature. The slider stays fully
             // drawn while locked (the default range really is in force) but
             // its draggers refuse input, so this row explains the refusal
             // and links to the only way to lift it.
@@ -1599,17 +1706,18 @@ struct ContentView: View {
     }
 
     private func registrationRow() -> some View {
-        HStack {
+        let tier = registration.tier
+        return HStack {
             // Circle variants (not the seals): seals render 18x18 where the
             // sibling circles are 16x16, visibly oversizing this row's icon
             // and indenting its label.
-            Image(systemName: registration.isRegistered ? "checkmark.circle.fill" : "xmark.circle.fill")
+            Image(systemName: tier == .unlicensed ? "xmark.circle.fill" : "checkmark.circle.fill")
                 .font(.system(size: 14))
-                .foregroundColor(registration.isRegistered ? .accentColor : .orange)
-            // "Registered to <name>" once registered; the unregistered row
-            // keeps the neutral label — "Registered to … Unregistered"
-            // would contradict itself.
-            Text(registration.isRegistered ? "Registered to" : "Registration")
+                .foregroundColor(tier == .unlicensed ? .orange : .accentColor)
+            // "Registered to <name>" once registered, "Free license" for a
+            // free one; the unregistered row keeps the neutral label —
+            // "Registered to … Unregistered" would contradict itself.
+            Text(tier == .paid ? "Registered to" : tier == .free ? "Free license" : "Registration")
                 .font(.system(size: 13, weight: .semibold))
             Spacer()
             Button(action: {
@@ -1617,19 +1725,22 @@ struct ContentView: View {
             }) {
                 // Licensee name when known; the registration window this
                 // opens shows the email, so the row doesn't need to.
-                Text(registration.isRegistered
-                    ? (registration.name.isEmpty ? registration.email : registration.name)
-                    : "Unregistered")
+                Text(tier == .unlicensed
+                    ? "Unregistered"
+                    : (registration.name.isEmpty ? registration.email : registration.name))
                     .font(.system(size: 12))
-                    .foregroundColor(registration.isRegistered ? .secondary : .orange)
+                    .foregroundColor(tier == .unlicensed ? .orange : .secondary)
             }
             .buttonStyle(.plain)
         }
         .padding(.horizontal, 16)
-        .help(registration.isRegistered
+        .help(tier == .paid
             ? "Registered to \(registration.email); click the name to manage or deregister"
-            : "Unregistered; click to enter the registration key from your purchase email")
+            : tier == .free
+            ? "Free license, registered to \(registration.email); click the name to manage it, or to move to a paid license for custom charge bounds and Keep Awake"
+            : "Unregistered; click to get a free license, or to enter the key from your purchase email")
     }
+
 
     /// Settings-row home of the old footer "Revoke Admin Access" button.
     /// Visible only while the sudoers rule is installed, same as the button
@@ -2291,7 +2402,7 @@ struct BatteryRangeSlider: View {
     /// and the target-range highlight extends to 100% to show the actual
     /// charge target. The stored bound is untouched throughout.
     var upperOverridden: Bool = false
-    /// True while the bounds are pinned (unregistered copy, see
+    /// True while the bounds are pinned (a free license, see
     /// BatteryMonitor.chargeBoundsLocked): both draggers are drawn as usual,
     /// since the range they mark is in force, but ignore drags, keep the
     /// arrow cursor, and say why in their tooltips. The panel puts a
@@ -2374,7 +2485,7 @@ struct BatteryRangeSlider: View {
                     .contentShape(Rectangle())
                     .position(x: inset + lowerX, y: midY)
                     .help(locked
-                        ? "Lower bound, locked at \(Int(lower))%: register Ampere to set your own charge bounds"
+                        ? "Lower bound, locked at \(Int(lower))%: custom charge bounds need a paid license"
                         : "Lower bound: charging starts when battery drops below this level")
                     .onHover { hovering in
                         if hovering && !locked { NSCursor.resizeLeftRight.set() } else { NSCursor.arrow.set() }
@@ -2420,7 +2531,7 @@ struct BatteryRangeSlider: View {
                         .contentShape(Rectangle())
                         .position(x: inset + upperX, y: midY)
                         .help(locked
-                            ? "Upper bound, locked at \(Int(upper))%: register Ampere to set your own charge bounds"
+                            ? "Upper bound, locked at \(Int(upper))%: custom charge bounds need a paid license"
                             : "Upper bound: charging stops when battery reaches this level")
                         .onHover { hovering in
                             if hovering && !locked { NSCursor.resizeLeftRight.set() } else { NSCursor.arrow.set() }
@@ -2441,11 +2552,12 @@ struct BatteryRangeSlider: View {
 
 // MARK: - Charge Bounds Lock Row
 
-/// Shown beneath the range slider while the bounds are locked (unregistered
-/// copy): names the lock and links to the registration window, the only way
-/// to lift it. Same layout as the toggle rows it sits among (icon in a 26pt
-/// column, semibold label, trailing control) and the same orange
-/// call-to-register as the settings' Registration row.
+/// Shown beneath the range slider while the bounds are locked (a free
+/// license; an unregistered copy has no slider, its charge control being on
+/// hold): names the lock and links to the registration window, where the
+/// way to a paid license is. Same layout as the toggle rows it sits among
+/// (icon in a 26pt column, semibold label, trailing control) and the same
+/// orange call as the settings' Registration row.
 struct ChargeBoundsLockRow: View {
     let lower: Int
     let upper: Int
@@ -2462,13 +2574,13 @@ struct ChargeBoundsLockRow: View {
             Button(action: {
                 NotificationCenter.default.post(name: .ampereShowRegistrationWindow, object: nil)
             }) {
-                Text("Register to change")
+                Text("Buy a license to change")
                     .font(.system(size: 12))
                     .foregroundColor(.orange)
             }
             .buttonStyle(.plain)
         }
-        .help("Charge bounds are locked at the default \(lower) to \(upper)% until Ampere is registered; click the link to enter the registration key from your purchase email and set your own bounds.")
+        .help("Charge bounds are locked at the default \(lower) to \(upper)% on a free license; a paid license lets you set your own. Click the link to open the registration window.")
     }
 }
 
@@ -2481,94 +2593,37 @@ extension Notification.Name {
 
 /// Content of the standalone registration window. A fresh instance is
 /// installed on every open, so state resets and `onAppear` prefills reliably.
+/// Three faces: a paid registration (whose, how many Macs, Deregister This
+/// Mac), a free one (whose, what a paid key adds, Buy a License…, Deregister
+/// This Mac), and the form of an unregistered copy, which is also where a
+/// free license is asked for (Get Free License, with the name and the email
+/// address) and where the key that then comes by mail is entered and
+/// registered, like a bought one.
 struct RegistrationView: View {
     @ObservedObject var registration: RegistrationManager
     var close: () -> Void
 
+    @State private var nameInput = ""
     @State private var emailInput = ""
     @State private var keyInput = ""
-    private enum Field: Hashable { case email, key }
+    /// True from Get Free License until the server answers, so the busy
+    /// label lands on that button and not on Register.
+    @State private var requestingFreeLicense = false
+    private enum Field: Hashable { case name, email, key }
     @FocusState private var focus: Field?
-    @State private var lastFocus: Field = .email
+    @State private var lastFocus: Field = .name
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             if registration.isRegistered {
-                HStack(spacing: 6) {
-                    Image(systemName: "checkmark.seal.fill")
-                        .foregroundColor(.green)
-                    Text(registration.name.isEmpty
-                        ? "Registered to \(registration.email)"
-                        : "Registered to \(registration.name) (\(registration.email))")
-                        .font(.system(size: 12, weight: .semibold))
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                // How many Macs the key is on, out of its room, as the server
-                // said at the verify this window started when it opened.
-                if let usage = RegistrationManager.usage(macs: registration.deviceCount,
-                                                         of: registration.maxDevices) {
-                    Text(usage)
-                        .font(.system(size: 12))
-                        .foregroundColor(.secondary)
-                }
-                if let error = registration.lastError {
-                    Text(error)
-                        .font(.system(size: 12))
-                        .foregroundColor(.red)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                Divider()
-                // The key's own rules, by the Mac count the server gave it:
-                // a one-Mac key moves, a fuller one fills up and refuses.
-                Text(RegistrationManager.explanation(macs: registration.maxDevices))
-                    .font(.system(size: 12))
-                    .foregroundColor(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                HStack {
-                    Button(registration.isBusy ? "Deregistering…" : "Deregister This Mac") {
-                        registration.deregister { _ in }
-                    }
-                    .disabled(registration.isBusy)
-                    Spacer()
-                    Button("Done") { close() }
-                        .keyboardShortcut(.defaultAction)
-                }
+                registeredBody
             } else {
-                Text("Enter the email you purchased with and your registration key to activate Ampere on this Mac and unlock custom charge bounds.")
-                    .font(.system(size: 12))
-                    .foregroundColor(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                TextField("Email", text: $emailInput)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.system(size: 12))
-                    .focused($focus, equals: .email)
-                TextField("Registration Key", text: $keyInput)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.system(size: 12, design: .monospaced))
-                    .focused($focus, equals: .key)
-                if let error = registration.lastError {
-                    Text(error)
-                        .font(.system(size: 12))
-                        .foregroundColor(.red)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                HStack {
-                    Spacer()
-                    Button("Cancel") { close() }
-                        .keyboardShortcut(.cancelAction)
-                    Button(registration.isBusy ? "Registering…" : "Register") {
-                        registration.register(email: emailInput, key: keyInput) { _ in }
-                    }
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(registration.isBusy
-                        || emailInput.trimmingCharacters(in: .whitespaces).isEmpty
-                        || keyInput.trimmingCharacters(in: .whitespaces).isEmpty)
-                }
+                unregisteredBody
             }
         }
         .textSelection(.enabled)
         .padding(20)
-        .frame(width: 340)
+        .frame(width: 440)
         .onChange(of: focus) {
             if let focus { lastFocus = focus }
         }
@@ -2583,13 +2638,157 @@ struct RegistrationView: View {
             }
         })
         .onAppear {
+            nameInput = registration.name
             emailInput = registration.email
             keyInput = registration.licenseKey
             registration.windowOpened()
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                if !registration.isRegistered { focus = .email }
+                if !registration.isRegistered { focus = firstEmptyField }
             }
         }
+    }
+
+    /// Where typing starts: the first field the copy could not fill in
+    /// itself. A copy awaiting its free license key knows the name and the
+    /// address, so the key's field is the one.
+    private var firstEmptyField: Field {
+        if nameInput.trimmingCharacters(in: .whitespaces).isEmpty { return .name }
+        if emailInput.trimmingCharacters(in: .whitespaces).isEmpty { return .email }
+        return .key
+    }
+
+    @ViewBuilder
+    private var registeredBody: some View {
+        let free = registration.isFree
+        let holder = registration.name.isEmpty
+            ? registration.email
+            : "\(registration.name) (\(registration.email))"
+        HStack(spacing: 6) {
+            Image(systemName: "checkmark.seal.fill")
+                .foregroundColor(.green)
+            Text(free ? "Free license, registered to \(holder)" : "Registered to \(holder)")
+                .font(.system(size: 12, weight: .semibold))
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        // How many Macs the key is on, out of its room, as the server
+        // said at the verify this window started when it opened (a free
+        // license holds one Mac, so it has no line).
+        if let usage = RegistrationManager.usage(macs: registration.deviceCount,
+                                                 of: registration.maxDevices) {
+            Text(usage)
+                .font(.system(size: 12))
+                .foregroundColor(.secondary)
+        }
+        if let error = registration.lastError {
+            Text(error)
+                .font(.system(size: 12))
+                .foregroundColor(.red)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        Divider()
+        // The key's own rules: what a free license gives and how to move to
+        // a paid one, or by the Mac count the server gave a paid key (a
+        // one-Mac key moves, a fuller one fills up and refuses).
+        Text(free
+            ? RegistrationManager.freeExplanation
+            : RegistrationManager.explanation(macs: registration.maxDevices))
+            .font(.system(size: 12))
+            .foregroundColor(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+        HStack {
+            Button(registration.isBusy ? "Deregistering…" : "Deregister This Mac") {
+                registration.deregister { _ in }
+            }
+            .disabled(registration.isBusy)
+            if free {
+                Button("Buy a License…") { NSWorkspace.shared.open(RegistrationManager.buyURL) }
+                    .help("Opens the pricing page in your browser: a paid license adds custom charge bounds and Keep Awake")
+            }
+            Spacer()
+            Button("Done") { close() }
+                .keyboardShortcut(.defaultAction)
+        }
+    }
+
+    @ViewBuilder
+    private var unregisteredBody: some View {
+        Text(RegistrationManager.unregisteredExplanation)
+            .font(.system(size: 12))
+            .foregroundColor(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+        // The name is the free license's: a paid key registers by its
+        // email and key alone.
+        TextField("Name (for a free license)", text: $nameInput)
+            .textFieldStyle(.roundedBorder)
+            .font(.system(size: 12))
+            .focused($focus, equals: .name)
+        TextField("Email", text: $emailInput)
+            .textFieldStyle(.roundedBorder)
+            .font(.system(size: 12))
+            .focused($focus, equals: .email)
+        TextField("Registration Key", text: $keyInput)
+            .textFieldStyle(.roundedBorder)
+            .font(.system(size: 12, design: .monospaced))
+            .focused($focus, equals: .key)
+        // What the last action has to say: why it was refused, in red; or,
+        // for a copy that asked for a free license, where the key went,
+        // or that this Mac is off its key.
+        if let error = registration.lastError {
+            Text(error)
+                .font(.system(size: 12))
+                .foregroundColor(.red)
+                .fixedSize(horizontal: false, vertical: true)
+        } else if let notice = freeLicenseNotice {
+            Text(notice)
+                .font(.system(size: 12))
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        HStack {
+            Button(requestingFreeLicense ? "Requesting…" : "Get Free License") {
+                requestingFreeLicense = true
+                registration.requestFreeLicense(name: nameInput, email: emailInput) { mailed in
+                    requestingFreeLicense = false
+                    // The key is in the mail, not in the answer: a key the
+                    // form held makes way for it, and the address stays as
+                    // the server took it.
+                    if mailed {
+                        keyInput = ""
+                        emailInput = registration.email
+                        focus = .key
+                    }
+                }
+            }
+            .disabled(registration.isBusy
+                || nameInput.trimmingCharacters(in: .whitespaces).isEmpty
+                || emailInput.trimmingCharacters(in: .whitespaces).isEmpty)
+            .help("Emails a free license key to your name and email address. Enter the key under Registration Key and press Register to put this Mac on it: the default 40 to 60% charge range, for as long as you like.")
+            Button("Buy a License…") { NSWorkspace.shared.open(RegistrationManager.buyURL) }
+                .help("Opens the pricing page in your browser: a paid license adds custom charge bounds and Keep Awake")
+            Spacer()
+            // No license means no app: the other way out of this window is
+            // quitting (the owner's call, 2026-10-16). The window has no
+            // close button meanwhile (AppDelegate.licenseGated).
+            Button("Quit Ampere") { NSApp.terminate(nil) }
+                .keyboardShortcut(.cancelAction)
+                .help("Quit Ampere without registering; the battery charges as macOS charges it")
+            Button(registration.isBusy && !requestingFreeLicense ? "Registering…" : "Register") {
+                registration.register(email: emailInput, key: keyInput) { _ in }
+            }
+            .keyboardShortcut(.defaultAction)
+            .disabled(registration.isBusy
+                || emailInput.trimmingCharacters(in: .whitespaces).isEmpty
+                || keyInput.trimmingCharacters(in: .whitespaces).isEmpty)
+        }
+    }
+
+    /// What an unregistered copy that asked for a free license has to say
+    /// for itself: the key is in the mail, or this Mac is off its key.
+    private var freeLicenseNotice: String? {
+        guard registration.isFree else { return nil }
+        return registration.licenseKey.isEmpty
+            ? RegistrationManager.pendingFreeKeyMessage(email: registration.email)
+            : RegistrationManager.freeKeyHeldMessage
     }
 }
 
@@ -2650,6 +2849,21 @@ struct SheetKeyActivator: NSViewRepresentable {
             }
         }
     }
+}
+
+// MARK: - First Mouse Hosting View
+
+/// The registration window's content view. SwiftUI's own hosting view
+/// refuses the "first mouse", the click that makes a non-key window key,
+/// so that click only keyed the window and the button under it never saw
+/// it. In a menu bar app the window is non-key more often than not: the
+/// popover's panel and other apps' windows take key status readily, and the
+/// app itself is inactive whenever the user has been elsewhere. Every first
+/// click on Register or Deregister was swallowed and the second one acted
+/// (the owner, 2026-10-16). Accepting the first mouse delivers that click to
+/// the control it landed on, as AppKit's own buttons and fields do.
+final class FirstMouseHostingView<Content: View>: NSHostingView<Content> {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }
 
 // MARK: - Detached Panel Drag

@@ -26,7 +26,7 @@ final class VideoSnapshotTests: XCTestCase {
 
     private static let registrationKeys = [
         "registration.active", "registration.email", "registration.name",
-        "registration.licenseKey", "registration.serverURL",
+        "registration.licenseKey", "registration.free", "registration.serverURL",
     ]
 
     func testExportPanels() throws {
@@ -47,13 +47,17 @@ final class VideoSnapshotTests: XCTestCase {
         defer { for key in Self.registrationKeys { defaults.removeObject(forKey: key) } }
         for key in Self.registrationKeys { defaults.removeObject(forKey: key) }
         defaults.set("http://127.0.0.1:9", forKey: "registration.serverURL")
-        let unregistered = RegistrationManager()
         defaults.set(true, forKey: "registration.active")
         defaults.set("alex@example.com", forKey: "registration.email")
         defaults.set("Alex Appleseed", forKey: "registration.name")
         let registered = RegistrationManager()
-        XCTAssertFalse(unregistered.isRegistered)
+        // A free license: registered, locked bounds, Keep Awake withheld.
+        defaults.set(true, forKey: "registration.free")
+        let free = RegistrationManager()
+        defaults.set(false, forKey: "registration.free")
         XCTAssertTrue(registered.isRegistered)
+        XCTAssertEqual(registered.tier, .paid)
+        XCTAssertEqual(free.tier, .free)
 
         let charging = Self.battery(percentage: 47, amperage: 3390, adapterWatts: 65.1, electronicsWatts: 23.3)
         let holding = Self.battery(percentage: 60, amperage: 0, adapterWatts: 23.1, electronicsWatts: 23.1)
@@ -105,10 +109,13 @@ final class VideoSnapshotTests: XCTestCase {
         manualMonitor.state = charging
         panels.append(("manual", manualMonitor, registered))
 
-        let lockedMonitor = Self.monitor(locked: true)
-        lockedMonitor.state = holding
-        lockedMonitor.chargingPaused = true
-        panels.append(("unregistered", lockedMonitor, unregistered))
+        // A free license holds the default range with the bounds locked. A
+        // copy with no license never shows the panel: it is held at the
+        // registration window.
+        let freeMonitor = Self.monitor(license: .free)
+        freeMonitor.state = holding
+        freeMonitor.chargingPaused = true
+        panels.append(("free", freeMonitor, free))
 
         _ = NSApplication.shared
         NSApp.setActivationPolicy(.accessory)
@@ -179,7 +186,7 @@ final class VideoSnapshotTests: XCTestCase {
     /// A monitor that is never started: no helper install, no SMC read or
     /// write, no cleanup-job registration. Any privileged call fails the
     /// test instead of touching the system.
-    private static func monitor(prefs: [String: Any] = [:], locked: Bool = false) -> BatteryMonitor {
+    private static func monitor(prefs: [String: Any] = [:], license: LicenseTier = .paid) -> BatteryMonitor {
         let preferences = MemoryBatteryPreferences()
         preferences.values["chargeLowerBound"] = 40
         preferences.values["chargeUpperBound"] = 60
@@ -201,7 +208,7 @@ final class VideoSnapshotTests: XCTestCase {
         io.runAsAdmin = { _ in XCTFail("administrator command during snapshot"); return false }
         io.cleanupDaemonBundlePath = { nil }
         io.cleanupDaemonRegistered = { _ in true }
-        return BatteryMonitor(chargeBoundsLocked: locked, defaults: preferences,
+        return BatteryMonitor(license: license, defaults: preferences,
                               io: io, startMonitoring: false)
     }
 

@@ -151,7 +151,11 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
                 batteryWatts: 0, batteryAgeYears: "", batteryAgeDays: "", fullyCharged: full)
         }
 
-        func monitor(startMonitoring: Bool = false, locked: Bool = true) -> BatteryMonitor {
+        /// `locked` stands for the bounds: a free license (the default here,
+        /// what an unregistered copy was before the free license) or a paid
+        /// one; `license` names the tier outright where a test is about it.
+        func monitor(startMonitoring: Bool = false, locked: Bool = true,
+                     license: LicenseTier? = nil) -> BatteryMonitor {
             var io = BatteryMonitor.IO()
             io.battery = { self.unreadable ? nil : self.reading() }
             io.lidClosed = { false }
@@ -200,7 +204,7 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
                 self.prompts.append(reason)
                 if let answer = self.ownerAnswer { reply(answer) } else { self.pendingPrompt = reply }
             }
-            return BatteryMonitor(chargeBoundsLocked: locked, defaults: preferences,
+            return BatteryMonitor(license: license ?? (locked ? .free : .paid), defaults: preferences,
                                   io: io, startMonitoring: startMonitoring)
         }
     }
@@ -215,6 +219,157 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         let done = expectation(description: "main queue drained")
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { done.fulfill() }
         wait(for: [done], timeout: 3)
+    }
+
+    // MARK: - The license (the owner's call, 2026-10-16)
+
+    /// A copy with no license monitors only: at launch no helper is
+    /// installed or asked for and nothing is written, whatever Auto Charge
+    /// was left set to; the controls are withheld and the status line says
+    /// why. A free license registered later takes charge control the way a
+    /// takeover from another instance does, with the persisted intent
+    /// intact, and keeps the bounds locked; a paid one unlocks them.
+    func testAnUnlicensedCopyWritesNothingUntilALicenseIsRegistered() {
+        let hw = Hardware()
+        hw.percentage = 50
+        let monitor = hw.monitor(startMonitoring: true, license: .unlicensed)
+        drainCallbacks()
+        XCTAssertEqual(monitor.chargeControlHold, .unlicensed)
+        XCTAssertTrue(monitor.controlsUnavailable)
+        XCTAssertEqual(hw.writes, [], "nothing is written without a license")
+        XCTAssertEqual(hw.installs, 0, "and no helper is asked for")
+        XCTAssertTrue(monitor.autoManageEnabled, "the persisted intent is kept")
+        XCTAssertTrue(monitor.chargeBoundsLocked)
+        XCTAssertTrue(monitor.keepAwakeLocked)
+        for _ in 0..<2 { monitor.refresh() }
+        drainCallbacks()
+        XCTAssertEqual(hw.writes, [], "and stays unwritten poll after poll")
+        XCTAssertNotNil(monitor.state, "battery information keeps coming")
+
+        // A free license: charge control is taken with the launch cleanup
+        // (between the bounds, so the inhibit) and a watchdog; the bounds
+        // stay locked to the default range.
+        monitor.licenseTier = .free
+        awaitCondition { monitor.chargingPaused }
+        drainCallbacks()
+        XCTAssertNil(monitor.chargeControlHold)
+        XCTAssertEqual(hw.writes, ["nodischarge", "inhibit", "spawn-watchdog:\(ProcessInfo.processInfo.processIdentifier)"])
+        XCTAssertTrue(monitor.chargeBoundsLocked)
+        monitor.chargeLowerBound = 20
+        XCTAssertEqual(monitor.chargeLowerBound, BatteryMonitor.defaultChargeLowerBound, "a free license keeps the default range")
+
+        // A paid one unlocks the bounds, and nothing else changes.
+        let written = hw.writes.count
+        monitor.licenseTier = .paid
+        drainCallbacks()
+        XCTAssertFalse(monitor.chargeBoundsLocked)
+        XCTAssertFalse(monitor.keepAwakeLocked)
+        XCTAssertNil(monitor.chargeControlHold)
+        XCTAssertEqual(hw.writes.count, written, "a paid key writes nothing new")
+        monitor.chargeLowerBound = 20
+        XCTAssertEqual(monitor.chargeLowerBound, 20)
+    }
+
+    /// Losing the license mid-session (the registration lapsed, this Mac
+    /// deregistered) puts back what the session had in force, the way
+    /// quitting does — one restore, behind any write in flight — and keeps
+    /// the persisted intent, so a license registered again resumes exactly
+    /// where the copy was.
+    func testLosingTheLicenseRestoresSystemDefaults_AndRegisteringResumes() {
+        let hw = Hardware()
+        hw.percentage = 50
+        let monitor = hw.monitor(startMonitoring: true, license: .free)
+        awaitCondition { monitor.chargingPaused }
+        drainCallbacks()
+        let pid = ProcessInfo.processInfo.processIdentifier
+        XCTAssertEqual(hw.writes, ["nodischarge", "inhibit", "spawn-watchdog:\(pid)"])
+
+        monitor.licenseTier = .unlicensed
+        drainCallbacks()
+        XCTAssertEqual(monitor.chargeControlHold, .unlicensed)
+        XCTAssertEqual(hw.writes.last, "restore", "what the session held is put back at once")
+        XCTAssertFalse(monitor.chargingPaused, "the picture follows the restore")
+        XCTAssertTrue(monitor.autoManageEnabled, "the intent is kept for the next license")
+        XCTAssertEqual(hw.preferences.values["autoManageEnabled"] as? Bool, true)
+        let afterRestore = hw.writes.count
+        for _ in 0..<2 { monitor.refresh() }
+        drainCallbacks()
+        XCTAssertEqual(hw.writes.count, afterRestore, "on hold, nothing more is written")
+
+        monitor.licenseTier = .free
+        awaitCondition { monitor.chargingPaused }
+        drainCallbacks()
+        XCTAssertNil(monitor.chargeControlHold)
+        XCTAssertEqual(Array(hw.writes.suffix(3)), ["nodischarge", "inhibit", "spawn-watchdog:\(pid)"],
+                       "registered again, the copy takes charge control as it did at launch")
+    }
+
+    /// A restore the lapse called for that fails is retried while the hold
+    /// lasts, at the launch cleanup's interval; once it lands, nothing more
+    /// is written.
+    func testAFailedRestoreOnLosingTheLicenseIsRetried() {
+        let hw = Hardware()
+        hw.percentage = 50
+        let monitor = hw.monitor(startMonitoring: true, license: .free)
+        awaitCondition { monitor.chargingPaused }
+        drainCallbacks()
+        hw.fail("restore")
+        monitor.licenseTier = .unlicensed
+        drainCallbacks()
+        XCTAssertEqual(hw.writes.filter { $0 == "restore" }.count, 1)
+        XCTAssertTrue(monitor.chargingPaused, "a failed restore leaves the picture as it was")
+        monitor.refresh()
+        XCTAssertEqual(hw.writes.filter { $0 == "restore" }.count, 1, "not before the retry interval")
+        hw.clock = hw.clock.addingTimeInterval(121)
+        monitor.refresh()
+        XCTAssertEqual(hw.writes.filter { $0 == "restore" }.count, 2, "retried after the interval")
+        hw.stopFailing("restore")
+        hw.clock = hw.clock.addingTimeInterval(121)
+        monitor.refresh()
+        drainCallbacks()
+        XCTAssertEqual(hw.writes.filter { $0 == "restore" }.count, 3)
+        XCTAssertFalse(monitor.chargingPaused)
+        hw.clock = hw.clock.addingTimeInterval(121)
+        monitor.refresh()
+        drainCallbacks()
+        XCTAssertEqual(hw.writes.filter { $0 == "restore" }.count, 3, "landed: no further restore")
+    }
+
+    /// Keep Awake is a paid feature: a session ends the moment the copy
+    /// loses the paid license, none can be started without one, and a
+    /// session persisted by a paid copy is not resumed by a copy that has
+    /// since lost it — while a paid copy resumes it as before, so an
+    /// existing paying user sees no change.
+    func testKeepAwakeNeedsThePaidLicense() {
+        let hw = Hardware()
+        let monitor = hw.monitor(license: .paid)
+        monitor.setKeepAwake(true)
+        XCTAssertTrue(monitor.keepAwakeEnabled)
+        monitor.licenseTier = .free
+        XCTAssertFalse(monitor.keepAwakeEnabled, "the session ends with the paid license")
+        XCTAssertEqual(hw.preferences.values["keepAwakeEnabled"] as? Bool, false)
+        monitor.setKeepAwake(true)
+        XCTAssertFalse(monitor.keepAwakeEnabled, "and none starts without it")
+        monitor.licenseTier = .paid
+        monitor.setKeepAwake(true)
+        XCTAssertTrue(monitor.keepAwakeEnabled, "a paid key again: as before")
+        monitor.setKeepAwake(false)
+
+        // Persisted on by a paid copy: the registration lapsed while the app
+        // was not running, or the update brought the lock to an unregistered
+        // copy.
+        hw.preferences.values["keepAwakeEnabled"] = true
+        hw.preferences.values["keepAwakeDisplay"] = true
+        let paid = hw.monitor(license: .paid)
+        XCTAssertTrue(paid.keepAwakeEnabled, "a paid copy resumes its session")
+        XCTAssertTrue(paid.keepAwakeDisplay)
+        hw.preferences.values["keepAwakeEnabled"] = true
+        hw.preferences.values["keepAwakeDisplay"] = true
+        let locked = hw.monitor(license: .free)
+        XCTAssertFalse(locked.keepAwakeEnabled, "a copy without the paid license does not")
+        XCTAssertFalse(locked.keepAwakeDisplay)
+        XCTAssertEqual(hw.preferences.values["keepAwakeEnabled"] as? Bool, false, "and persists the negation")
+        XCTAssertEqual(hw.preferences.values["keepAwakeDisplay"] as? Bool, false)
     }
 
     /// Charge to Full started on top of a charge to the upper bound (armed by
@@ -1275,22 +1430,25 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
 
     // MARK: - Keep Awake display option
 
+    // Keep Awake is a paid feature (2026-10-16), so every session below runs
+    // on a paid copy; testKeepAwakeNeedsThePaidLicense covers the lock.
+
     func testKeepAwakeDisplay_PersistsAcrossRestartWithItsSessionAndDefaultsToOff() {
         let hw = Hardware()
-        XCTAssertFalse(hw.monitor().keepAwakeDisplay, "Off until the user confirms it")
+        XCTAssertFalse(hw.monitor(license: .paid).keepAwakeDisplay, "Off until the user confirms it")
         hw.preferences.values["keepAwakeEnabled"] = true
         hw.preferences.values["keepAwakeDisplay"] = true
-        let monitor = hw.monitor()
+        let monitor = hw.monitor(license: .paid)
         XCTAssertTrue(monitor.keepAwakeEnabled)
         XCTAssertTrue(monitor.keepAwakeDisplay, "A restart mid-session resumes the same kind of hold")
         XCTAssertEqual(hw.prompts, [], "Resuming the owner's own choice asks nothing")
         monitor.turnOffKeepAwakeDisplay()
         XCTAssertEqual(hw.preferences.values["keepAwakeDisplay"] as? Bool, false)
-        XCTAssertFalse(hw.monitor().keepAwakeDisplay)
+        XCTAssertFalse(hw.monitor(license: .paid).keepAwakeDisplay)
     }
 
     func testKeepAwakeDisplay_RefusedWhileTheToggleIsOff() {
-        let hw = Hardware(), monitor = hw.monitor()
+        let hw = Hardware(), monitor = hw.monitor(license: .paid)
         var ends: [BatteryMonitor.KeepAwakeDisplayRequest] = []
         monitor.requestKeepAwakeDisplay { ends.append($0) }
         XCTAssertEqual(ends, [.noSession], "An option of the running session only")
@@ -1305,7 +1463,7 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
     }
 
     func testKeepAwakeDisplay_TurnsOnOnlyWhenTheOwnerAuthenticates() {
-        let hw = Hardware(), monitor = hw.monitor()
+        let hw = Hardware(), monitor = hw.monitor(license: .paid)
         monitor.setKeepAwake(true)
         var ends: [BatteryMonitor.KeepAwakeDisplayRequest] = []
         hw.ownerAnswer = .cancelled
@@ -1334,7 +1492,7 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
     }
 
     func testKeepAwakeDisplay_PromptOutlivingTheSessionTurnsNothingOn() {
-        let hw = Hardware(), monitor = hw.monitor()
+        let hw = Hardware(), monitor = hw.monitor(license: .paid)
         monitor.refresh()
         monitor.setKeepAwake(true)
         hw.ownerAnswer = nil
@@ -1372,20 +1530,20 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         // the toggle off; the invariant is restored at launch.
         let hw = Hardware()
         hw.preferences.values["keepAwakeDisplay"] = true
-        XCTAssertFalse(hw.monitor().keepAwakeDisplay)
+        XCTAssertFalse(hw.monitor(license: .paid).keepAwakeDisplay)
         XCTAssertEqual(hw.preferences.values["keepAwakeDisplay"] as? Bool, false)
         // Same for a session that expired while the app was not running.
         hw.preferences.values["keepAwakeEnabled"] = true
         hw.preferences.values["keepAwakeDeadline"] = Date().addingTimeInterval(-60).timeIntervalSince1970
         hw.preferences.values["keepAwakeDisplay"] = true
-        let monitor = hw.monitor()
+        let monitor = hw.monitor(license: .paid)
         XCTAssertFalse(monitor.keepAwakeEnabled)
         XCTAssertFalse(monitor.keepAwakeDisplay)
         XCTAssertEqual(hw.preferences.values["keepAwakeDisplay"] as? Bool, false)
     }
 
     func testKeepAwake_TurningTheToggleOffTurnsTheDisplayOptionOff() {
-        let hw = Hardware(), monitor = hw.monitor()
+        let hw = Hardware(), monitor = hw.monitor(license: .paid)
         monitor.setKeepAwake(true)
         monitor.requestKeepAwakeDisplay { _ in }
         monitor.setKeepAwake(false)
@@ -1399,7 +1557,7 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         hw.preferences.values["keepAwakeEnabled"] = true
         hw.preferences.values["keepAwakeDisplay"] = true
         hw.preferences.values["keepAwakeDeadline"] = Date().addingTimeInterval(0.3).timeIntervalSince1970
-        let monitor = hw.monitor()
+        let monitor = hw.monitor(license: .paid)
         XCTAssertTrue(monitor.keepAwakeEnabled)
         monitor.refresh() // arms the expiry timer the init could not
         awaitCondition { !monitor.keepAwakeEnabled }
@@ -1410,7 +1568,7 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
     }
 
     func testKeepAwake_UnpluggingEndsTheSessionAndReconnectingStartsNothing() {
-        let hw = Hardware(), monitor = hw.monitor()
+        let hw = Hardware(), monitor = hw.monitor(license: .paid)
         monitor.refresh()
         monitor.setKeepAwake(true)
         monitor.requestKeepAwakeDisplay { _ in }
@@ -1434,7 +1592,7 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         hw.connected = false
         hw.preferences.values["keepAwakeEnabled"] = true
         hw.preferences.values["keepAwakeDisplay"] = true
-        let monitor = hw.monitor()
+        let monitor = hw.monitor(license: .paid)
         XCTAssertTrue(monitor.keepAwakeEnabled, "Init cannot tell yet; the first poll decides")
         monitor.refresh()
         XCTAssertFalse(monitor.keepAwakeEnabled)
@@ -1444,7 +1602,7 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
     }
 
     func testKeepAwake_AFailedBatteryReadKeepsTheSession() {
-        let hw = Hardware(), monitor = hw.monitor()
+        let hw = Hardware(), monitor = hw.monitor(license: .paid)
         monitor.refresh()
         monitor.setKeepAwake(true)
         monitor.requestKeepAwakeDisplay { _ in }

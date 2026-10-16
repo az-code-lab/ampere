@@ -211,7 +211,9 @@ final class BatteryMonitor: ObservableObject {
     /// exclusive to the charge/discharge overrides. A session is AC-only:
     /// unplugging ends it (both this and keepAwakeDisplay go off, see
     /// reconcileKeepAwake), and plugging back in starts nothing; the
-    /// display still sleeps normally unless keepAwakeDisplay is on.
+    /// display still sleeps normally unless keepAwakeDisplay is on. A paid
+    /// feature (keepAwakeLocked): a session ends the moment the copy loses
+    /// the paid license, and none starts or resumes without one.
     @Published var keepAwakeEnabled: Bool {
         didSet { defaults.set(keepAwakeEnabled, forKey: "keepAwakeEnabled") }
     }
@@ -273,6 +275,16 @@ final class BatteryMonitor: ObservableObject {
         /// Nothing is written and no helper prompt is shown until it does;
         /// refresh asks again at every poll.
         case mechanismUnknown
+        /// This copy is not registered (LicenseTier.unlicensed): charge
+        /// control needs a license, free or paid, and AppDelegate holds the
+        /// app at the registration window meanwhile. Nothing is written
+        /// while the hold lasts, and no helper is installed or verified at
+        /// launch; a hold that begins mid-session puts back what the
+        /// session had in force (suspendChargeControl). The persisted
+        /// intent is kept throughout, so registering resumes the copy
+        /// exactly where it was, the way a takeover from another instance
+        /// does (refresh).
+        case unlicensed
     }
     @Published private(set) var chargeControlHold: ChargeControlHold?
     /// True while another process holds charge control; the panel hides
@@ -282,11 +294,12 @@ final class BatteryMonitor: ObservableObject {
         return false
     }
     /// True while nothing this instance could write would apply: another
-    /// process holds control, this Mac has no mechanism, or the SMC has
-    /// not said which one yet. The panel hides the controls in every
-    /// case; the status line says which.
+    /// process holds control, this Mac has no mechanism, the SMC has not
+    /// said which one yet, or the copy has no license. The panel hides the
+    /// controls in every case; the status line says which.
     var controlsUnavailable: Bool {
         standingBy || chargeControlHold == .noMechanism || chargeControlHold == .mechanismUnknown
+            || chargeControlHold == .unlicensed
     }
 
     /// Which mechanism can hold the charge on this Mac. Decided from what
@@ -407,22 +420,42 @@ final class BatteryMonitor: ObservableObject {
     static let defaultChargeLowerBound = 40
     static let defaultChargeUpperBound = 60
 
-    /// True while the bounds are pinned to the defaults because the copy is
-    /// unregistered. Custom charge bounds are the licensed feature:
-    /// AppDelegate mirrors `!RegistrationManager.isRegistered` here, at
-    /// launch through the init parameter (so the launch-time inhibit/allow
-    /// decision already reads the locked range) and on every later change,
-    /// whether from the registration window or a daily verify that finds
-    /// the license revoked or moved to another Mac. Engaging the lock
-    /// resets both bounds to the defaults, and while it holds, any other
-    /// assignment is undone by the bounds' didSets, so the persisted values
-    /// never diverge from the range in force. Not persisted itself: the
-    /// registration state it derives from is.
-    @Published var chargeBoundsLocked: Bool {
+    /// What this copy's license allows (LicenseTier). AppDelegate mirrors
+    /// RegistrationManager's tier here, at launch through the init
+    /// parameter (so the launch-time decisions already read it) and on
+    /// every later change, whether from the registration window (a free or
+    /// a paid key registered, Deregister This Mac) or a daily verify that
+    /// finds the license revoked or moved to another Mac. Three things hang
+    /// off it, each with a derived flag below: the charge bounds are locked
+    /// to the defaults unless the key is a paid one (`chargeBoundsLocked`),
+    /// Keep Awake is offered only then (`keepAwakeLocked`), and charge
+    /// control at all needs a license of either kind
+    /// (`chargeControlLicensed`; without one it is on hold, see
+    /// ChargeControlHold.unlicensed). A change acts at once: the bounds
+    /// reset here, and the refresh that follows ends a Keep Awake session
+    /// the copy may no longer hold and puts charge control on hold or takes
+    /// it back, the same way the poll would. Not persisted itself: the
+    /// registration it derives from is.
+    @Published var licenseTier: LicenseTier {
         didSet {
+            guard oldValue != licenseTier else { return }
             if chargeBoundsLocked { resetChargeBoundsToDefaults() }
+            refresh()
         }
     }
+    /// True while the bounds are pinned to the defaults: custom charge
+    /// bounds are the paid feature. Engaging the lock resets both bounds to
+    /// the defaults (the didSet above), and while it holds, any other
+    /// assignment is undone by the bounds' didSets, so the persisted values
+    /// never diverge from the range in force.
+    var chargeBoundsLocked: Bool { licenseTier != .paid }
+    /// True while Keep Awake is not offered, a paid feature too: a running
+    /// session ends the moment the lock engages (reconcileKeepAwake), none
+    /// starts while it holds (setKeepAwake), and none resumes at launch.
+    var keepAwakeLocked: Bool { licenseTier != .paid }
+    /// True while charge control may be taken at all: a free or a paid
+    /// license. Without one, refresh keeps charge control on hold.
+    var chargeControlLicensed: Bool { licenseTier != .unlicensed }
 
     @Published var chargeLowerBound: Int {
         didSet {
@@ -645,6 +678,11 @@ final class BatteryMonitor: ObservableObject {
         set { watchdogLock.lock(); defer { watchdogLock.unlock() }; launchCleanupPendingStorage = newValue }
     }
     private var launchCleanupRetryAt = Date.distantPast
+    /// True while the restore a license hold called for has not succeeded
+    /// (releaseChargeControl): retried from refresh while the hold lasts,
+    /// at launchCleanupRetrySeconds, and once more at quit.
+    private var chargeControlReleasePending = false
+    private var chargeControlReleaseRetryAt = Date.distantPast
     /// Long enough for whatever refused pmset or the SMC at login to have
     /// recovered; the state machine runs on every poll in between.
     private static let launchCleanupRetrySeconds: TimeInterval = 120
@@ -712,14 +750,18 @@ final class BatteryMonitor: ObservableObject {
     private static let sudoersPath = AppConstants.sudoersPath
     private static let helperPath = AppConstants.helperPath
 
-    /// `chargeBoundsLocked`: true for an unregistered copy, so the bounds are
-    /// pinned to the defaults from the launch-time SMC decision onward (see
-    /// the property).
-    init(chargeBoundsLocked: Bool, defaults: BatteryPreferences = UserDefaults.standard,
+    /// `license`: what the copy's registration allows at launch (see
+    /// `licenseTier`), so the bounds are pinned, Keep Awake withheld, and
+    /// charge control held or taken from the launch-time decisions onward.
+    init(license: LicenseTier, defaults: BatteryPreferences = UserDefaults.standard,
          io: IO = IO(), startMonitoring: Bool = true) {
         self.defaults = defaults
         self.io = io
-        self.chargeBoundsLocked = chargeBoundsLocked
+        self.licenseTier = license
+        // The derived flags, before self may be read: every stored property
+        // below is initialized from them.
+        let chargeBoundsLocked = license != .paid
+        let keepAwakeLocked = license != .paid
         // Load persisted auto-manage settings
         let autoManage = defaults.bool(forKey: "autoManageEnabled")
         self.autoManageEnabled = autoManage
@@ -730,11 +772,14 @@ final class BatteryMonitor: ObservableObject {
         // deadline that passed while the app wasn't running means the
         // session is over — restore "off" and persist the negation (didSet
         // doesn't fire during init), same pattern as the flag repairs
-        // below. A deadline found without its toggle is half-written state
-        // from a crash between the two defaults writes; drop it. The
-        // assertion itself is re-acquired by the first refresh's reconcile,
-        // and the expiry timer by the same path (timers can't be scheduled
-        // this early in init anyway).
+        // below; so does a copy that no longer holds the paid license a
+        // session needs (keepAwakeLocked: the registration lapsed while
+        // the app was not running, or an update brought the lock to an
+        // unregistered copy). A deadline found without its toggle is
+        // half-written state from a crash between the two defaults writes;
+        // drop it. The assertion itself is re-acquired by the first
+        // refresh's reconcile, and the expiry timer by the same path
+        // (timers can't be scheduled this early in init anyway).
         // Repair a corrupted duration to Forever — a value outside the
         // preset list would leave the picker with no selected item.
         let storedKeepAwakeMinutes = defaults.object(forKey: "keepAwakeMinutes") as? Int ?? 0
@@ -744,7 +789,7 @@ final class BatteryMonitor: ObservableObject {
         let persistedKeepAwakeDeadline = (defaults.object(forKey: "keepAwakeDeadline") as? Double)
             .map { Date(timeIntervalSince1970: $0) }
         let resumedKeepAwake: Bool
-        if persistedKeepAwake, let deadline = persistedKeepAwakeDeadline, deadline <= Date() {
+        if persistedKeepAwake, keepAwakeLocked || persistedKeepAwakeDeadline.map({ $0 <= Date() }) == true {
             resumedKeepAwake = false
             self.keepAwakeDeadline = nil
             defaults.set(false, forKey: "keepAwakeEnabled")
@@ -830,14 +875,25 @@ final class BatteryMonitor: ObservableObject {
         // set it to true if shouldInhibit applies. Not persisted — always
         // derived fresh from the rule conditions at launch.
         chargingPaused = false
+        // No license: charge control is on hold until one is registered
+        // (no helper prompt, nothing written; refresh takes charge control
+        // then, as it does after another instance quits). Set whether or
+        // not monitoring starts, so a monitor that is never started shows
+        // the hold the way a running one does.
+        if !chargeControlLicensed {
+            chargeControlHold = .unlicensed
+        }
         guard startMonitoring else { return }
         // Only one Ampere process may manage charge control on this Mac
         // (see InstanceGuard). An instance that starts while another one is
         // already running reads the battery but writes nothing until the
-        // other quits; refresh() takes over from there.
+        // other quits; refresh() takes over from there. That hold outranks
+        // the license's: nothing of this instance's can be in force either way.
         if let other = io.competingInstance() {
             chargeControlHold = .otherInstance(other)
             AmpereLog.app("Ampere: Charge control is in use by %@; this instance stands by", other)
+        } else if chargeControlHold == .unlicensed {
+            AmpereLog.app("Ampere: Charge control on hold: this copy is not registered")
         } else if !activateChargeControl(atLaunch: true) {
             return
         }
@@ -1079,8 +1135,11 @@ final class BatteryMonitor: ObservableObject {
     func restoreBeforeTermination() {
         terminating = true
         // On hold: nothing of ours is in force, and the restore belongs to
-        // the instance that holds control.
-        guard isSudoRuleInstalled, chargeControlHold == nil else { return }
+        // the instance that holds control. The one exception is a license
+        // hold whose own restore kept failing: it is tried once more here.
+        guard isSudoRuleInstalled,
+              chargeControlHold == nil || (chargeControlHold == .unlicensed && chargeControlReleasePending)
+        else { return }
         let done = DispatchSemaphore(value: 0)
         smcQueue.async {
             // A single helper transaction restores both SMC keys and sleep
@@ -1091,6 +1150,88 @@ final class BatteryMonitor: ObservableObject {
             done.signal()
         }
         _ = done.wait(timeout: .now() + 6)
+    }
+
+    /// Charge control goes on hold because the copy lost its license (a
+    /// daily verify found the registration ended, or Deregister This Mac)
+    /// while this instance was managing. Whatever the session has in force
+    /// is put back the way quitting puts it (releaseChargeControl); the
+    /// persisted intent — Auto Charge, the bounds, a charge to the upper
+    /// bound or to full — is kept, so registering again resumes exactly
+    /// where the copy was (resumeAfterHold, then activateChargeControl). An
+    /// in-flight decision's intentions are void, since the state they
+    /// describe is about to be restored: the revision bump keeps their
+    /// completions from applying them, and the hardware facts those
+    /// completions report are corrected once the restore has run.
+    private func suspendChargeControl() {
+        let wasManaging = chargeControlHold == nil
+        chargeControlHold = .unlicensed
+        controlRevision &+= 1
+        requestedChargingPaused = nil
+        recoveryWarning = nil
+        AmpereLog.app("Ampere: Charge control on hold: this copy is not registered%@",
+                      wasManaging ? "; restoring system defaults" : "")
+        if wasManaging { releaseChargeControl() }
+    }
+
+    /// Put back what this session had in force, with charge control on
+    /// hold for want of a license: one helper transaction restores CHTE,
+    /// CHIE, the sleep settings and the macOS charge limit from their
+    /// markers and retires the watchdog, the transaction quitting runs.
+    /// Synchronous on the SMC queue, so it lands behind any write already
+    /// queued; what this instance believes is written follows on the main
+    /// queue, behind that write's own completion, and only while the hold
+    /// still stands (a registration meanwhile resets it itself). A restore
+    /// that fails is retried from refresh every launchCleanupRetrySeconds
+    /// while the hold lasts, and once more at quit; the watchdog, which a
+    /// failed restore leaves running, covers a crash meanwhile.
+    private func releaseChargeControl() {
+        chargeControlReleaseRetryAt = io.now().addingTimeInterval(Self.launchCleanupRetrySeconds)
+        guard isSudoRuleInstalled else {
+            chargeControlReleasePending = false
+            return
+        }
+        let ok = smcQueue.sync { runSMCWriteViaSudo("restore") }
+        chargeControlReleasePending = !ok
+        if ok {
+            AmpereLog.app("Ampere: System defaults restored; charge control stays on hold until a license is registered")
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.chargeControlHold == .unlicensed else { return }
+                self.forgetWrittenState()
+            }
+        } else {
+            AmpereLog.app("Ampere: Restore failed with charge control on hold; retrying in %d s",
+                          Int(Self.launchCleanupRetrySeconds))
+        }
+    }
+
+    /// Nothing of this session's is in force any more (the restore ran, or
+    /// the takeover's own cleanup is about to put things right): the
+    /// picture of what is written says so, so the panel, and the takeover a
+    /// registration brings, start from a clean state.
+    private func forgetWrittenState() {
+        chargingPaused = false
+        activeDischarging = false
+        sleepHoldActive = false
+        requestedChargingPaused = nil
+        nativeLimitWritten = nil
+        nativeLimitIntent = nil
+        nativeLimitUnconfirmed = false
+        wakeReassertPending = false
+        lastError = nil
+        healthWarning = nil
+    }
+
+    /// A license was registered while charge control was on hold for want
+    /// of one: the instance takes charge control the way it does after
+    /// another instance quits, from a clean picture. A restore still on the
+    /// SMC queue lands first (the queue is drained), and one that kept
+    /// failing is left to the takeover's cleanup, which puts back what a
+    /// crashed session left the same way.
+    private func resumeAfterHold() {
+        smcQueue.sync {}
+        forgetWrittenState()
+        chargeControlReleasePending = false
     }
 
     /// Block new poll-driven writes before draining those already queued.
@@ -1459,8 +1600,9 @@ final class BatteryMonitor: ObservableObject {
     func ensureSudoInstalled(completion: @escaping (Bool) -> Void) {
         // Standing by: installing would run the migration's restore and
         // spawn a watchdog against the instance that holds charge control.
-        // No mechanism: nothing a helper could do here would apply. The
-        // status line already explains both.
+        // No mechanism: nothing a helper could do here would apply. No
+        // license: charge control is on hold until one is registered. The
+        // status line already explains each.
         if controlsUnavailable {
             completion(false)
             return
@@ -1828,16 +1970,17 @@ final class BatteryMonitor: ObservableObject {
     /// Pure gate for whether the keep-awake assertion should be held.
     /// AC-only by design: an assertion on battery would drain a forgotten
     /// Mac, and it cannot absorb lid-close sleep anyway. A deadline at or
-    /// before `now` means the session ended. Both battery and an ended
-    /// session also end the session itself (keepAwakeSessionEnd); this
-    /// gate is what the held assertion is reconciled against on every
-    /// tick, so a session that is in the middle of ending, or one that
-    /// cannot decide because the adapter state is unknown, still holds
-    /// nothing.
+    /// before `now` means the session ended, and `locked` (no paid license,
+    /// keepAwakeLocked) means there can be no session. Battery, an ended
+    /// session and the lock also end the session itself
+    /// (keepAwakeSessionEnd); this gate is what the held assertion is
+    /// reconciled against on every tick, so a session that is in the
+    /// middle of ending, or one that cannot decide because the adapter
+    /// state is unknown, still holds nothing.
     static func keepAwakeAssertionDesired(
-        enabled: Bool, adapterConnected: Bool, deadline: Date?, now: Date
+        enabled: Bool, adapterConnected: Bool, deadline: Date?, now: Date, locked: Bool = false
     ) -> Bool {
-        guard enabled, adapterConnected else { return false }
+        guard enabled, adapterConnected, !locked else { return false }
         if let deadline, deadline <= now { return false }
         return true
     }
@@ -1850,11 +1993,16 @@ final class BatteryMonitor: ObservableObject {
     enum KeepAwakeSessionEnd: Equatable {
         case expired
         case unplugged
+        /// The copy no longer holds the paid license Keep Awake needs
+        /// (keepAwakeLocked): the registration lapsed, or this Mac was
+        /// deregistered, mid-session.
+        case locked
     }
     static func keepAwakeSessionEnd(
-        enabled: Bool, adapterConnected: Bool?, deadline: Date?, now: Date
+        enabled: Bool, adapterConnected: Bool?, deadline: Date?, now: Date, locked: Bool = false
     ) -> KeepAwakeSessionEnd? {
         guard enabled else { return nil }
+        if locked { return .locked }
         if let deadline, deadline <= now { return .expired }
         if adapterConnected == false { return .unplugged }
         return nil
@@ -1887,10 +2035,10 @@ final class BatteryMonitor: ObservableObject {
     /// AC-only and deadline rules of keepAwakeAssertionDesired apply to
     /// both, so the display option alone never holds anything.
     static func keepAwakeAssertion(
-        enabled: Bool, display: Bool, adapterConnected: Bool, deadline: Date?, now: Date
+        enabled: Bool, display: Bool, adapterConnected: Bool, deadline: Date?, now: Date, locked: Bool = false
     ) -> KeepAwakeAssertion? {
         guard keepAwakeAssertionDesired(enabled: enabled, adapterConnected: adapterConnected,
-                                        deadline: deadline, now: now) else { return nil }
+                                        deadline: deadline, now: now, locked: locked) else { return nil }
         return display ? .display : .system
     }
 
@@ -1966,6 +2114,9 @@ final class BatteryMonitor: ObservableObject {
     /// the display option down with it.
     func setKeepAwake(_ on: Bool) {
         guard on != keepAwakeEnabled else { return }
+        // A paid feature: the panel offers no switch while locked, and a
+        // flip that arrives anyway starts nothing.
+        if on, keepAwakeLocked { return }
         keepAwakeEnabled = on
         if !on { keepAwakeDisplay = false }
         setKeepAwakeDeadline(on ? Self.keepAwakeDeadline(minutes: keepAwakeMinutes, from: Date()) : nil)
@@ -2026,11 +2177,17 @@ final class BatteryMonitor: ObservableObject {
         // UI reads "off", never "on but expired" or "on but on battery";
         // plugging back in then starts nothing.
         if let end = Self.keepAwakeSessionEnd(enabled: keepAwakeEnabled, adapterConnected: adapterConnected,
-                                              deadline: keepAwakeDeadline, now: now) {
+                                              deadline: keepAwakeDeadline, now: now, locked: keepAwakeLocked) {
             keepAwakeEnabled = false
             keepAwakeDisplay = false
             setKeepAwakeDeadline(nil)
-            AmpereLog.app("Ampere: Keep-awake session ended (%@)", end == .expired ? "expired" : "unplugged")
+            let why: String
+            switch end {
+            case .expired: why = "expired"
+            case .unplugged: why = "unplugged"
+            case .locked: why = "no paid license"
+            }
+            AmpereLog.app("Ampere: Keep-awake session ended (%@)", why)
         }
         // Launch case: a deadline restored by init has no timer yet
         // (timers can't be scheduled mid-init).
@@ -2039,7 +2196,7 @@ final class BatteryMonitor: ObservableObject {
         }
         let desired = Self.keepAwakeAssertion(
             enabled: keepAwakeEnabled, display: keepAwakeDisplay, adapterConnected: adapterConnected ?? false,
-            deadline: keepAwakeDeadline, now: now)
+            deadline: keepAwakeDeadline, now: now, locked: keepAwakeLocked)
         guard desired != keepAwakeAssertionHeld else { return }
         // A change of kind (the display option toggled mid-session) is a
         // release followed by a fresh create, so the process holds exactly
@@ -2458,9 +2615,22 @@ final class BatteryMonitor: ObservableObject {
             }
             return
         }
-        if standingBy {
+        // No license: on hold until one is registered. A hold that begins
+        // here, mid-session, puts back what the session had in force; a
+        // restore that failed is retried while the hold lasts.
+        if !chargeControlLicensed {
+            if chargeControlHold != .unlicensed {
+                suspendChargeControl()
+            } else if chargeControlReleasePending, io.now() >= chargeControlReleaseRetryAt {
+                releaseChargeControl()
+            }
+            return
+        }
+        if standingBy || chargeControlHold == .unlicensed {
+            let registered = chargeControlHold == .unlicensed
             chargeControlHold = nil
-            AmpereLog.app("Ampere: Taking over charge control")
+            AmpereLog.app("Ampere: Taking over charge control%@", registered ? " (a license was registered)" : "")
+            if registered { resumeAfterHold() }
             activateChargeControl(atLaunch: false)
         } else if chargeControlHold == .mechanismUnknown {
             // The SMC did not answer the CHTE probe last time: ask again.
