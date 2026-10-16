@@ -69,6 +69,12 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         private var chie: UInt8 = 0
         private var held = false
         private var failingCommands: Set<String> = []
+        /// True: the discharge command writes CHIE and disables sleep, then
+        /// fails (its watchdog spawn and the CHIE rollback both failed), so
+        /// the override stays in force with the command reported failed.
+        var dischargeFailsAfterApplying = false
+        /// True while CHIE reads as discharging.
+        var dischargeApplied: Bool { lock.lock(); defer { lock.unlock() }; return chie == 8 }
 
         var writes: [String] {
             lock.lock(); defer { lock.unlock() }
@@ -139,7 +145,7 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
                     registered = [n]
                 }
             }
-            return true
+            return !(dischargeFailsAfterApplying && command.hasPrefix("discharge:"))
         }
 
         func reading() -> BatteryState {
@@ -776,6 +782,53 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         drainCallbacks()
         XCTAssertEqual(Array(hw.writes.suffix(4)), ["nodischarge", "spawn-watchdog:\(pid)", "nodischarge", discharge])
         XCTAssertNil(monitor.recoveryWarning)
+    }
+
+    /// A leftover CHIE from a start whose rollback keeps failing drains the
+    /// battery below the lower bound, where a charge would arm a sleep
+    /// hold. The cleanup retry waits for no hold to be active, so a hold
+    /// armed meanwhile would block it for as long as the battery stayed
+    /// low: no hold is armed while a cleanup is pending, a sleep meanwhile
+    /// pauses the charge, and the hold arms once the cleanup lands.
+    func testAPendingCleanupIsNotBlockedByANewSleepHold() {
+        let hw = Hardware()
+        hw.percentage = 80
+        hw.preferences.values["autoDischargeEnabled"] = true
+        hw.dischargeFailsAfterApplying = true
+        let discharge = "discharge:\(pid)"
+        let gate = hw.blockNext(discharge)
+        let monitor = hw.monitor(startMonitoring: true)
+        XCTAssertEqual(gate.entered.wait(timeout: .now() + 3), .success)
+        hw.fail("nodischarge")
+        gate.release.signal()
+        awaitCondition { monitor.recoveryWarning == BatteryMonitor.cleanupWarning }
+        XCTAssertTrue(hw.dischargeApplied, "The helper applied CHIE, failed, and its rollback failed too")
+        XCTAssertFalse(monitor.activeDischarging)
+        // Auto Discharge is turned off, and the leftover CHIE drains the
+        // battery below the lower bound while the helper keeps refusing.
+        monitor.autoDischargeEnabled = false
+        hw.percentage = 30
+        for _ in 0..<3 { monitor.refresh() }
+        drainCallbacks()
+        XCTAssertTrue(monitor.chargeToUpperBound)
+        XCTAssertFalse(hw.writes.contains("hold-sleep"), "No hold while the cleanup is pending")
+        XCTAssertFalse(monitor.sleepHoldActive)
+        XCTAssertEqual(monitor.recoveryWarning, BatteryMonitor.cleanupWarning)
+        // A sleep meanwhile pauses the charge, like any sleep without a hold.
+        monitor.prepareForSleep()
+        XCTAssertEqual(hw.writes.last, "inhibit")
+        monitor.resumeAfterWake()
+        drainCallbacks()
+        // The helper answers again: the due retry restores, and the hold
+        // arms on the refresh that follows.
+        hw.stopFailing("nodischarge")
+        hw.clock = hw.clock.addingTimeInterval(130)
+        monitor.refresh()
+        awaitCondition { monitor.sleepHoldActive }
+        drainCallbacks()
+        XCTAssertFalse(hw.dischargeApplied, "The outstanding CHIE cleanup landed")
+        XCTAssertNil(monitor.recoveryWarning)
+        XCTAssertEqual(hw.writes.filter { $0 == discharge }.count, 1, "Discharge was off: no new start")
     }
 
     func testStandsByForAnEarlierInstanceAndTakesOverWhenItQuits() {

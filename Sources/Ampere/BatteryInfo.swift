@@ -2712,7 +2712,8 @@ final class BatteryMonitor: ObservableObject {
         // A cleanup whose restore failed (the launch's, or a failed
         // discharge start's rollback) is finished here, one attempt per
         // interval, while nothing of this session's own has re-armed the
-        // same overrides (their own release restores the shared markers).
+        // same overrides (their own release restores the shared markers;
+        // no new hold is armed while this is pending, see holdOpNeeded).
         // The state machine runs on the other ticks.
         if cleanupPending, !autoManageInFlight, !activeDischarging, !sleepHoldActive,
            io.now() >= cleanupRetryAt {
@@ -2963,9 +2964,18 @@ final class BatteryMonitor: ObservableObject {
             // here would re-enable sleep mid-CHIE (the clamshell blackout).
             // The mismatch resolves right after the discharge stops — its
             // stop path restores sleep and removes the markers, so a later
-            // release is a clean no-op.
+            // release is a clean no-op. Nor is a hold armed while a cleanup
+            // is pending (cleanupPending): the nodischarge it waits for
+            // restores the shared markers, undoing a hold armed meanwhile,
+            // and the retry itself waits for no hold to be active, so a
+            // hold armed here would block the cleanup for as long as a
+            // leftover CHIE kept the battery below the lower bound. The
+            // hold arms on the refresh that follows the cleanup; a sleep
+            // meanwhile pauses the charge (prepareForSleep). A release is
+            // never held back.
             let holdOpNeeded = !activeDischarging
                 && decision.newState.sleepHold != sleepHoldActive
+                && !(decision.newState.sleepHold && cleanupPending)
             if (decision.action != .none || holdOpNeeded || wakeReassertPending), !autoManageInFlight {
                 autoManageInFlight = true
                 let reassert = wakeReassertPending
