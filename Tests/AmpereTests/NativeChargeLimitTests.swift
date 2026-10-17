@@ -107,7 +107,7 @@ final class NativeChargeLimitTests: XCTestCase {
         XCTAssertEqual(target(.hold, pct: 51, previous: .hold, written: 50), 51,
                        "A level that ticks up before the target applies is kept, not drained back")
         XCTAssertEqual(target(.hold, pct: 49, previous: .hold, written: 50), 50,
-                       "A dip under load on AC is not followed; the firmware charges it back")
+                       "A dip under load on AC is not followed: the firmware leaves a shallow dip alone and charges a deeper one back")
         XCTAssertEqual(target(.hold, pct: 70, previous: .drainTo(60), written: 60), 70,
                        "Turning discharge off mid-drain holds where the battery is now")
         XCTAssertEqual(target(.hold, pct: 45, ac: false, previous: .hold, written: 50), 45,

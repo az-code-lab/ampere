@@ -1134,7 +1134,8 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         for _ in 0..<3 { monitor.refresh() }
         drainCallbacks()
         XCTAssertEqual(hw.writes.count, 5, "The same level is not written twice")
-        // A dip under load on AC is not followed; the firmware charges it back.
+        // A dip under load on AC is not followed: the firmware leaves a shallow
+        // dip alone and charges a deeper one back, and the hold never tops it up.
         hw.percentage = 50
         for _ in 0..<2 { monitor.refresh() }
         drainCallbacks()

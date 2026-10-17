@@ -3179,9 +3179,12 @@ final class BatteryMonitor: ObservableObject {
     /// becomes the new target rather than being drained back to the old
     /// one (the firmware drains a battery that sits above its limit). The
     /// chase ends by itself, since charging stops the moment the limit
-    /// lands. A dip under load on AC is not followed; the firmware charges
-    /// it back. Off AC the hold follows the level down, so a reconnect
-    /// never charges toward a stale level. Nil releases.
+    /// lands. A dip under load on AC is not followed: the firmware leaves
+    /// a dip of up to 5 points alone and charges a deeper one back to
+    /// within a few points of the limit (the resume threshold Apple
+    /// documents), and the hold never tops the battery up itself. Off AC
+    /// the hold follows the level down, so a reconnect never charges
+    /// toward a stale level. Nil releases.
     static func nativeLimitTarget(
         intent: NativeLimitIntent, percentage: Int, adapterConnected: Bool,
         previousIntent: NativeLimitIntent?, previousTarget: Int?
