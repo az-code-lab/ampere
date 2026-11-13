@@ -1893,4 +1893,72 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         monitor.refresh()
         XCTAssertTrue(monitor.keepAwakeEnabled)
     }
+
+    // MARK: - Keep Awake in the menu bar
+
+    /// What the menu bar item shows follows the session the way the
+    /// panel's row does: nothing without one, the cup or the display
+    /// symbol with one, and a timed session's remaining time unless it is
+    /// switched off. The hover line and the countdown's next redraw come
+    /// and go with it.
+    func testKeepAwakeIndicator_FollowsTheSession() throws {
+        let hw = Hardware(), monitor = hw.monitor(license: .paid)
+        monitor.refresh()
+        XCTAssertNil(monitor.keepAwakeIndicator())
+        XCTAssertNil(monitor.keepAwakeToolTip)
+        XCTAssertNil(monitor.keepAwakeIndicatorNextChange(now: Date()))
+
+        monitor.setKeepAwakeDuration(minutes: 60)
+        monitor.setKeepAwake(true)
+        XCTAssertEqual(monitor.keepAwakeIndicator(), .init(display: false, time: "1h 00m"))
+        let next = try XCTUnwrap(monitor.keepAwakeIndicatorNextChange(now: Date()))
+        XCTAssertGreaterThan(next, 0)
+        XCTAssertLessThanOrEqual(next, 60)
+        let until = "until " + (try XCTUnwrap(monitor.keepAwakeDeadline)).formatted(date: .omitted, time: .shortened)
+        XCTAssertEqual(monitor.keepAwakeToolTip, "Keep Awake \(until). The display still sleeps on its own schedule.")
+
+        monitor.requestKeepAwakeDisplay { _ in }
+        XCTAssertEqual(monitor.keepAwakeIndicator(), .init(display: true, time: "1h 00m"))
+        XCTAssertEqual(monitor.keepAwakeToolTip,
+                       "Keep Awake \(until). The display is kept on, so the Mac does not lock on its own.")
+
+        monitor.showMenuBarKeepAwakeTime = false
+        XCTAssertEqual(monitor.keepAwakeIndicator(), .init(display: true, time: nil), "The symbol stays")
+        XCTAssertNil(monitor.keepAwakeIndicatorNextChange(now: Date()), "No time shown, no redraw to arm")
+        monitor.showMenuBarKeepAwakeTime = true
+
+        monitor.setKeepAwakeDuration(minutes: 0)
+        XCTAssertEqual(monitor.keepAwakeIndicator(), .init(display: true, time: nil), "Forever has no time to show")
+        XCTAssertNil(monitor.keepAwakeIndicatorNextChange(now: Date()))
+        XCTAssertEqual(monitor.keepAwakeToolTip,
+                       "Keep Awake until turned off. The display is kept on, so the Mac does not lock on its own.")
+
+        hw.connected = false
+        monitor.refresh()
+        XCTAssertNil(monitor.keepAwakeIndicator(), "Unplugging ends the session and takes its symbol along")
+        XCTAssertNil(monitor.keepAwakeToolTip)
+    }
+
+    /// A restart mid-session shows the same symbol and what is left of the
+    /// session, not a fresh countdown.
+    func testKeepAwakeIndicator_ResumesWithTheSessionAfterARestart() {
+        let hw = Hardware()
+        hw.preferences.values["keepAwakeEnabled"] = true
+        hw.preferences.values["keepAwakeDisplay"] = true
+        hw.preferences.values["keepAwakeMinutes"] = 120
+        hw.preferences.values["keepAwakeDeadline"] = Date().addingTimeInterval(45 * 60 - 5).timeIntervalSince1970
+        XCTAssertEqual(hw.monitor(license: .paid).keepAwakeIndicator(), .init(display: true, time: "45m"))
+    }
+
+    /// The Settings switch for the time defaults to on and survives a
+    /// restart, whatever license the copy then holds.
+    func testShowMenuBarKeepAwakeTime_DefaultsToOnAndPersists() {
+        let hw = Hardware()
+        let monitor = hw.monitor(license: .paid)
+        XCTAssertTrue(monitor.showMenuBarKeepAwakeTime)
+        monitor.showMenuBarKeepAwakeTime = false
+        XCTAssertEqual(hw.preferences.values["showMenuBarKeepAwakeTime"] as? Bool, false)
+        XCTAssertFalse(hw.monitor(license: .paid).showMenuBarKeepAwakeTime, "A restart keeps the choice")
+        XCTAssertFalse(hw.monitor(license: .free).showMenuBarKeepAwakeTime, "And a lapsed license does not reset it")
+    }
 }

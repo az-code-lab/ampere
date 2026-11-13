@@ -202,6 +202,14 @@ final class BatteryMonitor: ObservableObject {
     @Published var showMenuBarPercent: Bool {
         didSet { defaults.set(showMenuBarPercent, forKey: "showMenuBarPercent") }
     }
+    /// Show a timed Keep Awake session's remaining time ("1h 45m") beside
+    /// the session's symbol in the menu bar; off = the symbol alone, which
+    /// keeps the item narrow. The symbol itself always shows while a
+    /// session runs (see keepAwakeIndicator). Lives here for the same
+    /// reason as showMenuBarPercent: AppDelegate renders the item.
+    @Published var showMenuBarKeepAwakeTime: Bool {
+        didSet { defaults.set(showMenuBarKeepAwakeTime, forKey: "showMenuBarKeepAwakeTime") }
+    }
     /// Keep-awake toggle: hold a powerd assertion (the caffeinate
     /// mechanism) that prevents idle system sleep while the adapter is
     /// connected. Deliberately NOT the helper's pmset sleep hold: an
@@ -789,6 +797,7 @@ final class BatteryMonitor: ObservableObject {
         self.autoDischargeEnabled = defaults.bool(forKey: "autoDischargeEnabled")
         // Default true (shown) — bool(forKey:) would read a missing key as false.
         self.showMenuBarPercent = defaults.object(forKey: "showMenuBarPercent") as? Bool ?? true
+        self.showMenuBarKeepAwakeTime = defaults.object(forKey: "showMenuBarKeepAwakeTime") as? Bool ?? true
         // Keep-awake: restore the toggle and its wall-clock deadline. A
         // deadline that passed while the app wasn't running means the
         // session is over — restore "off" and persist the negation (didSet
@@ -2087,6 +2096,96 @@ final class BatteryMonitor: ObservableObject {
     /// (no deadline).
     static func keepAwakeDeadline(minutes: Int, from: Date) -> Date? {
         minutes > 0 ? from.addingTimeInterval(TimeInterval(minutes) * 60) : nil
+    }
+
+    /// What the menu bar item shows of a running Keep Awake session, to the
+    /// left of the battery: which symbol, and the remaining time when
+    /// there is one to show.
+    struct KeepAwakeIndicator: Equatable {
+        /// The session keeps the display on: the display badge (a white
+        /// display on the accent color), in place of the plain cup. The
+        /// one state the item draws attention to, because the Mac does
+        /// not lock on its own while it lasts.
+        let display: Bool
+        /// The remaining time ("1h 45m"); nil for a Forever session and
+        /// while the time is switched off (showMenuBarKeepAwakeTime).
+        let time: String?
+    }
+
+    /// A timed session's remaining time as the menu bar words it, and when
+    /// those words next change.
+    struct KeepAwakeCountdown: Equatable {
+        let label: String
+        /// Seconds until `label` changes; nil in the last minute, which
+        /// ends with the session, not with another label.
+        let nextChange: TimeInterval?
+    }
+
+    /// The countdown for a session ending at `deadline`. Whole minutes,
+    /// rounded up: a fresh 15-minute session reads "15m" and the last
+    /// minute "1m", never "0m" (a deadline that has just passed still reads
+    /// "1m" for the half second the expiry timer takes to end the
+    /// session). Past the hour the minutes keep two digits ("1h 09m"), so
+    /// the text, and with it the width of the menu bar item, changes at the
+    /// hour and at ten minutes only, not twice in every hour.
+    static func keepAwakeCountdown(deadline: Date, now: Date) -> KeepAwakeCountdown {
+        let remaining = deadline.timeIntervalSince(now)
+        // Clamped to 1m...99h 59m before the conversion: no preset comes
+        // near the top, but a deadline read back from damaged preferences
+        // must not overflow it, and one that is not a number reads "1m".
+        let cap = Double(99 * 60 + 59)
+        let minutes = remaining.isFinite ? Int(min(max((remaining / 60).rounded(.up), 1), cap)) : 1
+        let label = minutes >= 60
+            ? "\(minutes / 60)h \(String(format: "%02d", minutes % 60))m"
+            : "\(minutes)m"
+        guard minutes > 1 else { return KeepAwakeCountdown(label: label, nextChange: nil) }
+        // The label drops to `minutes - 1` once that many whole minutes are left.
+        let untilNext = remaining - Double(minutes - 1) * 60
+        return KeepAwakeCountdown(label: label, nextChange: min(max(untilNext, 0), 60))
+    }
+
+    /// The indicator for a session, nil when none runs. The symbol shows
+    /// for every session; the time only for a timed one, and only while
+    /// `showTime` (the Settings switch) is on.
+    static func keepAwakeIndicator(
+        enabled: Bool, display: Bool, deadline: Date?, showTime: Bool, now: Date
+    ) -> KeepAwakeIndicator? {
+        guard enabled else { return nil }
+        let time = showTime ? deadline.map { keepAwakeCountdown(deadline: $0, now: now).label } : nil
+        return KeepAwakeIndicator(display: display, time: time)
+    }
+
+    /// What the menu bar item shows of the session right now. It follows
+    /// the session the way the panel's row does (the toggle and the display
+    /// option), so the two can never disagree.
+    func keepAwakeIndicator(now: Date = Date()) -> KeepAwakeIndicator? {
+        Self.keepAwakeIndicator(enabled: keepAwakeEnabled, display: keepAwakeDisplay, deadline: keepAwakeDeadline,
+                                showTime: showMenuBarKeepAwakeTime, now: now)
+    }
+
+    /// Seconds until the indicator's time next changes, nil while it shows
+    /// no time or is in its last minute: when the menu bar item is due a
+    /// redraw that no published change announces.
+    func keepAwakeIndicatorNextChange(now: Date) -> TimeInterval? {
+        guard keepAwakeEnabled, showMenuBarKeepAwakeTime, let deadline = keepAwakeDeadline else { return nil }
+        return Self.keepAwakeCountdown(deadline: deadline, now: now).nextChange
+    }
+
+    /// The menu bar hover text's line for a running session, nil when none
+    /// runs: the wordless symbol spelled out. It names the end time, not
+    /// the time left, so the text holds still for the whole session (a
+    /// hover text that changes is installed again, which hides it under
+    /// the cursor).
+    static func keepAwakeToolTip(enabled: Bool, display: Bool, deadline: Date?) -> String? {
+        guard enabled else { return nil }
+        let until = deadline.map { "until " + $0.formatted(date: .omitted, time: .shortened) } ?? "until turned off"
+        return "Keep Awake \(until). " + (display
+            ? "The display is kept on, so the Mac does not lock on its own."
+            : "The display still sleeps on its own schedule.")
+    }
+
+    var keepAwakeToolTip: String? {
+        Self.keepAwakeToolTip(enabled: keepAwakeEnabled, display: keepAwakeDisplay, deadline: keepAwakeDeadline)
     }
 
     /// Which powerd assertion a Keep Awake session holds: idle system sleep

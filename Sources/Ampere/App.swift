@@ -139,6 +139,28 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             }
         }
 
+        // The display badge of a Keep Awake session is filled with the
+        // accent color: redraw when the user picks another one (the redraw
+        // itself is decided by the color comparison in updateMenuBarIcon).
+        systemColorsObserver = NotificationCenter.default.addObserver(
+            forName: NSColor.systemColorsDidChangeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.updateMenuBarIcon()
+        }
+
+        // The status item's window moving is the second half of every
+        // width change, and what a neighboring item does to this one: the
+        // attached panel's anchor is set again each time (repinPanelAnchor).
+        // Matched by window at delivery, so a window the status bar makes
+        // later is followed too.
+        statusWindowMoveObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didMoveNotification, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let self, let window = note.object as? NSWindow,
+                  window === self.statusItem.button?.window else { return }
+            self.repinPanelAnchor()
+        }
+
         // Reactivate app on any mouse click in our windows — fixes focus loss
         // for .accessory apps where clicking the popover doesn't auto-activate.
         mouseMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { event in
@@ -177,6 +199,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var lastIconShowPct: Bool = true
     private var lastIconPanelAnchored: Bool = false
     private var lastIconGated: Bool = false
+    private var lastIconKeepAwake: BatteryMonitor.KeepAwakeIndicator?
+    /// The accent color the last icon was drawn with (the display badge of
+    /// a Keep Awake session; see renderMenuBarIcon).
+    private var lastIconAccent: NSColor?
     /// The icon's hover text while the copy is gated at the registration window.
     private static let gatedToolTip = "Ampere needs a license: register one (a free license takes a name and an email address), or quit. Click to open the registration window."
     /// Whether the last rendered title occupied its full width (visible or
@@ -185,10 +211,29 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// True while the popover is (or is about to be) anchored to the status
     /// item — set before showing, cleared on close/detach. While set, the
     /// item width may grow but never shrink; see the title logic in
-    /// updateMenuBarIcon.
-    private var panelAnchored = false
+    /// updateMenuBarIcon and, for the image, anchoredIconWidth.
+    private var panelAnchored = false {
+        didSet { if !panelAnchored { anchoredIconWidth = 0 } }
+    }
+    /// The widest icon image drawn since the panel was anchored, 0 while it
+    /// is not. The image keeps at least this width until the panel closes
+    /// or is torn off (buildMenuBarIcon): a Keep Awake group that narrows
+    /// or goes (the countdown losing a digit, the session ending) leaves
+    /// clear space on the left instead of narrowing the item under the
+    /// panel. The same rule the title follows, for the same reason.
+    private var anchoredIconWidth: CGFloat = 0
+    /// How much of the status item's button, measured from its right edge,
+    /// the panel hangs from: the battery and the percent, without the Keep
+    /// Awake group to their left. Set when the panel is shown; see
+    /// repinPanelAnchor.
+    private var panelAnchorWidth: CGFloat = 0
+    private var statusWindowMoveObserver: NSObjectProtocol?
+    private var systemColorsObserver: NSObjectProtocol?
     private var animationTimer: Timer?
     private var animationPct: Int = 0
+    /// Fires when the Keep Awake countdown beside the icon next changes
+    /// (once a minute); see scheduleKeepAwakeTick.
+    private var keepAwakeTickTimer: Timer?
 
     /// True iff the battery is actually receiving current right now. Shares
     /// the source-of-truth logic with `BatteryModeRouter` so the menu bar
@@ -211,6 +256,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let hasUpdate = monitor.updateAvailable != nil
         let dark = menuBarIsDark
         let showPct = monitor.showMenuBarPercent
+        let now = Date()
+        let keepAwake = monitor.keepAwakeIndicator(now: now)
+        let accent = Self.menuBarAccent(dark: dark)
+
+        // The Keep Awake countdown changes with the clock, which no
+        // published change announces: re-arm its redraw on every pass, so
+        // a new deadline, the Settings switch and a late wake from sleep
+        // all land on the right minute. Ahead of the gate and the skip
+        // guard below, which both return early, and from the same instant
+        // as the text above: read a moment apart, the two could straddle a
+        // minute and leave the old text up for the whole of the next one.
+        scheduleKeepAwakeTick(now: now)
 
         // Gated (no license): an empty outline with no level and no percent,
         // the animation stopped, and a tooltip that says what to do. Drawn
@@ -254,6 +311,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if pct == lastIconPct, isCharging == lastIconCharging, hasWarning == lastIconWarning,
            hasUpdate == lastIconUpdate, dark == lastIconDark,
            showPct == lastIconShowPct, panelAnchored == lastIconPanelAnchored,
+           keepAwake == lastIconKeepAwake, accent == lastIconAccent,
            needsAnimation == (animationTimer != nil) {
             return
         }
@@ -282,7 +340,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 button.image = self.buildMenuBarIcon(
                     percentage: CGFloat(self.animationPct),
                     hasWarning: warn,
-                    hasUpdate: self.monitor.updateAvailable != nil
+                    hasUpdate: self.monitor.updateAvailable != nil,
+                    keepAwake: self.monitor.keepAwakeIndicator()
                 )
             }
         }
@@ -294,12 +353,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         lastIconDark = dark
         lastIconShowPct = showPct
         lastIconPanelAnchored = panelAnchored
+        lastIconKeepAwake = keepAwake
+        lastIconAccent = accent
 
         let displayPct = needsAnimation ? animationPct : pct
         button.image = buildMenuBarIcon(
             percentage: CGFloat(displayPct),
             hasWarning: hasWarning,
-            hasUpdate: hasUpdate
+            hasUpdate: hasUpdate,
+            keepAwake: keepAwake
         )
         // Menu bar items resize from the LEFT edge, so narrowing this item
         // drags the icon — and the panel anchored to it — sideways. While
@@ -311,7 +373,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         lastTitleWide = wide
         if wide {
             var titleAttrs: [NSAttributedString.Key: Any] = [
-                .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+                .font: Self.menuBarTextFont
             ]
             if !showPct {
                 titleAttrs[.foregroundColor] = NSColor.clear
@@ -325,15 +387,41 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
     }
 
+    /// Arm the one redraw the Keep Awake countdown needs that nothing else
+    /// asks for: the moment its text changes, once a minute. One shot,
+    /// re-armed by every updateMenuBarIcon pass (the redraw it triggers
+    /// included), and gone while there is no countdown to show: no
+    /// session, a Forever session, the time switched off in Settings, or
+    /// the last minute, which ends with the session's own expiry timer.
+    /// In the common run loop modes, so an open menu or a slider drag does
+    /// not hold the minute back.
+    private func scheduleKeepAwakeTick(now: Date) {
+        keepAwakeTickTimer?.invalidate()
+        keepAwakeTickTimer = nil
+        guard let delay = monitor.keepAwakeIndicatorNextChange(now: now) else { return }
+        // A touch past the boundary, so the pass it triggers already reads
+        // the next minute.
+        let timer = Timer(timeInterval: delay + 0.05, repeats: false) { [weak self] _ in
+            self?.keepAwakeTickTimer = nil
+            self?.updateMenuBarIcon()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        keepAwakeTickTimer = timer
+    }
+
     /// Hover text for the menu bar icon: the same status line the panel
     /// header shows, prefixed with the charge percent (which may be hidden
-    /// from the menu bar itself), plus the health warning and the pending
-    /// update when present — the two states the icon can only signal with
-    /// the orange tint and the wordless badge dot.
+    /// from the menu bar itself), plus a running Keep Awake session, the
+    /// health warning and the pending update when present — the states the
+    /// icon can only signal with a wordless symbol, the orange tint and
+    /// the badge dot.
     private func menuBarToolTip() -> String? {
         var lines: [String] = []
         if let state = monitor.state {
             lines.append("\(state.percentage)% — \(monitor.statusLine(for: state))")
+        }
+        if let keepAwake = monitor.keepAwakeToolTip {
+            lines.append(keepAwake)
         }
         if let warning = monitor.healthWarning {
             lines.append(warning)
@@ -433,7 +521,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             // it set, the panel's window-drag gesture would move the new
             // popover instead of letting it tear off (see DetachedPanelDrag).
             monitor.panelDetached = false
-            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            // The panel hangs from the battery and the percent, not from a
+            // Keep Awake group to their left: it then opens in the same
+            // place with or without a session, and stays there when one
+            // starts while it is open (repinPanelAnchor).
+            let groupWidth = max(0, (button.image?.size.width ?? 0) - Self.menuBarBatteryWidth)
+            panelAnchorWidth = max(button.bounds.width - groupWidth, 1)
+            popover.show(relativeTo: Self.panelAnchorRect(buttonBounds: button.bounds, anchorWidth: panelAnchorWidth),
+                         of: button, preferredEdge: .minY)
             NSApp.activate(ignoringOtherApps: true)
             // Force the popover's panel key so SwiftUI drag gestures (the
             // charge-bound slider thumbs) track. An accessory app's popover
@@ -457,6 +552,41 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// togglePopover for why an accessory app's popover needs this nudge.
     private func makePopoverWindowKey() {
         popover.contentViewController?.view.window?.makeKey()
+    }
+
+    /// The part of the status item's button the panel hangs from: its
+    /// right-hand `anchorWidth` points, or all of it once it is narrower
+    /// than that. Measured from the right edge because that is the edge a
+    /// menu bar item keeps when its width changes.
+    static func panelAnchorRect(buttonBounds: NSRect, anchorWidth: CGFloat) -> NSRect {
+        let width = min(max(anchorWidth, 0), buttonBounds.width)
+        return NSRect(x: buttonBounds.maxX - width, y: buttonBounds.minY, width: width, height: buttonBounds.height)
+    }
+
+    /// Keep the attached panel where it is while the status item changes
+    /// around it. A popover follows its positioning rect, which is in the
+    /// button's coordinates, and those start at the button's LEFT edge:
+    /// the edge that moves when the item widens (a Keep Awake session
+    /// started from the panel adds its group there). macOS widens an item
+    /// in two steps, measured on macOS 27 with a scratch status item: the
+    /// button grows in place, then, a frame or two later, its window moves
+    /// so that the right edge is back where it was. The popover re-reads
+    /// its rect on the first step only, where the old rect still names the
+    /// right spot, and ignores the move, after which the old rect names a
+    /// spot further left: the next thing that makes the popover lay itself
+    /// out again (the Settings section opening) would carry the panel
+    /// there. So the rect is set again, as the same right-hand part of the
+    /// button, on the move: the panel does not move at all when the item
+    /// widens, and follows the icon when the whole item is pushed along by
+    /// a neighbor. Setting it on the first step instead makes the panel
+    /// jump sideways and back. Narrowing is the case this cannot keep
+    /// still (the popover clips the rect to the narrower button on the
+    /// first step), which is why the item never narrows while the panel is
+    /// attached: see anchoredIconWidth and the title logic in
+    /// updateMenuBarIcon.
+    private func repinPanelAnchor() {
+        guard panelAnchored, popover.isShown, !popover.isDetached, let button = statusItem.button else { return }
+        popover.positioningRect = Self.panelAnchorRect(buttonBounds: button.bounds, anchorWidth: panelAnchorWidth)
     }
 
     func popoverShouldDetach(_ popover: NSPopover) -> Bool {
@@ -534,8 +664,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // teardown order obvious.
         appearanceObservation?.invalidate()
         animationTimer?.invalidate()
+        keepAwakeTickTimer?.invalidate()
         if let registrationShowObserver {
             NotificationCenter.default.removeObserver(registrationShowObserver)
+        }
+        if let systemColorsObserver {
+            NotificationCenter.default.removeObserver(systemColorsObserver)
+        }
+        if let statusWindowMoveObserver {
+            NotificationCenter.default.removeObserver(statusWindowMoveObserver)
         }
         if let mouseMonitor = mouseMonitor {
             NSEvent.removeMonitor(mouseMonitor)
@@ -554,9 +691,154 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     private func buildMenuBarIcon(percentage: CGFloat, hasWarning: Bool = false,
-                                  hasUpdate: Bool = false) -> NSImage {
-        Self.renderMenuBarIcon(percentage: percentage, hasWarning: hasWarning,
-                               hasUpdate: hasUpdate, darkMenuBar: menuBarIsDark)
+                                  hasUpdate: Bool = false,
+                                  keepAwake: BatteryMonitor.KeepAwakeIndicator? = nil) -> NSImage {
+        let dark = menuBarIsDark
+        let image = Self.renderMenuBarIcon(
+            percentage: percentage, hasWarning: hasWarning, hasUpdate: hasUpdate, darkMenuBar: dark,
+            keepAwake: keepAwake, accent: Self.menuBarAccent(dark: dark), timeY: menuBarTimeY,
+            minWidth: panelAnchored ? anchoredIconWidth : 0)
+        // Wider while the panel is attached, never narrower (anchoredIconWidth).
+        if panelAnchored { anchoredIconWidth = max(anchoredIconWidth, image.size.width) }
+        return image
+    }
+
+    /// The accent color as the menu bar's own light or dark look resolves
+    /// it, as a fixed color. The icon is drawn into an image, where a
+    /// dynamic color would resolve against whatever appearance happens to
+    /// be current, and the menu bar's follows the wallpaper, not the app.
+    static func menuBarAccent(dark: Bool) -> NSColor {
+        var accent = NSColor.controlAccentColor
+        NSAppearance(named: dark ? .darkAqua : .aqua)?.performAsCurrentDrawingAppearance {
+            accent = NSColor.controlAccentColor.usingColorSpace(.sRGB) ?? accent
+        }
+        return accent
+    }
+
+    /// How strongly the system draws a template image and the title beside
+    /// it in the menu bar: white at 90% on a dark menu bar, black at 85% on
+    /// a light one. Read off the status bar button's own drawing on macOS
+    /// 27 (a scratch status item, captured under each appearance); the
+    /// values are the button's, not a named system color's, so they are
+    /// written out here.
+    static func menuBarTintAlpha(dark: Bool) -> CGFloat {
+        dark ? 0.9 : 0.85
+    }
+
+    /// The battery alone: the icon's width without a Keep Awake group.
+    static let menuBarBatteryWidth: CGFloat = 24 + 2.8 + 1
+    static let menuBarIconHeight: CGFloat = 18
+    /// The percent beside the icon (the button's title) and the Keep Awake
+    /// time inside it are one font, so they read as one line of text.
+    static let menuBarTextFont = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+    private static let menuBarTextLineHeight: CGFloat =
+        ceil(NSAttributedString(string: "0", attributes: [.font: menuBarTextFont]).size().height)
+    /// The room a session's symbol takes, the same for both: the display
+    /// badge fills it and the cup, narrower, sits against its right. So
+    /// the display option switching on or off changes the symbol and
+    /// nothing else; the item does not resize under the sheet that
+    /// confirms the option.
+    static let keepAwakeSymbolSlot: CGFloat = 24
+    /// The display badge: as wide as the battery beside it, and an even
+    /// height, so it sits on the battery's center line with whole points
+    /// above and below.
+    static let keepAwakeBadgeSize = NSSize(width: keepAwakeSymbolSlot, height: 14)
+    private static let keepAwakeSymbolToTime: CGFloat = 3
+    private static let keepAwakeGroupToBattery: CGFloat = 7
+
+    /// Where the Keep Awake time sits in the icon image (the bottom of its
+    /// line, from the image's bottom) when the button has no title to line
+    /// it up with. Measured on macOS 27 with a scratch status item: in the
+    /// 22-point button the title's 15-point line starts 3 points down and
+    /// the 18-point image 2 points down, which puts the line 2 points up
+    /// from the image's bottom. At that height text drawn into the image
+    /// lands on the very pixel rows of the title beside it.
+    static let menuBarTimeDefaultY: CGFloat = 2
+
+    /// The same from where the button's cell puts the title and the image
+    /// (their tops, in the button's flipped coordinates). Read from the
+    /// cell so the two stay on one baseline wherever the system aligns the
+    /// title: the measurement above is from a display with one pixel per
+    /// point, and a Retina display has half points to align to. An answer
+    /// more than a point off the measured one is not a layout this code
+    /// knows, and falls back to it.
+    static func menuBarTimeY(titleTop: CGFloat, imageTop: CGFloat) -> CGFloat {
+        let y = menuBarIconHeight - (titleTop - imageTop) - menuBarTextLineHeight
+        return abs(y - menuBarTimeDefaultY) <= 1 ? y : menuBarTimeDefaultY
+    }
+
+    private var menuBarTimeY: CGFloat {
+        guard let button = statusItem?.button, let cell = button.cell as? NSButtonCell,
+              button.image != nil, !button.attributedTitle.string.isEmpty else {
+            return Self.menuBarTimeDefaultY
+        }
+        return Self.menuBarTimeY(titleTop: cell.titleRect(forBounds: button.bounds).minY,
+                                 imageTop: cell.imageRect(forBounds: button.bounds).minY)
+    }
+
+    /// The width a Keep Awake group adds to the left of the battery, its
+    /// gap to the battery included. Whole points, so the battery keeps its
+    /// place on the pixel grid whatever the group holds.
+    static func keepAwakeGroupWidth(_ indicator: BatteryMonitor.KeepAwakeIndicator) -> CGFloat {
+        var width = keepAwakeSymbolSlot
+        if let time = indicator.time {
+            width += keepAwakeSymbolToTime
+                + ceil(NSAttributedString(string: time, attributes: [.font: menuBarTextFont]).size().width)
+        }
+        return width + keepAwakeGroupToBattery
+    }
+
+    /// The cup of a session that keeps only the Mac awake, in one color
+    /// (the panel row's own symbol).
+    private static func keepAwakeCup(color: NSColor) -> NSImage? {
+        let config = NSImage.SymbolConfiguration(pointSize: 12, weight: .medium)
+            .applying(NSImage.SymbolConfiguration(paletteColors: [color]))
+        return NSImage(systemSymbolName: "cup.and.saucer.fill", accessibilityDescription: nil)?
+            .withSymbolConfiguration(config)
+    }
+
+    /// The badge of a session that keeps the display on: a white display
+    /// on a rounded rectangle in the accent color, which is how the panel's
+    /// Keep Display On button looks while it is on (the owner's pick,
+    /// 2026-11-12, over a display symbol in the accent color alone). The
+    /// display is drawn here, not taken from the symbol font: its outline
+    /// is a one-point line on the pixel grid, which stays a clean white
+    /// line where a display has one pixel per point; the symbol scaled
+    /// down to this size comes out thin and pale there. `x`: the badge's
+    /// left edge, a whole number of points.
+    private static func drawKeepAwakeDisplayBadge(x: CGFloat, iconHeight: CGFloat, accent: NSColor) {
+        let badge = keepAwakeBadgeSize
+        let y = ((iconHeight - badge.height) / 2).rounded(.down)
+        accent.setFill()
+        NSBezierPath(roundedRect: NSRect(x: x, y: y, width: badge.width, height: badge.height),
+                     xRadius: 4, yRadius: 4).fill()
+        // A screen and, under it, a stub of a stand, centered in the badge.
+        let screen = NSSize(width: 12, height: 8)
+        let stand = NSSize(width: 4, height: 2)
+        let glyphX = x + ((badge.width - screen.width) / 2).rounded(.down)
+        let glyphY = y + ((badge.height - screen.height - stand.height) / 2).rounded(.down)
+        NSColor.white.setStroke()
+        let outline = NSBezierPath(roundedRect: NSRect(x: glyphX + 0.5, y: glyphY + stand.height + 0.5,
+                                                       width: screen.width - 1, height: screen.height - 1),
+                                   xRadius: 1.5, yRadius: 1.5)
+        outline.lineWidth = 1
+        outline.stroke()
+        NSColor.white.setFill()
+        NSBezierPath(rect: NSRect(x: glyphX + ((screen.width - stand.width) / 2).rounded(.down), y: glyphY,
+                                  width: stand.width, height: stand.height)).fill()
+    }
+
+    /// The icon's size: the battery, plus the Keep Awake group when a
+    /// session runs, and never narrower than `minWidth` (the widest icon
+    /// drawn since the panel was attached; see anchoredIconWidth).
+    static func menuBarIconSize(keepAwake: BatteryMonitor.KeepAwakeIndicator? = nil,
+                                minWidth: CGFloat = 0) -> NSSize {
+        let group = keepAwake.map(keepAwakeGroupWidth) ?? 0
+        // Every icon is a whole number of points plus the battery, and
+        // `minWidth` was one of them: rounding takes it back to that
+        // number exactly, so the battery cannot drift off the pixel grid.
+        let reserved = (minWidth - menuBarBatteryWidth).rounded()
+        return NSSize(width: max(group, reserved) + menuBarBatteryWidth, height: menuBarIconHeight)
     }
 
     /// Pure icon renderer. Internal (not private) so headless snapshot tests
@@ -564,35 +846,101 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     ///
     /// Template rendering only survives while the icon is monochrome: the
     /// system recolors template images from their alpha alone, which would
-    /// erase the badge's blue and the warning's orange. Those variants render
-    /// non-template, picking the battery color from `darkMenuBar` manually.
+    /// erase the update dot's blue, the warning's orange and the accent color
+    /// of a Keep Awake session's display badge. Those variants render
+    /// non-template, picking the neutral color from `darkMenuBar` manually.
+    ///
+    /// `keepAwake`: a running Keep Awake session, drawn to the left of the
+    /// battery as its symbol and, when it has one to show, its remaining
+    /// time. To the left because a menu bar item keeps its right edge when
+    /// its width changes: the battery and the percent stay where they are
+    /// when a session starts or ends and as the countdown loses digits.
+    /// The symbol comes first so the time cannot be read as the battery's.
+    /// While the display is kept on (so the Mac does not lock on its own)
+    /// the symbol is a badge filled with `accent`, the one colored part,
+    /// to draw the eye to that state (drawKeepAwakeDisplayBadge); the cup,
+    /// the time and, unless a warning tints it, the battery stay neutral.
+    /// `timeY`: see menuBarTimeY.
     static func renderMenuBarIcon(percentage: CGFloat, hasWarning: Bool,
-                                  hasUpdate: Bool, darkMenuBar: Bool, gated: Bool = false) -> NSImage {
+                                  hasUpdate: Bool, darkMenuBar: Bool, gated: Bool = false,
+                                  keepAwake: BatteryMonitor.KeepAwakeIndicator? = nil,
+                                  accent: NSColor = .controlAccentColor,
+                                  timeY: CGFloat = menuBarTimeDefaultY,
+                                  minWidth: CGFloat = 0) -> NSImage {
+        let size = menuBarIconSize(keepAwake: keepAwake, minWidth: minWidth)
+        let image = NSImage(size: size)
+        image.lockFocus()
+        drawMenuBarIcon(size: size, percentage: percentage, hasWarning: hasWarning, hasUpdate: hasUpdate,
+                        darkMenuBar: darkMenuBar, gated: gated, keepAwake: keepAwake, accent: accent, timeY: timeY)
+        image.unlockFocus()
+        image.isTemplate = menuBarIconIsTemplate(hasWarning: hasWarning, hasUpdate: hasUpdate, keepAwake: keepAwake)
+        return image
+    }
+
+    static func menuBarIconIsTemplate(hasWarning: Bool, hasUpdate: Bool,
+                                      keepAwake: BatteryMonitor.KeepAwakeIndicator?) -> Bool {
+        !hasWarning && !hasUpdate && keepAwake?.display != true
+    }
+
+    /// Draws the icon into the current graphics context, in a `size` from
+    /// menuBarIconSize: the battery against the right edge, the Keep Awake
+    /// group against the battery, and any spare width clear on the left.
+    /// Apart from renderMenuBarIcon so a snapshot can draw it at any scale.
+    static func drawMenuBarIcon(size: NSSize, percentage: CGFloat, hasWarning: Bool,
+                                hasUpdate: Bool, darkMenuBar: Bool, gated: Bool = false,
+                                keepAwake: BatteryMonitor.KeepAwakeIndicator? = nil,
+                                accent: NSColor = .controlAccentColor,
+                                timeY: CGFloat = menuBarTimeDefaultY) {
         let battW: CGFloat = 24
         let battH: CGFloat = 11
         let capW: CGFloat = 2.8
-        let totalW = battW + capW + 1
-        let totalH: CGFloat = 18
+        let totalH = size.height
+        // Where the battery starts: a whole number of points (menuBarIconSize).
+        let battX = (size.width - menuBarBatteryWidth).rounded()
 
-        let image = NSImage(size: NSSize(width: totalW, height: totalH))
-        image.lockFocus()
-
-        let color: NSColor = hasWarning ? .systemOrange
-            : (hasUpdate ? (darkMenuBar ? .white : .black) : .black)
+        let templated = menuBarIconIsTemplate(hasWarning: hasWarning, hasUpdate: hasUpdate, keepAwake: keepAwake)
+        // Off template rendering the neutral parts are colored by hand, in
+        // the color the system gives a template image and the title beside
+        // it (menuBarTintAlpha): at full strength they would come out
+        // brighter than the percent next to them, and the battery would
+        // brighten the moment the update dot or the display badge appeared.
+        let neutralAlpha: CGFloat = templated ? 1 : menuBarTintAlpha(dark: darkMenuBar)
+        let neutral = (!templated && darkMenuBar ? NSColor.white : NSColor.black).withAlphaComponent(neutralAlpha)
+        let color: NSColor = hasWarning ? .systemOrange : neutral
+        let colorAlpha: CGFloat = hasWarning ? 1 : neutralAlpha
         let battY = (totalH - battH) / 2
+
+        if let keepAwake {
+            let groupX = battX - keepAwakeGroupWidth(keepAwake)
+            if keepAwake.display {
+                drawKeepAwakeDisplayBadge(x: groupX, iconHeight: totalH, accent: accent)
+            } else if let cup = keepAwakeCup(color: neutral) {
+                // Against the right of the slot, so the gap to the time is
+                // the badge's; on whole points, where a one-pixel-per-point
+                // display draws it sharpest.
+                let cupSize = cup.size
+                cup.draw(in: NSRect(x: groupX + (keepAwakeSymbolSlot - cupSize.width).rounded(.down),
+                                    y: ((totalH - cupSize.height) / 2).rounded(),
+                                    width: cupSize.width, height: cupSize.height))
+            }
+            if let time = keepAwake.time {
+                NSAttributedString(string: time, attributes: [.font: menuBarTextFont, .foregroundColor: neutral])
+                    .draw(at: NSPoint(x: groupX + keepAwakeSymbolSlot + keepAwakeSymbolToTime, y: timeY))
+            }
+        }
 
         // Battery outline. Gated (no license, see AppDelegate.licenseGated):
         // the outline alone, dimmed, and nothing inside it.
         let outlineAlpha: CGFloat = gated ? 0.35 : 0.7
-        let bodyRect = NSRect(x: 0.5, y: battY + 0.5, width: battW - 1, height: battH - 1)
+        let bodyRect = NSRect(x: battX + 0.5, y: battY + 0.5, width: battW - 1, height: battH - 1)
         let path = NSBezierPath(roundedRect: bodyRect, xRadius: 2, yRadius: 2)
-        color.withAlphaComponent(outlineAlpha).setStroke()
+        color.withAlphaComponent(outlineAlpha * colorAlpha).setStroke()
         path.lineWidth = 1
         path.stroke()
 
         // Battery cap
-        let capRect = NSRect(x: battW, y: battY + battH * 0.3, width: capW, height: battH * 0.4)
-        color.withAlphaComponent(outlineAlpha).setFill()
+        let capRect = NSRect(x: battX + battW, y: battY + battH * 0.3, width: capW, height: battH * 0.4)
+        color.withAlphaComponent(outlineAlpha * colorAlpha).setFill()
         NSBezierPath(roundedRect: capRect, xRadius: 0.8, yRadius: 0.8).fill()
 
         // Fill level. Clamp to [0, fillMaxW] because the animation timer
@@ -602,7 +950,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let inset: CGFloat = 2
         let fillMaxW = battW - 1 - inset * 2
         let fillW = gated ? 0 : min(fillMaxW, max(0, fillMaxW * percentage / 100))
-        let fillRect = NSRect(x: 0.5 + inset, y: battY + 0.5 + inset,
+        let fillRect = NSRect(x: battX + 0.5 + inset, y: battY + 0.5 + inset,
                               width: fillW, height: battH - 1 - inset * 2)
         color.setFill()
         NSBezierPath(roundedRect: fillRect, xRadius: 1, yRadius: 1).fill()
@@ -611,7 +959,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // separated from the battery by a knocked-out ring so it reads
         // crisply over the outline, the fill, and any menu bar background.
         if hasUpdate {
-            let center = NSPoint(x: battW - 1, y: battY + battH - 1)
+            let center = NSPoint(x: battX + battW - 1, y: battY + battH - 1)
             let ringR: CGFloat = 4.6
             let dotR: CGFloat = 3.2
             if let ctx = NSGraphicsContext.current {
@@ -625,10 +973,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             NSBezierPath(ovalIn: NSRect(x: center.x - dotR, y: center.y - dotR,
                                         width: dotR * 2, height: dotR * 2)).fill()
         }
-
-        image.unlockFocus()
-        image.isTemplate = !hasWarning && !hasUpdate
-        return image
     }
 }
 
@@ -744,8 +1088,9 @@ struct ContentView: View {
 
             // Keep Awake lives on the main panel, outside the mode
             // sections: it works in manual and auto mode alike, and stays
-            // visible on battery (where the toggle holds its intent for
-            // the next plug-in rather than acting immediately).
+            // visible on battery, where its controls are disabled (a
+            // session is AC-only: unplugging ends it, and plugging back
+            // in starts nothing).
             keepAwakeRow()
 
             Divider().padding(.horizontal).padding(.top, 8)
@@ -976,6 +1321,11 @@ struct ContentView: View {
                     .disabled(monitor.controlsUnavailable)
                 launchAtLoginRow()
                 menuBarPercentRow()
+                // A setting of Keep Awake's, so offered with it: a copy
+                // without the paid license has no session to show.
+                if !monitor.keepAwakeLocked {
+                    menuBarKeepAwakeTimeRow()
+                }
                 registrationRow()
                 // Only while this account holds passwordless access and this
                 // instance manages charge control: another account's rule is
@@ -1282,6 +1632,28 @@ struct ContentView: View {
         }
         .padding(.horizontal, 16)
         .help("Show the charge percentage next to the battery icon in the menu bar; off shows the icon only (the freed space is reclaimed when this panel closes)")
+    }
+
+    private func menuBarKeepAwakeTimeRow() -> some View {
+        HStack {
+            // The settings rows' *.circle.fill family (see menuBarPercentRow).
+            Image(systemName: "timer.circle.fill")
+                .font(.system(size: 14))
+                .foregroundColor(monitor.showMenuBarKeepAwakeTime ? .accentColor : .secondary)
+            Text("Keep Awake Time in Menu Bar")
+                .font(.system(size: 13, weight: .semibold))
+            Spacer()
+            Toggle("", isOn: Binding(
+                get: { monitor.showMenuBarKeepAwakeTime },
+                set: { monitor.showMenuBarKeepAwakeTime = $0 }
+            ))
+            .toggleStyle(.switch)
+            .controlSize(.small)
+        }
+        .padding(.horizontal, 16)
+        .help(monitor.showMenuBarKeepAwakeTime
+            ? "On: a timed Keep Awake session shows its remaining time beside its symbol in the menu bar. Turn off to show the symbol alone and keep the menu bar item narrow (the freed space is reclaimed when this panel closes)."
+            : "Off: a Keep Awake session shows only its symbol in the menu bar, a cup, or a display on the accent color while the display is kept on. Turn on to show a timed session's remaining time beside it.")
     }
 
     private func keepAwakeRow() -> some View {
