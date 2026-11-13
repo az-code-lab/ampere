@@ -134,6 +134,13 @@ final class BatteryMonitor: ObservableObject {
         /// main queue.
         var authenticateOwner: (String, @escaping (OwnerAuthentication.Outcome) -> Void) -> Void
             = OwnerAuthentication.authenticate(reason:completion:)
+        /// Subscribes to this Mac's power-source changes (plug, unplug,
+        /// charge ticks): the handler runs on the main run loop at each
+        /// one. Returns what ends the subscription, or nil when it could
+        /// not be set up. Part of the seam like every other system input:
+        /// a monitor under test must not be polled by the real Mac's
+        /// battery, whose changes arrive at any moment.
+        var observePowerSource: (@escaping () -> Void) -> (() -> Void)? = BatteryMonitor.observePowerSource
     }
 
     private let defaults: BatteryPreferences
@@ -593,9 +600,10 @@ final class BatteryMonitor: ObservableObject {
     /// One-shot timer at the session deadline, so expiry lands on time
     /// instead of waiting out the current poll interval (up to 60 s).
     private var keepAwakeExpiryTimer: Timer?
-    /// IOKit power-source change notifications (plug/unplug, charge ticks)
-    /// drive an immediate refresh; removed from the run loop in deinit.
-    private var powerSourceRunLoopSource: CFRunLoopSource?
+    /// Power-source change notifications (plug/unplug, charge ticks) drive
+    /// an immediate refresh (IO.observePowerSource); this ends the
+    /// subscription, in deinit.
+    private var stopObservingPowerSource: (() -> Void)?
     // Self-update plumbing, used by the extension in Updater.swift. Not
     // `private`: stored properties can't live in a cross-file extension,
     // but the logic that touches them does.
@@ -996,17 +1004,10 @@ final class BatteryMonitor: ObservableObject {
         // and a discharge left running after an unplug should stop within
         // seconds, not at the next tick. The timer above remains the
         // fallback cadence and drives health checks when nothing changes.
-        // passUnretained is safe: the source is removed in deinit, so no
-        // callback can outlive self. The callback fires on the run loop the
-        // source is added to — main, where refresh() belongs.
-        let iopsContext = Unmanaged.passUnretained(self).toOpaque()
-        if let source = IOPSNotificationCreateRunLoopSource({ context in
-            guard let context else { return }
-            Unmanaged<BatteryMonitor>.fromOpaque(context).takeUnretainedValue().refresh()
-        }, iopsContext)?.takeRetainedValue() {
-            CFRunLoopAddSource(CFRunLoopGetMain(), source, .defaultMode)
-            powerSourceRunLoopSource = source
-        } else {
+        // The handler runs on the main run loop, where refresh() belongs,
+        // and the subscription ends in deinit.
+        stopObservingPowerSource = io.observePowerSource { [weak self] in self?.refresh() }
+        if stopObservingPowerSource == nil {
             AmpereLog.app("Ampere: IOPS notification source unavailable — timer-only polling")
         }
         // Check for updates: 5 minutes after launch, then once daily at a random interval
@@ -1545,9 +1546,7 @@ final class BatteryMonitor: ObservableObject {
         // system awake for the remainder of the process's lifetime.
         if keepAwakeAssertionHeld != nil { IOPMAssertionRelease(keepAwakeAssertionID) }
         updateDownloadTask?.cancel()
-        if let source = powerSourceRunLoopSource {
-            CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .defaultMode)
-        }
+        stopObservingPowerSource?()
         if let observer = terminationObserver {
             NotificationCenter.default.removeObserver(observer)
         }
@@ -4124,6 +4123,32 @@ final class BatteryMonitor: ObservableObject {
             performNativeHealthCheck(battery: battery)
         } else {
             performHealthCheck(battery: battery)
+        }
+    }
+
+    /// What the IOKit power-source callback is handed: the handler to run.
+    private final class PowerSourceHandler {
+        let run: () -> Void
+        init(_ run: @escaping () -> Void) { self.run = run }
+    }
+
+    /// The real power-source subscription (IO.observePowerSource): an
+    /// IOKit run loop source on the main run loop. The source keeps the
+    /// handler alive until the returned closure removes it, which must be
+    /// called on the main thread, so no callback can be running then.
+    static func observePowerSource(_ handler: @escaping () -> Void) -> (() -> Void)? {
+        let context = Unmanaged.passRetained(PowerSourceHandler(handler))
+        guard let source = IOPSNotificationCreateRunLoopSource({ context in
+            guard let context else { return }
+            Unmanaged<PowerSourceHandler>.fromOpaque(context).takeUnretainedValue().run()
+        }, context.toOpaque())?.takeRetainedValue() else {
+            context.release()
+            return nil
+        }
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .defaultMode)
+        return {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .defaultMode)
+            context.release()
         }
     }
 

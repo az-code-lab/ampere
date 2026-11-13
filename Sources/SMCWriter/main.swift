@@ -558,34 +558,6 @@ func stopWatchdogs() -> Bool {
     }
 }
 
-/// Start `path` with `arguments` in its own session, detached from this
-/// process and from any terminal, with the standard streams on /dev/null.
-/// Returns the posix_spawn error code, 0 on success.
-func spawnDetached(_ path: String, arguments: [String]) -> Int32 {
-    var spawnPid: pid_t = 0
-    var fileActions: posix_spawn_file_actions_t?
-    posix_spawn_file_actions_init(&fileActions)
-    posix_spawn_file_actions_addopen(&fileActions, STDIN_FILENO, "/dev/null", O_RDONLY, 0)
-    posix_spawn_file_actions_addopen(&fileActions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0)
-    posix_spawn_file_actions_addopen(&fileActions, STDERR_FILENO, "/dev/null", O_WRONLY, 0)
-
-    // Detach into its own session (setsid): otherwise the child inherits
-    // the app's process group, and a terminal Ctrl+C (dev runs via run.sh)
-    // delivers SIGINT to the whole foreground group — killing a watchdog
-    // at the same instant as the app it exists to clean up after.
-    var spawnAttrs: posix_spawnattr_t?
-    posix_spawnattr_init(&spawnAttrs)
-    posix_spawnattr_setflags(&spawnAttrs, Int16(POSIX_SPAWN_SETSID))
-
-    let argv = ([path] + arguments).map { strdup($0) }
-    var args: [UnsafeMutablePointer<CChar>?] = argv + [nil]
-    let result = posix_spawn(&spawnPid, path, &fileActions, &spawnAttrs, &args, nil)
-    posix_spawnattr_destroy(&spawnAttrs)
-    posix_spawn_file_actions_destroy(&fileActions)
-    for pointer in argv { free(pointer) }
-    return result
-}
-
 /// Spawn a detached watchdog daemon that monitors the given app PID.
 /// When the app dies, the watchdog clears CHTE, CHIE, and restores sleep.
 func spawnWatchdog(appPID: Int32) -> Bool {
@@ -596,7 +568,7 @@ func spawnWatchdog(appPID: Int32) -> Bool {
         fputs("ERROR: watchdog executable is not protected\n", stderr)
         return false
     }
-    let result = spawnDetached(execPath, arguments: ["watchdog:\(appPID)"])
+    let result = DetachedSpawn.spawn(execPath, arguments: ["watchdog:\(appPID)"]).status
     if result != 0 {
         fputs("WARNING: Failed to spawn watchdog (errno \(result))\n", stderr)
         return false
@@ -852,7 +824,7 @@ func performUninstall(asCleanupJob: Bool, userData: Bool) -> Int32 {
         },
         unloadDaemon: {
             if asCleanupJob {
-                _ = spawnDetached("/bin/sh", arguments: ["-c", "sleep 1; /bin/launchctl bootout \(cleanupJobTarget)"])
+                _ = DetachedSpawn.spawn("/bin/sh", arguments: ["-c", "sleep 1; /bin/launchctl bootout \(cleanupJobTarget)"])
             } else {
                 _ = runLaunchctl(["bootout", cleanupJobTarget])
             }

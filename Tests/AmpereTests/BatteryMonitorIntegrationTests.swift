@@ -72,6 +72,13 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         /// The reason given to each prompt, in order.
         var prompts: [String] = []
         private var pendingPrompt: ((OwnerAuthentication.Outcome) -> Void)?
+        /// What the monitor asked to be run at each power-source change,
+        /// while it is subscribed. The real Mac's own changes never reach
+        /// a monitor under test: they arrive whenever its battery ticks,
+        /// and each one is a poll the test did not ask for.
+        private var powerSourceHandler: (() -> Void)?
+        /// True while the monitor is subscribed to power-source changes.
+        var observingPowerSource: Bool { powerSourceHandler != nil }
         let preferences = MemoryBatteryPreferences()
         private let lock = NSLock()
         private var commands: [String] = []
@@ -147,6 +154,15 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
             guard let reply = pendingPrompt else { return XCTFail("No prompt is up", file: file, line: line) }
             pendingPrompt = nil
             reply(outcome)
+        }
+
+        /// The power source changed (plug, unplug, a charge tick): the
+        /// notification the monitor polls on.
+        func powerSourceChanged(file: StaticString = #filePath, line: UInt = #line) {
+            guard let handler = powerSourceHandler else {
+                return XCTFail("The monitor is not observing the power source", file: file, line: line)
+            }
+            handler()
         }
 
         /// Someone else (System Settings, another tool) cleared the limit.
@@ -285,6 +301,10 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
             io.authenticateOwner = { reason, reply in
                 self.prompts.append(reason)
                 if let answer = self.ownerAnswer { reply(answer) } else { self.pendingPrompt = reply }
+            }
+            io.observePowerSource = { handler in
+                self.powerSourceHandler = handler
+                return { self.powerSourceHandler = nil }
             }
             return BatteryMonitor(license: license ?? (locked ? .free : .paid), defaults: preferences,
                                   io: io, startMonitoring: startMonitoring)
@@ -1710,6 +1730,33 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         XCTAssertFalse(hw.sleepOverridden)
         XCTAssertFalse(hw.writes.contains("release-sleep-hold"))
         XCTAssertEqual(Array(hw.writes.suffix(2)), ["nodischarge", "spawn-watchdog:\(pid)"])
+    }
+
+    /// A running monitor polls at each power-source change instead of
+    /// waiting out its timer, through the subscription its IO hands it; a
+    /// monitor that was never started subscribes to nothing, and one that
+    /// goes away ends its subscription. The tests reach that subscription
+    /// through the harness only: a monitor under test that listened to the
+    /// real Mac was polled whenever the Mac's own battery ticked, which
+    /// retried a refused discharge start in the middle of
+    /// testAPendingCleanupRunsDespiteANewSleepHoldAndReArmsIt (2026-11-12).
+    func testAPowerSourceChangePollsAtOnceThroughTheIOSubscription() {
+        let idle = Hardware()
+        let unstarted = idle.monitor()
+        XCTAssertFalse(idle.observingPowerSource)
+        XCTAssertNil(unstarted.state)
+
+        let hw = Hardware()
+        var monitor: BatteryMonitor? = hw.monitor(startMonitoring: true)
+        drainCallbacks()
+        XCTAssertTrue(hw.observingPowerSource)
+        XCTAssertEqual(monitor?.state?.percentage, 50)
+        hw.percentage = 51
+        hw.powerSourceChanged()
+        XCTAssertEqual(monitor?.state?.percentage, 51, "Polled by the change itself, not by the timer")
+        drainCallbacks()
+        monitor = nil
+        XCTAssertFalse(hw.observingPowerSource, "The subscription ends with the monitor")
     }
 
     func testStandsByForAnEarlierInstanceAndTakesOverWhenItQuits() {
