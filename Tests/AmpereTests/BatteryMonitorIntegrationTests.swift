@@ -29,6 +29,17 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         var installs = 0
         /// False: the administrator prompt is cancelled.
         var installSucceeds = true
+        /// True: a successful install also does what the real setup script
+        /// does around it, the helper's restore and then a fresh watchdog.
+        /// Off by default so the tests that are not about the install keep
+        /// their write lists to what the monitor itself asked for.
+        var installRunsItsScript = false
+        /// What the administrator prompt behind Revoke leaves of the helper:
+        /// answered, this account's access goes, and the helper itself goes
+        /// too when no other account uses it; cancelled, nothing changes.
+        /// Nil: no such prompt is expected.
+        enum Revoke { case otherAccountsRemain, lastAccount, cancelled }
+        var revoke: Revoke?
         /// Non-nil: an earlier Ampere process holds charge control.
         var competing: String?
         /// Non-nil: an installed copy the cleanup job should watch.
@@ -65,9 +76,12 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         private let lock = NSLock()
         private var commands: [String] = []
         private var gate: (String, Gate)?
+        private var installGate: Gate?
+        private var revokeGate: Gate?
         private var chte: UInt8 = 1
         private var chie: UInt8 = 0
         private var held = false
+        private var watchdog = false
         private var failingCommands: Set<String> = []
         /// True: the discharge command writes CHIE and disables sleep, then
         /// fails (its watchdog spawn and the CHIE rollback both failed), so
@@ -77,6 +91,10 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         var dischargeApplied: Bool { lock.lock(); defer { lock.unlock() }; return chie == 8 }
         /// True while the helper's sleep override (discharge or hold) is in force.
         var sleepOverridden: Bool { lock.lock(); defer { lock.unlock() }; return held }
+        /// True while CHTE reads as inhibit.
+        var chargingInhibited: Bool { lock.lock(); defer { lock.unlock() }; return chte == 1 }
+        /// True while a crash watchdog the helper spawned has not been retired.
+        var watchdogRunning: Bool { lock.lock(); defer { lock.unlock() }; return watchdog }
 
         var writes: [String] {
             lock.lock(); defer { lock.unlock() }
@@ -87,6 +105,24 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
             let next = Gate()
             lock.lock(); defer { lock.unlock() }
             gate = (command, next)
+            return next
+        }
+
+        /// The next administrator prompt for the helper install stays up
+        /// until the gate is released.
+        func blockInstall() -> Gate {
+            let next = Gate()
+            lock.lock(); defer { lock.unlock() }
+            installGate = next
+            return next
+        }
+
+        /// The next administrator prompt behind Revoke stays up until the
+        /// gate is released.
+        func blockRevoke() -> Gate {
+            let next = Gate()
+            lock.lock(); defer { lock.unlock() }
+            revokeGate = next
             return next
         }
 
@@ -130,17 +166,20 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
             }
             lock.lock(); defer { lock.unlock() }
             commands.append(command)
+            // sudo runs the helper for an account that holds its rule only.
+            guard installed, authorized else { return false }
             guard !failingCommands.contains(command) else { return false }
             switch command {
             case "inhibit": chte = 1
             case "allow": chte = 0
-            case "nodischarge": chie = 0; held = false
-            case "restore": chte = 0; chie = 0; held = false; registered = []
+            case "nodischarge": chie = 0; held = false; watchdog = false
+            case "restore": chte = 0; chie = 0; held = false; registered = []; watchdog = false
             case "native-limit-release": registered = []
             case "hold-sleep": held = true
             case "release-sleep-hold": held = false
             default:
-                if command.hasPrefix("discharge:") { chie = 8; held = true }
+                if command.hasPrefix("discharge:") { chie = 8; held = true; watchdog = !dischargeFailsAfterApplying }
+                if command.hasPrefix("spawn-watchdog:") { watchdog = true }
                 if command.hasPrefix("register-daemon:") { daemonRegistered = true }
                 if command.hasPrefix("native-limit:"), enforcesLimits,
                    let n = Int(command.dropFirst("native-limit:".count)) {
@@ -193,17 +232,52 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
             io.now = { self.clock }
             io.writeHelper = write
             io.helperInstalled = { self.installed }
+            io.helperProtected = { self.installed }
             io.helperAuthorized = { self.authorized }
             io.helperStale = { self.stale }
             io.installHelper = {
                 self.installs += 1
+                self.lock.lock()
+                let prompt = self.installGate
+                self.installGate = nil
+                self.lock.unlock()
+                if let prompt {
+                    prompt.entered.signal()
+                    guard prompt.release.wait(timeout: .now() + 3) == .success else { return false }
+                }
                 guard self.installSucceeds else { return false }
                 self.authorized = true
                 self.installed = true
                 self.stale = false
+                if self.installRunsItsScript {
+                    _ = self.write("restore")
+                    _ = self.write("spawn-watchdog:\(ProcessInfo.processInfo.processIdentifier)")
+                }
                 return true
             }
-            io.runAsAdmin = { _ in XCTFail("Unexpected administrator command"); return false }
+            io.runAsAdmin = { _ in
+                guard let revoke = self.revoke else {
+                    XCTFail("Unexpected administrator command")
+                    return .failed
+                }
+                self.lock.lock()
+                let prompt = self.revokeGate
+                self.revokeGate = nil
+                self.lock.unlock()
+                if let prompt {
+                    prompt.entered.signal()
+                    guard prompt.release.wait(timeout: .now() + 3) == .success else { return .cancelled }
+                }
+                guard revoke != .cancelled else { return .cancelled }
+                // The removal script: the helper's restore first, and it
+                // stops there when that fails; then this account's sudoers
+                // line goes, and the helper itself once no other account
+                // is left.
+                guard self.write("restore") else { return .failed }
+                self.authorized = false
+                if revoke == .lastAccount { self.installed = false }
+                return .done
+            }
             io.setupRefusal = { nil }
             io.competingInstance = { self.competing }
             io.cleanupDaemonBundlePath = { self.bundlePath }
@@ -314,33 +388,723 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
 
     /// A restore the lapse called for that fails is retried while the hold
     /// lasts, at the launch cleanup's interval; once it lands, nothing more
-    /// is written.
+    /// is written. The restore is queued, not waited for, so each step
+    /// lets it land before looking.
     func testAFailedRestoreOnLosingTheLicenseIsRetried() {
         let hw = Hardware()
         hw.percentage = 50
         let monitor = hw.monitor(startMonitoring: true, license: .free)
         awaitCondition { monitor.chargingPaused }
         drainCallbacks()
+        let restores = { hw.writes.filter { $0 == "restore" }.count }
         hw.fail("restore")
         monitor.licenseTier = .unlicensed
+        awaitCondition { restores() == 1 }
         drainCallbacks()
-        XCTAssertEqual(hw.writes.filter { $0 == "restore" }.count, 1)
         XCTAssertTrue(monitor.chargingPaused, "a failed restore leaves the picture as it was")
         monitor.refresh()
-        XCTAssertEqual(hw.writes.filter { $0 == "restore" }.count, 1, "not before the retry interval")
+        drainCallbacks()
+        XCTAssertEqual(restores(), 1, "not before the retry interval")
         hw.clock = hw.clock.addingTimeInterval(121)
         monitor.refresh()
-        XCTAssertEqual(hw.writes.filter { $0 == "restore" }.count, 2, "retried after the interval")
+        awaitCondition { restores() == 2 }
+        drainCallbacks()
+        XCTAssertTrue(monitor.chargingPaused, "retried after the interval, and failed again")
         hw.stopFailing("restore")
         hw.clock = hw.clock.addingTimeInterval(121)
         monitor.refresh()
+        awaitCondition { restores() == 3 }
         drainCallbacks()
-        XCTAssertEqual(hw.writes.filter { $0 == "restore" }.count, 3)
         XCTAssertFalse(monitor.chargingPaused)
         hw.clock = hw.clock.addingTimeInterval(121)
         monitor.refresh()
         drainCallbacks()
-        XCTAssertEqual(hw.writes.filter { $0 == "restore" }.count, 3, "landed: no further restore")
+        XCTAssertEqual(restores(), 3, "landed: no further restore")
+    }
+
+    // MARK: - Administrator prompts (Revoke, and a helper re-grant from the panel)
+
+    /// Waits, with the main queue running, until a gated prompt or helper
+    /// call has been reached. A prompt opens from the main queue, once
+    /// charge control is frozen for it, so blocking on its gate here would
+    /// keep it from ever opening.
+    private func awaitEntered(_ gate: Hardware.Gate, file: StaticString = #filePath, line: UInt = #line) {
+        let deadline = Date().addingTimeInterval(3)
+        while gate.entered.wait(timeout: .now()) != .success {
+            guard Date() < deadline else {
+                return XCTFail("The gated call was never reached", file: file, line: line)
+            }
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.01))
+        }
+    }
+
+    /// What the Auto Charge switch does when it is turned on: the intent
+    /// first, then the grant, then a poll (ContentView.autoManageToggle).
+    private func turnAutoChargeOn(_ monitor: BatteryMonitor) -> XCTestExpectation {
+        let answered = expectation(description: "the administrator prompt was answered")
+        monitor.autoManageEnabled = true
+        monitor.ensureSudoInstalled { ok in
+            if ok { monitor.refresh() } else { monitor.autoManageEnabled = false }
+            answered.fulfill()
+        }
+        return answered
+    }
+
+    /// A monitor that manages charging in auto mode at 50% with a charge to
+    /// the upper bound running: charging is allowed, and a sleep would
+    /// pause it. Four helper calls have been made.
+    private func chargingMonitor(_ hw: Hardware) -> BatteryMonitor {
+        let monitor = hw.monitor(startMonitoring: true, license: .free)
+        awaitCondition { monitor.chargingPaused }
+        drainCallbacks()
+        monitor.chargeToUpperBound = true
+        monitor.refresh()
+        awaitCondition { !monitor.chargingPaused }
+        drainCallbacks()
+        XCTAssertEqual(hw.writes, ["nodischarge", "inhibit", "spawn-watchdog:\(pid)", "allow"])
+        return monitor
+    }
+
+    /// A monitor that managed charging with Auto Charge on and then had its
+    /// admin access revoked from the panel, on a Mac where this was the
+    /// helper's last account (the helper is gone) or where another account
+    /// keeps it installed. Returns how many helper calls that took.
+    private func revokedMonitor(_ hw: Hardware, _ revoke: Hardware.Revoke) -> (monitor: BatteryMonitor, writes: Int) {
+        let monitor = hw.monitor(startMonitoring: true, license: .free)
+        awaitCondition { monitor.chargingPaused }
+        drainCallbacks()
+        hw.revoke = revoke
+        monitor.removeSudoRule()
+        awaitCondition { !monitor.accountAuthorized }
+        drainCallbacks()
+        XCTAssertEqual(hw.writes.last, "restore", "Revoke restores before it takes the access away")
+        XCTAssertFalse(hw.chargingInhibited)
+        XCTAssertFalse(monitor.autoManageEnabled, "Revoke turns Auto Charge off")
+        XCTAssertNil(monitor.chargeControlHold)
+        XCTAssertFalse(monitor.adminPromptUp)
+        XCTAssertEqual(monitor.isSudoRuleInstalled, revoke == .otherAccountsRemain)
+        return (monitor, hw.writes.count)
+    }
+
+    /// A password prompt takes as long as the person takes. On the SMC
+    /// queue it held up everything that has to land in order behind the
+    /// helper's writes: the sleep handler waited for it with the charge
+    /// still running, a discharge was not stopped at its target, and
+    /// quitting waited out its limit. The prompt now runs elsewhere, and
+    /// charge control is frozen first: overrides cleared, a fresh
+    /// watchdog, and the charge paused as before a sleep. While the prompt
+    /// is up nothing is written, no second prompt opens, and neither sleep
+    /// nor wake waits for anything.
+    func testRevokeFreezesChargeControlForAsLongAsItsPromptIsUp() {
+        let hw = Hardware()
+        let monitor = chargingMonitor(hw)
+        hw.revoke = .otherAccountsRemain
+        let prompt = hw.blockRevoke()
+        monitor.removeSudoRule()
+        XCTAssertEqual(monitor.chargeControlHold, .adminPrompt, "Frozen from the click")
+        XCTAssertTrue(monitor.adminPromptUp)
+        awaitEntered(prompt)
+        XCTAssertEqual(Array(hw.writes.dropFirst(4)), ["nodischarge", "spawn-watchdog:\(pid)", "inhibit"],
+                       "Before the prompt opens: overrides cleared, a fresh watchdog, the charge paused as before a sleep")
+        XCTAssertTrue(hw.chargingInhibited)
+        XCTAssertTrue(hw.watchdogRunning)
+        XCTAssertTrue(monitor.chargeToUpperBound, "The intent is untouched")
+
+        for _ in 0..<3 { monitor.refresh() }
+        let asleep = Date()
+        monitor.prepareForSleep()
+        XCTAssertLessThan(Date().timeIntervalSince(asleep), 1, "The sleep handler does not wait for the prompt")
+        monitor.resumeAfterWake()
+        monitor.removeSudoRule()
+        XCTAssertEqual(monitor.lastError, "Charge control is busy — try revoking access again in a moment")
+        var granted: Bool?
+        monitor.ensureSudoInstalled { granted = $0 }
+        XCTAssertEqual(granted, false, "No second prompt behind the first")
+        drainCallbacks()
+        XCTAssertEqual(hw.writes.count, 7, "Polls, sleep, wake: nothing is written while the prompt is up")
+        XCTAssertEqual(hw.installs, 0)
+
+        prompt.release.signal()
+        awaitCondition { !monitor.adminPromptUp }
+        drainCallbacks()
+        XCTAssertEqual(Array(hw.writes.dropFirst(7)), ["restore"], "Answered: the removal restores, and nothing follows it")
+        XCTAssertNil(monitor.chargeControlHold)
+        XCTAssertFalse(monitor.accountAuthorized)
+        XCTAssertFalse(monitor.autoManageEnabled)
+        XCTAssertFalse(hw.chargingInhibited)
+        XCTAssertNil(monitor.lastError)
+    }
+
+    /// A cancelled prompt changed nothing, so charge control goes on the
+    /// way it does after a sleep: the paused charge is allowed again, and
+    /// there is nothing to report.
+    func testACancelledRevokeGoesOnAsAfterASleep() {
+        let hw = Hardware()
+        let monitor = chargingMonitor(hw)
+        hw.revoke = .cancelled
+        let prompt = hw.blockRevoke()
+        monitor.removeSudoRule()
+        awaitEntered(prompt)
+        XCTAssertTrue(hw.chargingInhibited, "Paused while the prompt is up")
+        prompt.release.signal()
+        awaitCondition { hw.writes.last == "allow" }
+        drainCallbacks()
+        XCTAssertEqual(Array(hw.writes.dropFirst(4)), ["nodischarge", "spawn-watchdog:\(pid)", "inhibit", "allow"],
+                       "The charge resumes, as on wake")
+        XCTAssertNil(monitor.chargeControlHold)
+        XCTAssertFalse(monitor.adminPromptUp)
+        XCTAssertTrue(monitor.accountAuthorized)
+        XCTAssertTrue(monitor.chargeToUpperBound)
+        XCTAssertFalse(monitor.chargingPaused)
+        XCTAssertNil(monitor.lastError, "Cancelling is not a failure")
+        XCTAssertNil(monitor.recoveryWarning)
+    }
+
+    /// Revoke tells a cancelled prompt from a removal that failed by the
+    /// error number osascript reports, never by the message, which follows
+    /// the system language. The two samples are what osascript prints for
+    /// each on macOS 27.
+    func testAnAdminPromptOutcomeIsReadFromTheErrorNumber() {
+        typealias Monitor = BatteryMonitor
+        XCTAssertEqual(Monitor.adminPromptOutcome(status: 0, errorOutput: ""), .done)
+        XCTAssertEqual(Monitor.adminPromptOutcome(status: 1, errorOutput: "0:17: execution error: User canceled. (-128)\n"),
+                       .cancelled)
+        XCTAssertEqual(Monitor.adminPromptOutcome(status: 1, errorOutput: "0:17: execution error: Abgebrochen. (-128)\n"),
+                       .cancelled, "The number, not the words")
+        XCTAssertEqual(Monitor.adminPromptOutcome(status: 1, errorOutput: "0:39: execution error: boom (3)\n"), .failed)
+        XCTAssertEqual(Monitor.adminPromptOutcome(status: 1,
+                                                  errorOutput: "0:39: execution error: ERROR: left at (-128) by a script (2)\n"),
+                       .failed, "Only the number osascript appends counts")
+        XCTAssertEqual(Monitor.adminPromptOutcome(status: 1, errorOutput: ""), .failed,
+                       "No verdict is not a cancel: the cleanup retry covers it")
+    }
+
+    /// A removal that ran and failed stopped at its restore, which may
+    /// have got part-way. Charge control goes on, and the restore joins
+    /// the cleanup retry: its warning stands until the retry has landed
+    /// and put a fresh watchdog in place.
+    func testARevokeWhoseCleanupFailsIsReportedAndRetried() {
+        let hw = Hardware()
+        let monitor = chargingMonitor(hw)
+        hw.revoke = .otherAccountsRemain
+        let prompt = hw.blockRevoke()
+        monitor.removeSudoRule()
+        awaitEntered(prompt)
+        hw.fail("restore")
+        prompt.release.signal()
+        awaitCondition { hw.writes.last == "allow" }
+        drainCallbacks()
+        XCTAssertEqual(Array(hw.writes.dropFirst(7)), ["restore", "allow"], "The removal's restore failed; the charge resumes")
+        XCTAssertTrue(monitor.accountAuthorized, "Nothing was removed")
+        XCTAssertNil(monitor.chargeControlHold)
+        XCTAssertEqual(monitor.recoveryWarning, BatteryMonitor.cleanupWarning)
+        hw.stopFailing("restore")
+        hw.clock = hw.clock.addingTimeInterval(130)
+        monitor.refresh()
+        awaitCondition { monitor.recoveryWarning == nil }
+        drainCallbacks()
+        XCTAssertEqual(Array(hw.writes.dropFirst(9).prefix(2)), ["nodischarge", "spawn-watchdog:\(pid)"])
+        XCTAssertTrue(hw.watchdogRunning)
+    }
+
+    /// An active discharge needs watching: it is stopped at the upper
+    /// bound by a poll, and no poll writes while a prompt is up. Left
+    /// running, it drained the battery for as long as the prompt stayed
+    /// open. It is stopped before the prompt opens, and restarted when a
+    /// prompt that changed nothing has been answered.
+    func testRevokeStopsAnActiveDischargeBeforeItsPromptOpens() {
+        let hw = Hardware()
+        hw.percentage = 70
+        hw.preferences.values["autoDischargeEnabled"] = true
+        let monitor = hw.monitor(startMonitoring: true, license: .free)
+        awaitCondition { monitor.activeDischarging }
+        drainCallbacks()
+        XCTAssertTrue(hw.dischargeApplied)
+        XCTAssertTrue(hw.sleepOverridden)
+        let before = hw.writes.count
+
+        hw.revoke = .cancelled
+        let prompt = hw.blockRevoke()
+        monitor.removeSudoRule()
+        awaitEntered(prompt)
+        XCTAssertEqual(Array(hw.writes.dropFirst(before)), ["nodischarge", "spawn-watchdog:\(pid)", "inhibit"])
+        XCTAssertFalse(hw.dischargeApplied, "No discharge runs unwatched behind a prompt")
+        XCTAssertFalse(hw.sleepOverridden, "And sleep is not kept disabled for it")
+        XCTAssertFalse(monitor.activeDischarging)
+        // The level the discharge was aiming for is reached and passed
+        // while the prompt is up: nothing drains toward it.
+        hw.percentage = 55
+        for _ in 0..<3 { monitor.refresh() }
+        drainCallbacks()
+        XCTAssertEqual(hw.writes.count, before + 3)
+        hw.percentage = 70
+
+        prompt.release.signal()
+        awaitCondition { monitor.activeDischarging }
+        drainCallbacks()
+        XCTAssertEqual(Array(hw.writes.suffix(2)), ["nodischarge", "discharge:\(pid)"],
+                       "Cancelled: the discharge starts again, as it would after a wake")
+        XCTAssertTrue(hw.dischargeApplied)
+    }
+
+    /// Quitting restores what the freeze left in force, at once: the
+    /// prompt is not on the SMC queue for the restore to wait behind.
+    func testQuittingWhileAPromptIsUpRestoresWithoutWaitingForIt() {
+        let hw = Hardware()
+        let monitor = chargingMonitor(hw)
+        hw.revoke = .cancelled
+        let prompt = hw.blockRevoke()
+        monitor.removeSudoRule()
+        awaitEntered(prompt)
+        XCTAssertTrue(hw.chargingInhibited)
+        let started = Date()
+        monitor.restoreBeforeTermination()
+        XCTAssertLessThan(Date().timeIntervalSince(started), 2, "Not the six seconds a restore stuck behind the prompt waited")
+        XCTAssertEqual(hw.writes.last, "restore")
+        XCTAssertFalse(hw.chargingInhibited)
+        XCTAssertFalse(hw.watchdogRunning)
+        prompt.release.signal()
+        drainCallbacks()
+    }
+
+    /// On firmware without CHTE the firmware holds the target on its own,
+    /// so there is nothing to stop and nothing to pause: the prompt freezes
+    /// the target as it stands, and sleep does not wait for it either.
+    func testNativeMode_APromptFreezesTheTargetAsItStands() {
+        let hw = Hardware()
+        hw.percentage = 50
+        let monitor = nativeMonitor(hw)
+        drainCallbacks()
+        let before = hw.writes.count
+        hw.revoke = .cancelled
+        let prompt = hw.blockRevoke()
+        monitor.removeSudoRule()
+        awaitEntered(prompt)
+        XCTAssertEqual(monitor.chargeControlHold, .adminPrompt)
+        for _ in 0..<2 { monitor.refresh() }
+        let asleep = Date()
+        monitor.prepareForSleep()
+        XCTAssertLessThan(Date().timeIntervalSince(asleep), 1, "The sleep handler does not wait for the prompt")
+        monitor.resumeAfterWake()
+        drainCallbacks()
+        XCTAssertEqual(hw.writes.count, before, "Nothing to stop, nothing to pause, and nothing written while the prompt is up")
+        XCTAssertEqual(hw.registered, [50])
+        prompt.release.signal()
+        awaitCondition { !monitor.adminPromptUp }
+        drainCallbacks()
+        XCTAssertNil(monitor.chargeControlHold)
+        XCTAssertEqual(hw.writes.count, before, "Cancelled: the target stood all along")
+        XCTAssertTrue(monitor.chargingPaused)
+    }
+
+    /// A re-grant after Revoke has nothing to freeze: nothing of this
+    /// account's is in force and it cannot run the helper. The prompt
+    /// still puts charge control on hold, so a poll that comes round while
+    /// the password is typed queues nothing behind it, and a second click
+    /// opens no second prompt. Granted, the state machine writes its one
+    /// inhibit and no health-check repair on top of it.
+    func testARegrantPromptHoldsChargeControlAndRefusesASecondPrompt() {
+        let hw = Hardware()
+        hw.installRunsItsScript = true
+        let (monitor, afterRevoke) = revokedMonitor(hw, .otherAccountsRemain)
+        let prompt = hw.blockInstall()
+        let answered = turnAutoChargeOn(monitor)
+        awaitEntered(prompt)
+        XCTAssertEqual(monitor.chargeControlHold, .adminPrompt)
+        XCTAssertTrue(monitor.adminPromptUp)
+        monitor.toggleCharging()
+        for _ in 0..<3 { monitor.refresh() }
+        drainCallbacks()
+        XCTAssertEqual(hw.installs, 1, "One prompt at a time")
+        XCTAssertEqual(hw.writes.count, afterRevoke, "Nothing to freeze, and nothing queued while the prompt is up")
+        XCTAssertNil(monitor.lastError)
+
+        prompt.release.signal()
+        wait(for: [answered], timeout: 3)
+        awaitCondition { monitor.chargingPaused }
+        drainCallbacks()
+        XCTAssertNil(monitor.chargeControlHold)
+        XCTAssertFalse(monitor.adminPromptUp)
+        XCTAssertTrue(monitor.accountAuthorized)
+        XCTAssertEqual(Array(hw.writes.dropFirst(afterRevoke)), ["restore", "spawn-watchdog:\(pid)", "inhibit"],
+                       "The install's own restore and watchdog, then the state machine's one inhibit, with no repair on top")
+        XCTAssertTrue(hw.chargingInhibited)
+        XCTAssertNil(monitor.healthWarning)
+    }
+
+    /// A helper that still works but has to be replaced (another account
+    /// installed a newer one) is the case where a re-grant finds things in
+    /// force: they are frozen like before a Revoke, and a cancelled prompt
+    /// resumes the charge.
+    func testReplacingAStaleHelperFreezesChargeControlAndACancelResumesIt() {
+        let hw = Hardware()
+        let monitor = chargingMonitor(hw)
+        hw.stale = true
+        hw.installSucceeds = false
+        let prompt = hw.blockInstall()
+        var granted: Bool?
+        monitor.ensureSudoInstalled { granted = $0 }
+        awaitEntered(prompt)
+        XCTAssertEqual(Array(hw.writes.dropFirst(4)), ["nodischarge", "spawn-watchdog:\(pid)", "inhibit"])
+        XCTAssertTrue(hw.chargingInhibited)
+        prompt.release.signal()
+        awaitCondition { hw.writes.last == "allow" }
+        drainCallbacks()
+        XCTAssertEqual(granted, false)
+        XCTAssertNil(monitor.chargeControlHold)
+        XCTAssertFalse(monitor.chargingPaused)
+        XCTAssertTrue(monitor.chargeToUpperBound)
+    }
+
+    /// The same prompt answered: the setup restored, so charging is allowed
+    /// while the picture says held. Charge control goes on as after a
+    /// sleep, so the poll that follows the grant re-asserts the hold
+    /// itself, and no health check has to find it missing first.
+    func testReplacingAStaleHelperWhileHoldingReassertsTheHoldAfterTheGrant() {
+        let hw = Hardware()
+        hw.installRunsItsScript = true
+        let monitor = hw.monitor(startMonitoring: true, license: .free)
+        awaitCondition { monitor.chargingPaused }
+        drainCallbacks()
+        XCTAssertEqual(hw.writes, ["nodischarge", "inhibit", "spawn-watchdog:\(pid)"])
+        hw.stale = true
+        let answered = expectation(description: "the administrator prompt was answered")
+        monitor.ensureSudoInstalled { ok in
+            if ok { monitor.refresh() }
+            answered.fulfill()
+        }
+        wait(for: [answered], timeout: 3)
+        awaitCondition { hw.writes.count >= 9 }
+        drainCallbacks()
+        XCTAssertEqual(Array(hw.writes.dropFirst(3)),
+                       ["nodischarge", "spawn-watchdog:\(pid)", "inhibit", "restore", "spawn-watchdog:\(pid)", "inhibit"],
+                       "Frozen, then the setup's restore and watchdog, then the hold again")
+        XCTAssertTrue(hw.chargingInhibited)
+        XCTAssertTrue(monitor.chargingPaused)
+        XCTAssertNotEqual(monitor.lastHealthCheckStatus, "FAIL")
+        XCTAssertNil(monitor.healthWarning)
+        XCTAssertFalse(hw.stale)
+    }
+
+    /// On battery the app is not managing charging, so there is no expected
+    /// state to check, and a re-grant there repairs nothing: the inhibit a
+    /// check used to write on battery had the state machine believing
+    /// charging was allowed at the next plug-in.
+    func testRegrantingOnBatteryRunsNoHealthCheck() {
+        let hw = Hardware()
+        hw.installRunsItsScript = true
+        let (monitor, afterRevoke) = revokedMonitor(hw, .lastAccount)
+        hw.connected = false
+        monitor.refresh()
+        let answered = turnAutoChargeOn(monitor)
+        wait(for: [answered], timeout: 3)
+        drainCallbacks()
+        XCTAssertEqual(Array(hw.writes.dropFirst(afterRevoke)), ["restore", "spawn-watchdog:\(pid)"],
+                       "The install's own restore and watchdog, and no repair")
+        XCTAssertFalse(hw.chargingInhibited)
+        // Plugged in between the bounds: the state machine holds, as it
+        // would have without the re-grant.
+        hw.connected = true
+        monitor.refresh()
+        awaitCondition { monitor.chargingPaused }
+        drainCallbacks()
+        XCTAssertEqual(hw.writes.last, "inhibit")
+        XCTAssertNil(monitor.healthWarning)
+    }
+
+    // MARK: - A prompt and sleep
+
+    /// A sleep that begins while a prompt is up has nothing to prepare
+    /// (the freeze did it) and does not wait. When the install then lands
+    /// on the way into sleep, its setup has restored, so what a sleep
+    /// needs is written again, and the health check that follows a grant
+    /// does not run: its repair would undo that pause.
+    func testAnInstallLandingOnTheWayIntoSleepLeavesTheChargePaused() {
+        let hw = Hardware()
+        hw.installRunsItsScript = true
+        let monitor = chargingMonitor(hw)
+        hw.stale = true
+        let prompt = hw.blockInstall()
+        let answered = expectation(description: "the administrator prompt was answered")
+        monitor.ensureSudoInstalled { _ in answered.fulfill() }
+        awaitEntered(prompt)
+        XCTAssertEqual(hw.writes.last, "inhibit", "Frozen for the prompt")
+        let frozen = hw.writes.count
+        monitor.prepareForSleep()
+        XCTAssertEqual(hw.writes.count, frozen, "The sleep handler returns with nothing to add")
+        prompt.release.signal()
+        wait(for: [answered], timeout: 3)
+        drainCallbacks()
+        XCTAssertEqual(Array(hw.writes.dropFirst(frozen)), ["restore", "spawn-watchdog:\(pid)", "inhibit"],
+                       "The setup restored; the pause is written again, and no repair allows charging after it")
+        XCTAssertTrue(hw.chargingInhibited)
+        monitor.resumeAfterWake()
+        awaitCondition { hw.writes.last == "allow" }
+        XCTAssertTrue(monitor.chargeToUpperBound, "Wake resumes the charge")
+    }
+
+    /// The same on firmware without CHTE: the setup's restore released the
+    /// macOS charge limit, and the target is handed back before sleep.
+    func testNativeMode_AnInstallLandingOnTheWayIntoSleepLeavesTheTargetInForce() {
+        let hw = Hardware()
+        hw.percentage = 50
+        hw.installRunsItsScript = true
+        let monitor = nativeMonitor(hw)
+        drainCallbacks()
+        XCTAssertEqual(hw.registered, [50])
+        hw.stale = true
+        let prompt = hw.blockInstall()
+        let answered = expectation(description: "the administrator prompt was answered")
+        monitor.ensureSudoInstalled { _ in answered.fulfill() }
+        awaitEntered(prompt)
+        let frozen = hw.writes.count
+        monitor.prepareForSleep()
+        XCTAssertEqual(hw.writes.count, frozen)
+        prompt.release.signal()
+        wait(for: [answered], timeout: 3)
+        drainCallbacks()
+        XCTAssertEqual(Array(hw.writes.dropFirst(frozen)), ["restore", "spawn-watchdog:\(pid)", "native-limit:50"],
+                       "The setup's restore released the limit; the hold is handed back before sleep")
+        XCTAssertEqual(hw.registered, [50])
+        monitor.resumeAfterWake()
+        drainCallbacks()
+        XCTAssertEqual(hw.writes.filter { $0 == "native-limit:50" }.count, 2,
+                       "Once at launch, once before sleep; wake finds the target current")
+        XCTAssertTrue(monitor.chargingPaused)
+        XCTAssertTrue(monitor.accountAuthorized)
+    }
+
+    // MARK: - A prompt and the license
+
+    /// A monitor in manual mode, charging, whose helper has to be replaced,
+    /// with Auto Charge just turned on: the password prompt is up, and
+    /// charge control was frozen for it. Six helper calls have been made:
+    /// the launch cleanup's three and the freeze's three.
+    private func monitorWithTheAdminPromptUp(_ hw: Hardware) -> (monitor: BatteryMonitor, prompt: Hardware.Gate,
+                                                                 answered: XCTestExpectation) {
+        hw.preferences.values["autoManageEnabled"] = false
+        hw.installRunsItsScript = true
+        let monitor = hw.monitor(startMonitoring: true, license: .free)
+        drainCallbacks()
+        XCTAssertEqual(hw.writes, ["nodischarge", "allow", "spawn-watchdog:\(pid)"])
+        hw.stale = true
+        let prompt = hw.blockInstall()
+        let answered = turnAutoChargeOn(monitor)
+        awaitEntered(prompt)
+        XCTAssertEqual(Array(hw.writes.dropFirst(3)), ["nodischarge", "spawn-watchdog:\(pid)", "inhibit"])
+        return (monitor, prompt, answered)
+    }
+
+    /// The copy can lose its license while a prompt is up. The restore the
+    /// hold calls for lands at once: the prompt is not on the SMC queue
+    /// for it to wait behind, and the main queue never waited either way.
+    /// When the install then lands, its completion must not act as if the
+    /// copy still managed charging: the health check it used to run found
+    /// Auto Charge on with charging allowed and wrote an inhibit after the
+    /// restore, and quitting restores nothing on a license hold. What the
+    /// install's setup started, the watchdog, is put back instead.
+    func testALicenseLostWhileAPromptIsUp_IsPutBackAtOnceAndTheInstallAfterIt() {
+        let hw = Hardware()
+        let (monitor, prompt, answered) = monitorWithTheAdminPromptUp(hw)
+        monitor.licenseTier = .unlicensed
+        XCTAssertEqual(monitor.chargeControlHold, .unlicensed, "The license hold replaces the prompt's")
+        awaitCondition { hw.writes.last == "restore" }
+        drainCallbacks()
+        XCTAssertEqual(hw.writes.count, 7, "The frozen state is put back with the prompt still up")
+        XCTAssertFalse(hw.chargingInhibited)
+        XCTAssertFalse(hw.watchdogRunning)
+        XCTAssertTrue(monitor.adminPromptUp)
+
+        prompt.release.signal()
+        wait(for: [answered], timeout: 3)
+        awaitCondition { hw.writes.count >= 10 }
+        drainCallbacks()
+        XCTAssertEqual(Array(hw.writes.dropFirst(7)), ["restore", "spawn-watchdog:\(pid)", "restore"],
+                       "The install's own restore and watchdog, then the restore that puts them back, and nothing after it")
+        XCTAssertFalse(hw.chargingInhibited, "No health-check repair may inhibit charging on a license hold")
+        XCTAssertFalse(hw.watchdogRunning)
+        XCTAssertFalse(monitor.adminPromptUp)
+        XCTAssertTrue(monitor.accountAuthorized, "The grant itself is a fact")
+        XCTAssertTrue(monitor.autoManageEnabled, "The intent is kept for the next license")
+        XCTAssertNil(monitor.healthWarning)
+        let settled = hw.writes.count
+        for _ in 0..<5 { monitor.refresh() }
+        drainCallbacks()
+        XCTAssertEqual(hw.writes.count, settled, "On hold, nothing more is written")
+        monitor.restoreBeforeTermination()
+        XCTAssertEqual(hw.writes.count, settled, "Nothing of ours is in force, so quitting has nothing to put back")
+    }
+
+    /// Where the account lost its sudoers line without the app having been
+    /// told, the hold's restore fails for want of access, as the freeze
+    /// did. It is not left to its two-minute retry once the grant lands:
+    /// the install is put back, and the restore with it, at once.
+    func testARestoreTheHoldCouldNotRunIsRunWhenTheGrantLands() {
+        let hw = Hardware()
+        hw.preferences.values["autoManageEnabled"] = false
+        hw.installRunsItsScript = true
+        let monitor = hw.monitor(startMonitoring: true, license: .free)
+        drainCallbacks()
+        hw.authorized = false
+        let prompt = hw.blockInstall()
+        let answered = turnAutoChargeOn(monitor)
+        awaitEntered(prompt)
+        monitor.licenseTier = .unlicensed
+        awaitCondition { hw.writes.last == "restore" }
+        drainCallbacks()
+        XCTAssertEqual(Array(hw.writes.dropFirst(3)), ["nodischarge", "inhibit", "restore"],
+                       "Refused one and all: this account cannot run the helper yet")
+        prompt.release.signal()
+        wait(for: [answered], timeout: 3)
+        awaitCondition { hw.writes.count >= 9 }
+        drainCallbacks()
+        XCTAssertEqual(Array(hw.writes.dropFirst(6)), ["restore", "spawn-watchdog:\(pid)", "restore"])
+        XCTAssertFalse(hw.watchdogRunning)
+        XCTAssertFalse(hw.chargingInhibited)
+        hw.clock = hw.clock.addingTimeInterval(130)
+        monitor.refresh()
+        drainCallbacks()
+        XCTAssertEqual(hw.writes.count, 9, "Landed: nothing left for the retry")
+    }
+
+    /// After Revoke nothing of this account's is in force (the removal
+    /// restores first) and the account can no longer run the helper, even
+    /// where another account keeps it installed. A license lost in that
+    /// state has nothing to put back: no restore is attempted, and none is
+    /// retried every two minutes for as long as the hold lasts.
+    func testLosingTheLicenseAfterRevokeAttemptsNoRestore() {
+        for revoke in [Hardware.Revoke.lastAccount, .otherAccountsRemain] {
+            let hw = Hardware()
+            let (monitor, afterRevoke) = revokedMonitor(hw, revoke)
+            monitor.licenseTier = .unlicensed
+            drainCallbacks()
+            XCTAssertEqual(monitor.chargeControlHold, .unlicensed)
+            hw.clock = hw.clock.addingTimeInterval(121)
+            monitor.refresh()
+            drainCallbacks()
+            XCTAssertEqual(hw.writes.count, afterRevoke, "Nothing to put back, and no access to do it with (\(revoke))")
+            monitor.restoreBeforeTermination()
+            XCTAssertEqual(hw.writes.count, afterRevoke, "\(revoke)")
+        }
+    }
+
+    /// Revoke, then Auto Charge turned on again, and the license lapses
+    /// with that password prompt still up. There is nothing to restore
+    /// (this account holds no access), and the install that lands on the
+    /// hold is put back the way the hold puts everything back, with no
+    /// health-check repair. Registering again takes charge control as at
+    /// launch.
+    func testALicenseLostWhileRegrantingAfterRevoke_TheInstallLandingOnTheHoldIsPutBack() {
+        for revoke in [Hardware.Revoke.lastAccount, .otherAccountsRemain] {
+            let hw = Hardware()
+            hw.installRunsItsScript = true
+            let (monitor, afterRevoke) = revokedMonitor(hw, revoke)
+            let prompt = hw.blockInstall()
+            let answered = turnAutoChargeOn(monitor)
+            awaitEntered(prompt)
+            monitor.licenseTier = .unlicensed
+            XCTAssertEqual(monitor.chargeControlHold, .unlicensed)
+            drainCallbacks()
+            XCTAssertEqual(hw.writes.count, afterRevoke, "Nothing to put back while the prompt is up (\(revoke))")
+            prompt.release.signal()
+            wait(for: [answered], timeout: 3)
+            awaitCondition { hw.writes.count >= afterRevoke + 3 }
+            drainCallbacks()
+            XCTAssertEqual(Array(hw.writes.dropFirst(afterRevoke)), ["restore", "spawn-watchdog:\(pid)", "restore"],
+                           "The install's own restore and watchdog, then the restore that puts them back (\(revoke))")
+            XCTAssertFalse(hw.watchdogRunning, "\(revoke)")
+            XCTAssertFalse(hw.chargingInhibited, "No health-check repair on a license hold (\(revoke))")
+            XCTAssertNil(monitor.healthWarning)
+            XCTAssertTrue(monitor.accountAuthorized, "The grant itself is a fact")
+            XCTAssertTrue(monitor.autoManageEnabled, "The intent is kept for the next license")
+            let settled = hw.writes.count
+            for _ in 0..<5 { monitor.refresh() }
+            drainCallbacks()
+            XCTAssertEqual(hw.writes.count, settled, "On hold, nothing more is written (\(revoke))")
+
+            monitor.licenseTier = .free
+            awaitCondition { monitor.chargingPaused }
+            drainCallbacks()
+            XCTAssertNil(monitor.chargeControlHold)
+            XCTAssertEqual(hw.installs, 1, "The helper is in place: registering asks for no password")
+            XCTAssertEqual(Array(hw.writes.suffix(3)), ["nodischarge", "inhibit", "spawn-watchdog:\(pid)"],
+                           "Registered again, the copy takes charge control as at launch, Auto Charge on (\(revoke))")
+        }
+    }
+
+    /// A license registered again while the prompt is still up. The
+    /// takeover needs the very grant that prompt is asking for, so it
+    /// waits for the answer instead of opening a second prompt behind the
+    /// first; the hold stands meanwhile and says what it is waiting for.
+    /// Answered, the takeover follows without another prompt.
+    func testRegisteringAgainWhileAPromptIsUp_TakesChargeControlOnceItIsAnswered() {
+        let hw = Hardware()
+        let (monitor, prompt, answered) = monitorWithTheAdminPromptUp(hw)
+        monitor.licenseTier = .unlicensed
+        XCTAssertFalse(monitor.chargeControlResuming)
+        awaitCondition { hw.writes.last == "restore" }
+        monitor.licenseTier = .free
+        for _ in 0..<2 { monitor.refresh() }
+        drainCallbacks()
+        XCTAssertEqual(monitor.chargeControlHold, .unlicensed, "The takeover waits for the prompt; the hold stands")
+        XCTAssertTrue(monitor.chargeControlResuming, "And the status line names the prompt, not a missing license")
+        XCTAssertEqual(hw.writes.count, 7, "Polls meanwhile neither take over nor write")
+        XCTAssertEqual(hw.installs, 1, "No second prompt behind the first")
+
+        prompt.release.signal()
+        wait(for: [answered], timeout: 3)
+        awaitCondition { monitor.chargeControlHold == nil && monitor.chargingPaused }
+        drainCallbacks()
+        XCTAssertEqual(Array(hw.writes.dropFirst(7)),
+                       ["restore", "spawn-watchdog:\(pid)", "nodischarge", "inhibit", "spawn-watchdog:\(pid)"],
+                       "The install, then the takeover's cleanup, with no restore in between: the license is back")
+        XCTAssertEqual(hw.installs, 1, "The grant the takeover needs is the one the prompt gave")
+        XCTAssertFalse(monitor.chargeControlResuming)
+        XCTAssertTrue(hw.watchdogRunning)
+        XCTAssertTrue(hw.chargingInhibited, "Auto Charge on, between the bounds")
+    }
+
+    /// The license can go again before the prompt is answered. Nothing is
+    /// taken over, and the install that lands on the hold is put back.
+    func testALicenseGoneAgainBeforeThePromptIsAnsweredTakesNothingOver() {
+        let hw = Hardware()
+        let (monitor, prompt, answered) = monitorWithTheAdminPromptUp(hw)
+        monitor.licenseTier = .unlicensed
+        monitor.licenseTier = .free
+        monitor.licenseTier = .unlicensed
+        XCTAssertFalse(monitor.chargeControlResuming)
+        awaitCondition { hw.writes.last == "restore" }
+        prompt.release.signal()
+        wait(for: [answered], timeout: 3)
+        awaitCondition { hw.writes.count >= 10 }
+        drainCallbacks()
+        XCTAssertEqual(monitor.chargeControlHold, .unlicensed)
+        XCTAssertEqual(Array(hw.writes.dropFirst(6)), ["restore", "restore", "spawn-watchdog:\(pid)", "restore"])
+        XCTAssertFalse(hw.watchdogRunning)
+        XCTAssertFalse(hw.chargingInhibited)
+        let settled = hw.writes.count
+        for _ in 0..<3 { monitor.refresh() }
+        drainCallbacks()
+        XCTAssertEqual(hw.writes.count, settled, "On hold, nothing more is written")
+    }
+
+    /// A takeover that comes due as the Mac goes to sleep waits for wake,
+    /// as it would have with the lid closed a moment earlier: its cleanup
+    /// is no pre-sleep pause, and the sleep handler has already run.
+    func testATakeoverDueAsTheMacGoesToSleepWaitsForWake() {
+        let hw = Hardware()
+        let monitor = hw.monitor(startMonitoring: true, license: .unlicensed)
+        drainCallbacks()
+        monitor.licenseTier = .free
+        monitor.prepareForSleep()
+        drainCallbacks()
+        XCTAssertEqual(hw.writes, [], "No takeover, and none of its cleanup, on the way into sleep")
+        XCTAssertEqual(monitor.chargeControlHold, .unlicensed)
+        monitor.resumeAfterWake()
+        awaitCondition { monitor.chargingPaused }
+        drainCallbacks()
+        XCTAssertNil(monitor.chargeControlHold)
+        XCTAssertEqual(hw.writes, ["nodischarge", "inhibit", "spawn-watchdog:\(pid)"])
     }
 
     /// Keep Awake is a paid feature: a session ends the moment the copy
@@ -1454,6 +2218,81 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         XCTAssertEqual(hw.writes.filter { $0 == "native-limit:50" }.count, 2, "Wake finds the target current")
         XCTAssertTrue(monitor.chargingPaused)
         XCTAssertFalse(monitor.chargeToFull)
+    }
+
+    /// The helper call in flight when sleep begins need not be a target
+    /// write. A cleanup retry holds the same in-flight token, and only its
+    /// main-queue completion gives it back, which cannot run while the
+    /// sleep handler occupies the main queue: a full charge cancelled
+    /// during the retry was left at 100% through sleep, the settling poll
+    /// refusing to write. Once the helper has returned, the target is
+    /// settled whatever completion is still queued.
+    func testNativeMode_FullChargeCancelledDuringACleanupRetryIsSettledBeforeSleep() {
+        let hw = Hardware()
+        hw.percentage = 50
+        hw.fail("nodischarge")
+        let monitor = nativeMonitor(hw)
+        drainCallbacks()
+        XCTAssertEqual(monitor.recoveryWarning, BatteryMonitor.cleanupWarning)
+        monitor.setChargeToFull(true)
+        awaitCondition { hw.writes.last == "native-limit:100" }
+        drainCallbacks()
+        // The retry comes due and is still in the helper when the full
+        // charge is cancelled and the lid closes.
+        hw.stopFailing("nodischarge")
+        let gate = hw.blockNext("nodischarge")
+        hw.clock = hw.clock.addingTimeInterval(130)
+        monitor.refresh()
+        XCTAssertEqual(gate.entered.wait(timeout: .now() + 3), .success)
+        monitor.setChargeToFull(false)
+        XCTAssertFalse(monitor.chargeToFull)
+        XCTAssertEqual(hw.registered, [100], "The retry is in flight: the cancel has written nothing yet")
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.03) { gate.release.signal() }
+        monitor.prepareForSleep()
+        XCTAssertEqual(Array(hw.writes.suffix(3)), ["nodischarge", "spawn-watchdog:\(pid)", "native-limit:50"],
+                       "The hold lands before sleep, behind the retry it waited for")
+        XCTAssertEqual(hw.registered, [50], "A cancelled full charge does not ride through sleep at 100%")
+        drainCallbacks() // the retry's queued completion runs and changes nothing
+        XCTAssertEqual(hw.registered, [50])
+        monitor.resumeAfterWake()
+        drainCallbacks()
+        XCTAssertEqual(hw.writes.filter { $0 == "native-limit:50" }.count, 2, "Wake finds the target current")
+        XCTAssertTrue(monitor.chargingPaused)
+        XCTAssertFalse(monitor.chargeToFull)
+        XCTAssertNil(monitor.recoveryWarning, "The retry itself landed")
+    }
+
+    /// The same sleep with the retry failing again, and with wake arriving
+    /// before the retry's completion has run: the target is settled before
+    /// sleep either way, the completion that runs after wake neither
+    /// writes it a second time nor disturbs the poll, and the cleanup stays
+    /// pending for its next interval.
+    func testNativeMode_ACleanupRetryThatFailsAgainStillLetsSleepSettleTheTarget() {
+        let hw = Hardware()
+        hw.percentage = 50
+        hw.fail("nodischarge")
+        let monitor = nativeMonitor(hw)
+        drainCallbacks()
+        monitor.setChargeToFull(true)
+        awaitCondition { hw.writes.last == "native-limit:100" }
+        drainCallbacks()
+        let gate = hw.blockNext("nodischarge")
+        hw.clock = hw.clock.addingTimeInterval(130)
+        monitor.refresh()
+        XCTAssertEqual(gate.entered.wait(timeout: .now() + 3), .success)
+        monitor.setChargeToFull(false)
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.03) { gate.release.signal() }
+        monitor.prepareForSleep()
+        XCTAssertEqual(Array(hw.writes.suffix(2)), ["nodischarge", "native-limit:50"])
+        XCTAssertEqual(hw.registered, [50])
+        monitor.resumeAfterWake() // before the retry's completion has run
+        drainCallbacks()
+        for _ in 0..<2 { monitor.refresh() }
+        drainCallbacks()
+        XCTAssertEqual(hw.writes.filter { $0 == "native-limit:50" }.count, 2, "Written once at launch and once before sleep")
+        XCTAssertEqual(hw.registered, [50])
+        XCTAssertTrue(monitor.chargingPaused)
+        XCTAssertEqual(monitor.recoveryWarning, BatteryMonitor.cleanupWarning, "Still pending: the retry failed")
     }
 
     func testNativeMode_SleepHooksWriteNothingAndQuitRestores() {

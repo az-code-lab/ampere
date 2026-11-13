@@ -4,8 +4,8 @@
 #
 # Usage: ./release.sh <version> [--force]
 #   e.g. ./release.sh 1.0.0
-#   --force allows re-releasing a version whose tag already exists
-#   (replaces the tag, the GitHub release, and the cask entry)
+#   --force allows re-releasing a version whose tag already exists, here
+#   or on origin (replaces the tag, the GitHub release, and the cask entry)
 #
 # Prerequisites:
 #   - Xcode and the pinned Developer ID Application certificate with its
@@ -37,13 +37,33 @@ if ! [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
     exit 1
 fi
 
-# Reusing a version number silently replaces the old tag, GitHub release,
-# and cask entry (tag -f / push -f / gh release delete below). Make that
-# an explicit choice rather than a typo's outcome.
-if git rev-parse -q --verify "refs/tags/v$VERSION" > /dev/null && [ "$FORCE" != "--force" ]; then
-    echo "ERROR: tag v$VERSION already exists — releasing would replace it"
-    echo "       To re-release deliberately: ./release.sh $VERSION --force"
-    exit 1
+# Reusing a version number replaces the old tag, GitHub release, and cask
+# entry. Make that an explicit choice rather than a typo's outcome: only
+# --force may replace anything, here and in the tag, push, and release steps
+# below. This is the early refusal, ahead of the build and the notarization
+# rounds. The local tag is only this Mac's memory of a release: a clone that
+# never fetched it (git clone --no-tags, another release Mac, a tag deleted
+# here) has none, so origin is asked as well. git ls-remote --exit-code
+# answers 0 when origin holds the tag and 2 when it does not; anything else
+# means origin could not be asked, which decides nothing, so that is refused
+# too rather than taken for "not published".
+if [ "$FORCE" != "--force" ]; then
+    if git rev-parse -q --verify "refs/tags/v$VERSION" > /dev/null; then
+        echo "ERROR: tag v$VERSION already exists — releasing would replace it"
+        echo "       To re-release deliberately: ./release.sh $VERSION --force"
+        exit 1
+    fi
+    PUBLISHED=0
+    git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" > /dev/null || PUBLISHED=$?
+    if [ "$PUBLISHED" -eq 0 ]; then
+        echo "ERROR: tag v$VERSION is already published on origin; releasing would replace it"
+        echo "       To re-release deliberately: ./release.sh $VERSION --force"
+        exit 1
+    elif [ "$PUBLISHED" -ne 2 ]; then
+        echo "ERROR: could not ask origin whether v$VERSION is already published (git ls-remote exited $PUBLISHED)"
+        echo "       Check the connection to origin and retry."
+        exit 1
+    fi
 fi
 
 # Select the G2 release certificate by fingerprint: older certificates can
@@ -78,7 +98,14 @@ echo "==> Running tests..."
 swift test
 
 echo "==> Tagging v$VERSION..."
-git tag -f "v$VERSION"
+# Only --force moves a tag that exists. The preflight found none, so a plain
+# tag fails only if one arrived since (a fetch while the tests ran), and then
+# before the build rather than at the push.
+if [ "$FORCE" = "--force" ]; then
+    git tag -f "v$VERSION"
+else
+    git tag "v$VERSION"
+fi
 
 echo "==> Building Release..."
 cd "$REPO_DIR"
@@ -214,10 +241,22 @@ echo "==> DMG SHA256: $SHA256"
 
 echo "==> Pushing tag..."
 cd "$REPO_DIR"
-git push origin "v$VERSION" -f
+# The preflight asked origin before the build; the answer can be stale by
+# now (another Mac published this version meanwhile). So without --force the
+# push is a plain one, which origin rejects for a tag it holds for another
+# commit, and nothing is deleted: the script stops here, or at the create
+# below, which GitHub refuses for a release that exists, with the published
+# version untouched.
+if [ "$FORCE" = "--force" ]; then
+    git push origin "v$VERSION" -f
+else
+    git push origin "v$VERSION"
+fi
 
-echo "==> Updating GitHub release v$VERSION..."
-gh release delete "v$VERSION" --repo "$GITHUB_REPO" --yes 2>/dev/null || true
+echo "==> Publishing GitHub release v$VERSION..."
+if [ "$FORCE" = "--force" ]; then
+    gh release delete "v$VERSION" --repo "$GITHUB_REPO" --yes 2>/dev/null || true
+fi
 gh release create "v$VERSION" "$DMG_PATH" \
     --repo "$GITHUB_REPO" \
     --title "v$VERSION" \

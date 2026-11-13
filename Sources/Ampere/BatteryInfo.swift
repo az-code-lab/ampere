@@ -110,6 +110,10 @@ final class BatteryMonitor: ObservableObject {
             FileManager.default.fileExists(atPath: AppConstants.sudoersPath)
                 && HelperSecurity.isProtected(path: AppConstants.helperPath)
         }
+        /// Whether the installed helper, and every directory leading to it,
+        /// is safe to run as root. Revoke asks before its administrator
+        /// prompt runs the helper (removeSudoRule).
+        var helperProtected: () -> Bool = { HelperSecurity.isProtected(path: AppConstants.helperPath) }
         var helperAuthorized: () -> Bool = BatteryMonitor.checkHelperAuthorization
         var helperStale: () -> Bool = BatteryMonitor.helperNeedsUpdate
         var installHelper: () -> Bool = BatteryMonitor.installSudo
@@ -117,7 +121,7 @@ final class BatteryMonitor: ObservableObject {
         /// Nil when this process should manage charge control; otherwise
         /// how to name the earlier instance that holds it (InstanceGuard).
         var competingInstance: () -> String? = { InstanceGuard.competingInstance()?.owner }
-        var runAsAdmin: (String) -> Bool = BatteryMonitor.runAsAdmin
+        var runAsAdmin: (String) -> AdminPromptOutcome = BatteryMonitor.runAsAdmin
         /// Where this copy of the app is installed, or nil when the cleanup
         /// job must not watch it (see CleanupDaemon.eligibleBundlePath).
         var cleanupDaemonBundlePath: () -> String? = {
@@ -296,6 +300,24 @@ final class BatteryMonitor: ObservableObject {
         /// exactly where it was, the way a takeover from another instance
         /// does (refresh).
         case unlicensed
+        /// One of this instance's own administrator prompts is up: Revoke,
+        /// or a helper re-grant from the panel (enterAdminPromptHold). A
+        /// prompt takes as long as the person takes, and once it is
+        /// answered its script restores, replaces, or removes the helper
+        /// on that schedule, not on the SMC queue's. A write of ours that
+        /// landed around the script could outlive the access needed to
+        /// undo it, and anything that needs watching (a discharge, a
+        /// charge short of its bound) would go unwatched for as long as
+        /// the prompt stays open. So charge control is frozen first, and
+        /// nothing is written until the prompt is answered: an active
+        /// discharge is stopped, a sleep hold released, and charging left
+        /// the way a sleep would leave it (the pre-sleep pause; on
+        /// firmware without CHTE the target as it stands). Once the prompt
+        /// is answered, charge control goes on from there as it does from
+        /// a sleep, unless the answer was a Revoke that went through.
+        /// Unlike the other holds this one has things in force: quitting
+        /// restores them, and a license lost meanwhile puts them back.
+        case adminPrompt
     }
     @Published private(set) var chargeControlHold: ChargeControlHold?
     /// True while another process holds charge control; the panel hides
@@ -312,6 +334,25 @@ final class BatteryMonitor: ObservableObject {
         standingBy || chargeControlHold == .noMechanism || chargeControlHold == .mechanismUnknown
             || chargeControlHold == .unlicensed
     }
+    /// True while a license is registered again and charge control has not
+    /// been taken back yet. The takeover follows the SMC queue
+    /// (resumeOnceSMCQueueDrains), which is over before the panel can draw
+    /// it, and waits for one of this instance's own administrator prompts
+    /// that is still up (adminPromptUp), which can last: the status line
+    /// then names the prompt instead of asking for a license the copy
+    /// already has.
+    var chargeControlResuming: Bool { chargeControlHold == .unlicensed && chargeControlLicensed }
+    /// True from the moment one of this instance's own administrator
+    /// prompts is asked for (Revoke, or a helper re-grant from the panel)
+    /// until it has been answered and acted on. While it is set the panel's
+    /// charge controls stay where they are but take no input: nothing they
+    /// asked for could be written before the prompt is answered, and an
+    /// intent changed meanwhile would leave the frozen state behind it. No
+    /// second prompt opens behind the first, and no takeover starts. It
+    /// outlasts the hold (ChargeControlHold.adminPrompt) when a license
+    /// lapse replaces that, and stands without it when the prompt was
+    /// asked for on another hold. Main queue only.
+    @Published private(set) var adminPromptUp = false
 
     /// Which mechanism can hold the charge on this Mac. Decided from what
     /// is present, never from the macOS version: the SMC's CHTE key first,
@@ -698,10 +739,18 @@ final class BatteryMonitor: ObservableObject {
     }
     private var cleanupRetryAt = Date.distantPast
     /// True while the restore a license hold called for has not succeeded
-    /// (releaseChargeControl): retried from refresh while the hold lasts,
-    /// at cleanupRetrySeconds, and once more at quit.
+    /// (releaseChargeControl), from the moment it is queued: retried from
+    /// refresh while the hold lasts, at cleanupRetrySeconds, and once more
+    /// at quit.
     private var chargeControlReleasePending = false
     private var chargeControlReleaseRetryAt = Date.distantPast
+    /// True while that restore is on the SMC queue, from dispatch to its
+    /// completion: nothing queues a second one behind it, and a takeover
+    /// waits for it (refresh). Main queue only.
+    private var chargeControlReleaseInFlight = false
+    /// True while a marker for the takeover a registration brings is on
+    /// the SMC queue (resumeOnceSMCQueueDrains). Main queue only.
+    private var resumeQueued = false
     /// Long enough for whatever refused pmset or the SMC at login to have
     /// recovered; the state machine runs on every poll in between.
     private static let cleanupRetrySeconds: TimeInterval = 120
@@ -758,6 +807,15 @@ final class BatteryMonitor: ObservableObject {
         }
     }
     private let smcQueue = DispatchQueue(label: "com.ampere.smc", qos: .utility)
+    /// Administrator prompts run here, never on the SMC queue. A prompt
+    /// takes as long as the person takes, and everything that has to land
+    /// in order behind the helper's writes (the pre-sleep pause, the
+    /// restore at quit, a license hold's restore, the stop of a discharge)
+    /// would wait there for it. The SMC queue carries helper calls only,
+    /// and charge control is frozen for as long as a prompt is up
+    /// (ChargeControlHold.adminPrompt), which is what makes it safe for
+    /// the prompt's script to run unordered with that queue.
+    private let adminQueue = DispatchQueue(label: "com.ampere.admin", qos: .userInitiated)
 
     /// Single source of truth for the "no adapter" error string — it's
     /// both set (in toggleCharging) and compared (in refresh) to clear on
@@ -776,7 +834,6 @@ final class BatteryMonitor: ObservableObject {
     /// writes have a chance to settle before we assert on their results.
     private static let healthCheckSettleRefreshes = 3
 
-    private static let sudoersPath = AppConstants.sudoersPath
     private static let helperPath = AppConstants.helperPath
 
     /// `license`: what the copy's registration allows at launch (see
@@ -1181,10 +1238,14 @@ final class BatteryMonitor: ObservableObject {
     func restoreBeforeTermination() {
         terminating = true
         // On hold: nothing of ours is in force, and the restore belongs to
-        // the instance that holds control. The one exception is a license
-        // hold whose own restore kept failing: it is tried once more here.
+        // the instance that holds control. Two exceptions: a license hold
+        // whose own restore has not landed (still queued, or failing) is
+        // tried once more here, and the hold for an administrator prompt
+        // only froze what the session had in force. That prompt is not on
+        // the SMC queue, so the restore does not wait for it.
         guard isSudoRuleInstalled,
-              chargeControlHold == nil || (chargeControlHold == .unlicensed && chargeControlReleasePending)
+              chargeControlHold == nil || chargeControlHold == .adminPrompt
+                || (chargeControlHold == .unlicensed && chargeControlReleasePending)
         else { return }
         let done = DispatchSemaphore(value: 0)
         smcQueue.async {
@@ -1210,7 +1271,9 @@ final class BatteryMonitor: ObservableObject {
     /// completions from applying them, and the hardware facts those
     /// completions report are corrected once the restore has run.
     private func suspendChargeControl() {
-        let wasManaging = chargeControlHold == nil
+        // Frozen for an administrator prompt counts: that hold has things
+        // in force (ChargeControlHold.adminPrompt).
+        let wasManaging = chargeControlHold == nil || chargeControlHold == .adminPrompt
         chargeControlHold = .unlicensed
         controlRevision &+= 1
         requestedChargingPaused = nil
@@ -1224,30 +1287,53 @@ final class BatteryMonitor: ObservableObject {
     /// hold for want of a license: one helper transaction restores CHTE,
     /// CHIE, the sleep settings and the macOS charge limit from their
     /// markers and retires the watchdog, the transaction quitting runs.
-    /// Synchronous on the SMC queue, so it lands behind any write already
-    /// queued; what this instance believes is written follows on the main
-    /// queue, behind that write's own completion, and only while the hold
-    /// still stands (a registration meanwhile resets it itself). A restore
-    /// that fails is retried from refresh every cleanupRetrySeconds
-    /// while the hold lasts, and once more at quit; the watchdog, which a
-    /// failed restore leaves running, covers a crash meanwhile.
+    /// Queued on the SMC queue, so it lands behind any write already
+    /// there, and not waited for: the main queue waits on helper processes
+    /// only where it must be done before it returns (sleep, quit), and a
+    /// license that changed is not one of them. What this instance
+    /// believes is written follows from the
+    /// restore's completion, behind that of any earlier write, and only
+    /// while the hold still stands (a registration meanwhile resets it
+    /// itself). The release counts as pending from the moment it is
+    /// queued, so quitting before it lands queues a restore of its own. A
+    /// restore that fails is retried from refresh every
+    /// cleanupRetrySeconds while the hold lasts, and once more at quit;
+    /// the watchdog, which a failed restore leaves running, covers a crash
+    /// meanwhile. One restore at a time: a retry that comes due, or an
+    /// install that lands on the hold, while one is still queued finds it
+    /// on its way. Without the helper, or without this account's access to
+    /// it, there is nothing to put back and nothing to do it with: Revoke
+    /// restores before it takes the access away, and no write can land for
+    /// this account until it is granted again (finishHelperInstall covers
+    /// a grant that lands on the hold). A restore attempted then would
+    /// only fail, at this interval, for as long as the hold lasted.
     private func releaseChargeControl() {
+        guard !chargeControlReleaseInFlight else { return }
         chargeControlReleaseRetryAt = io.now().addingTimeInterval(Self.cleanupRetrySeconds)
-        guard isSudoRuleInstalled else {
+        guard isSudoRuleInstalled, accountAuthorized else {
             chargeControlReleasePending = false
             return
         }
-        let ok = smcQueue.sync { runSMCWriteViaSudo("restore") }
-        chargeControlReleasePending = !ok
-        if ok {
-            AmpereLog.app("Ampere: System defaults restored; charge control stays on hold until a license is registered")
-            DispatchQueue.main.async { [weak self] in
-                guard let self, self.chargeControlHold == .unlicensed else { return }
-                self.forgetWrittenState()
+        chargeControlReleaseInFlight = true
+        chargeControlReleasePending = true
+        smcQueue.async { [weak self] in
+            guard let self else { return }
+            let ok = self.runSMCWriteViaSudo("restore")
+            DispatchQueue.main.async {
+                self.chargeControlReleaseInFlight = false
+                guard self.chargeControlHold == .unlicensed else { return }
+                self.chargeControlReleasePending = !ok
+                if ok {
+                    AmpereLog.app("Ampere: System defaults restored; charge control stays on hold until a license is registered")
+                    self.forgetWrittenState()
+                } else {
+                    // The interval runs from the failure: the restore may
+                    // have sat behind a prompt for longer than that.
+                    self.chargeControlReleaseRetryAt = self.io.now().addingTimeInterval(Self.cleanupRetrySeconds)
+                    AmpereLog.app("Ampere: Restore failed with charge control on hold; retrying in %d s",
+                                  Int(Self.cleanupRetrySeconds))
+                }
             }
-        } else {
-            AmpereLog.app("Ampere: Restore failed with charge control on hold; retrying in %d s",
-                          Int(Self.cleanupRetrySeconds))
         }
     }
 
@@ -1270,15 +1356,36 @@ final class BatteryMonitor: ObservableObject {
     }
 
     /// A license was registered while charge control was on hold for want
-    /// of one: the instance takes charge control the way it does after
-    /// another instance quits, from a clean picture. A restore still on the
-    /// SMC queue lands first (the queue is drained), and one that kept
-    /// failing is left to the takeover's cleanup, which puts back what a
-    /// crashed session left the same way.
+    /// of one, and the SMC queue has drained (resumeOnceSMCQueueDrains):
+    /// the instance takes charge control the way it does after another
+    /// instance quits, from a clean picture. A restore that kept failing
+    /// is left to the takeover's cleanup, which puts back what a crashed
+    /// session left the same way.
     private func resumeAfterHold() {
-        smcQueue.sync {}
         forgetWrittenState()
         chargeControlReleasePending = false
+    }
+
+    /// The takeover a registration brings writes its cleanup from the main
+    /// queue (activateChargeControl), so whatever is still on the SMC
+    /// queue has to land first: the restore the hold called for, and any
+    /// write dispatched before the hold began. The main queue does not
+    /// wait for that; the wait is handed to the SMC queue itself: a marker
+    /// queued behind everything there comes back on the main queue and
+    /// polls again, with the hold standing meanwhile. With the queue idle
+    /// that is the next turn of the main queue. The poll decides afresh:
+    /// the license may have gone again, another instance may have
+    /// started, or the Mac may be going to sleep.
+    private func resumeOnceSMCQueueDrains() {
+        guard !resumeQueued else { return }
+        resumeQueued = true
+        smcQueue.async { [weak self] in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.resumeQueued = false
+                self.refresh(smcQueueDrained: true)
+            }
+        }
     }
 
     /// Block new poll-driven writes before draining those already queued.
@@ -1287,14 +1394,44 @@ final class BatteryMonitor: ObservableObject {
     /// full-charge or manual-resume request whose callback is still pending.
     func prepareForSleep() {
         preparingForSleep = true
+        // Frozen for an administrator prompt: what a sleep needs written is
+        // written already, or on its way down the SMC queue, which carries
+        // helper calls only and never a prompt. Wait those out; there is
+        // nothing to add.
+        if chargeControlHold == .adminPrompt {
+            smcQueue.sync {}
+            return
+        }
         guard chargeControlHold == nil else { return }
+        writePreSleepState()
+    }
+
+    /// What a sleep that begins now has to find written, with the helper
+    /// calls already queued landed first. Also what an install re-granted
+    /// from the panel is followed by when it lands on the way into sleep
+    /// (ensureSudoInstalled).
+    private func writePreSleepState() {
         if nativeLimitMode {
             settleNativeLimitBeforeSleep()
             return
         }
         smcQueue.sync {}
-        guard isSudoRuleInstalled, let battery = io.battery(), battery.adapterConnected else { return }
-        let pause: Bool
+        guard let battery = io.battery(), let op = preSleepWrite(for: battery) else { return }
+        let ok = smcQueue.sync { runSMCWrite(op) }
+        AmpereLog.app("Ampere: Pre-sleep %@ at %d%% %@", op == .inhibit ? "pause" : "resume",
+              battery.percentage, ok ? "applied" : "failed")
+    }
+
+    /// The CHTE write that leaves charging the way a sleep must find it,
+    /// or nil when there is none to make (no helper, no reading, no
+    /// adapter, or manual mode with no request pending). Decided from the
+    /// intent, never from chargingPaused, which may trail a write still in
+    /// flight. The sleep handler writes it, and so does the freeze ahead of
+    /// an administrator prompt (enterAdminPromptHold), which has the same
+    /// thing to guarantee: nobody is awake, or allowed, to stop a charge
+    /// at its bound.
+    private func preSleepWrite(for battery: BatteryState?) -> SMCWriteOp? {
+        guard isSudoRuleInstalled, let battery, battery.adapterConnected else { return nil }
         if autoManageEnabled {
             // Pause until wake, at the upper bound and anywhere below it.
             // Between the bounds that is the documented pre-sleep pause.
@@ -1306,16 +1443,88 @@ final class BatteryMonitor: ObservableObject {
             // resumes; charging on would run past the upper bound with
             // nobody awake to stop it. Only a full charge runs through
             // sleep, as documented: its ceiling is 100%.
-            pause = !chargeToFull
+            let pause = !chargeToFull
                 || Self.reachedBound(100, percentage: battery.percentage, fullyCharged: battery.fullyCharged)
-        } else if let requested = requestedChargingPaused {
-            pause = requested
-        } else {
+            return pause ? .inhibit : .allow
+        }
+        if let requested = requestedChargingPaused { return requested ? .inhibit : .allow }
+        return nil
+    }
+
+    /// Freeze charge control for one of this instance's own administrator
+    /// prompts, then call `openPrompt` on the main queue
+    /// (ChargeControlHold.adminPrompt says why). An instance already on a
+    /// hold has nothing in force and polls nothing: only the flag is set.
+    /// A managing one goes on the prompt hold at once, so no poll writes
+    /// from here on; if its account can run the helper, what needs
+    /// watching is then stopped through the SMC queue, behind any write
+    /// still in flight: `nodischarge` ends a discharge and releases a
+    /// sleep hold (and retires the watchdog, so a fresh one follows), and
+    /// the pre-sleep write pauses a charge that a sleep would pause. On
+    /// firmware without CHTE there is nothing to stop, the firmware holds
+    /// the target on its own; the target is settled as before a sleep. The
+    /// prompt opens from that work's completion, behind the completions of
+    /// the writes it followed, so the picture it clears is the final one.
+    private func enterAdminPromptHold(then openPrompt: @escaping (_ frozen: Bool) -> Void) {
+        adminPromptUp = true
+        guard chargeControlHold == nil else {
+            openPrompt(false)
             return
         }
-        let ok = smcQueue.sync { runSMCWrite(pause ? .inhibit : .allow) }
-        AmpereLog.app("Ampere: Pre-sleep %@ at %d%% %@", pause ? "pause" : "resume",
-              battery.percentage, ok ? "applied" : "failed")
+        chargeControlHold = .adminPrompt
+        guard accountAuthorized, isSudoRuleInstalled else {
+            openPrompt(false)
+            return
+        }
+        let native = nativeLimitMode
+        let battery = io.battery()
+        let pause = native ? nil : preSleepWrite(for: battery)
+        let selfPID = ProcessInfo.processInfo.processIdentifier
+        smcQueue.async { [weak self] in
+            guard let self else { return }
+            var stopped = false
+            if !native {
+                stopped = self.runSMCWriteViaSudo("nodischarge")
+                if stopped, !self.runSMCWriteViaSudo("spawn-watchdog:\(selfPID)") {
+                    AmpereLog.app("Ampere: Watchdog respawn ahead of an administrator prompt failed")
+                }
+                let paused = pause.map { self.runSMCWrite($0) }
+                AmpereLog.app("Ampere: Charge control frozen for an administrator prompt at %d%% (overrides %@, charging %@)",
+                              battery?.percentage ?? 0, stopped ? "cleared" : "not cleared",
+                              paused.map { $0 ? (pause == .inhibit ? "paused" : "allowed") : "write failed" } ?? "left as it is")
+            }
+            DispatchQueue.main.async {
+                // A license lost since replaced the hold and queued its
+                // restore behind the freeze: that hold's picture stands.
+                if self.chargeControlHold == .adminPrompt {
+                    if stopped {
+                        self.activeDischarging = false
+                        self.sleepHoldActive = false
+                    }
+                    if native { self.settleNativeLimitBeforeSleep() }
+                }
+                openPrompt(true)
+            }
+        }
+    }
+
+    /// The administrator prompt has been answered. The prompt hold ends
+    /// with it, unless a license lapse replaced that hold meanwhile.
+    private func leaveAdminPromptHold() {
+        adminPromptUp = false
+        if chargeControlHold == .adminPrompt { chargeControlHold = nil }
+    }
+
+    /// Charge control goes on from a frozen state as it does from a
+    /// sleep: what the freeze cleared or paused is not in the picture, so
+    /// the next poll re-asserts the state it believes in, restarts a
+    /// discharge and arms a sleep hold again where they are still wanted.
+    /// That holds whatever the prompt's answer left behind, a grant whose
+    /// setup restored included; only a Revoke that went through has
+    /// nothing to go on with. Native mode has nothing to re-assert: the
+    /// target stood, or the grant marked it unconfirmed.
+    private func reassertAfterAdminPrompt(frozen: Bool) {
+        if frozen, chargeControlHold == nil, !nativeLimitMode { wakeReassertPending = true }
     }
 
     func resumeAfterWake() {
@@ -1525,29 +1734,54 @@ final class BatteryMonitor: ObservableObject {
     }
 
     /// Restore charging and sleep before removing the privileged files.
+    /// The prompt runs off the SMC queue with charge control frozen for as
+    /// long as it is up (enterAdminPromptHold): answered, the removal
+    /// script restores and this account's access goes; cancelled, charge
+    /// control goes on as after a sleep.
     func removeSudoRule() {
         if case .otherInstance(let other) = chargeControlHold {
             lastError = "Charge control is in use by \(other); revoke from that account"
             return
         }
-        guard !autoManageInFlight else {
+        guard !autoManageInFlight, !adminPromptUp else {
             lastError = "Charge control is busy — try revoking access again in a moment"
             return
         }
-        autoManageInFlight = true
-        smcQueue.async { [weak self] in
-            guard let self else { return }
-            // Restoration and removal share the one existing admin prompt.
-            // This also works when the sudoers rule belongs to another user.
-            // Only this account's rule goes; the helper itself is deleted
-            // once no account remains. Success means this account can no
-            // longer run the helper, whether or not the files still exist.
-            let ok = HelperSecurity.isProtected(path: Self.helperPath)
-                && self.io.runAsAdmin(HelperSetup.removalScript(username: NSUserName()))
-                && !self.io.helperAuthorized()
-            DispatchQueue.main.async {
-                self.autoManageInFlight = false
-                if ok {
+        enterAdminPromptHold { [weak self] frozen in
+            self?.adminQueue.async {
+                guard let self else { return }
+                // Restoration and removal share the one existing admin prompt.
+                // This also works when the sudoers rule belongs to another user.
+                // Only this account's rule goes; the helper itself is deleted
+                // once no account remains. Success means this account can no
+                // longer run the helper, whether or not the files still exist.
+                let outcome: AdminPromptOutcome = self.io.helperProtected()
+                    ? self.io.runAsAdmin(HelperSetup.removalScript(username: NSUserName())) : .failed
+                let ok = outcome == .done && !self.io.helperAuthorized()
+                DispatchQueue.main.async {
+                    self.leaveAdminPromptHold()
+                    guard ok else {
+                        // A cancelled prompt changed nothing and has
+                        // nothing to report. A removal that ran and failed
+                        // stopped at its restore, which may have got
+                        // part-way: it joins the cleanup retry, which
+                        // finishes it at the usual interval and replaces
+                        // the watchdog, with its warning in the status
+                        // line meanwhile (the error below is cleared by
+                        // the next poll in auto mode).
+                        if outcome != .cancelled, self.accountAuthorized, self.isSudoRuleInstalled {
+                            self.cleanupPending = true
+                            self.cleanupRetryAt = self.io.now().addingTimeInterval(Self.cleanupRetrySeconds)
+                        }
+                        self.reassertAfterAdminPrompt(frozen: frozen)
+                        // The poll also lets a takeover that waited for
+                        // this prompt go ahead.
+                        self.refresh()
+                        if outcome != .cancelled {
+                            self.lastError = "Admin access was not revoked. Cleanup must succeed before the helper can be removed."
+                        }
+                        return
+                    }
                     self.accountAuthorized = false
                     self.autoManageEnabled = false
                     self.autoDischargeEnabled = false
@@ -1562,22 +1796,46 @@ final class BatteryMonitor: ObservableObject {
                     self.nativeLimitWritten = nil
                     self.nativeLimitIntent = nil
                     self.nativeLimitUnconfirmed = false
+                    self.wakeReassertPending = false
                     self.watchdogSpawned = false
                     self.watchdogSpawnFailed = false
                     self.cleanupPending = false
+                    // Nothing is left for a license hold to put back.
+                    self.chargeControlReleasePending = false
                     self.recoveryWarning = nil
                     self.lastError = nil
                     self.healthWarning = nil
-                } else {
-                    self.lastError = "Admin access was not revoked. Cleanup must succeed before the helper can be removed."
+                    // A takeover that waited for this prompt goes ahead.
+                    if self.chargeControlResuming { self.refresh() }
                 }
             }
         }
     }
 
+    /// How an administrator prompt ended. Revoke tells the two failures
+    /// apart: a prompt that was cancelled changed nothing, while a script
+    /// that ran and failed may have restored part-way (removeSudoRule).
+    enum AdminPromptOutcome: Equatable {
+        case done
+        case cancelled
+        case failed
+    }
+
+    /// osascript's verdict on a `do shell script ... with administrator
+    /// privileges`. It exits 1 for a cancelled dialog and for a failed
+    /// script alike, and says which on stderr: `execution error: <message>
+    /// (<number>)`, the number being AppleScript's own -128 (user canceled)
+    /// or the script's exit status. The number is read, not the message,
+    /// which follows the system language. Internal so tests can pin it.
+    static func adminPromptOutcome(status: Int32, errorOutput: String) -> AdminPromptOutcome {
+        if status == 0 { return .done }
+        let report = errorOutput.trimmingCharacters(in: .whitespacesAndNewlines)
+        return report.hasSuffix("(-128)") ? .cancelled : .failed
+    }
+
     /// Run shell commands as root via osascript "with administrator privileges".
     /// Shows the native macOS password dialog (one-time setup only).
-    private static func runAsAdmin(_ commands: String) -> Bool {
+    private static func runAsAdmin(_ commands: String) -> AdminPromptOutcome {
         let escaped = commands.replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
             .replacingOccurrences(of: "\n", with: "\\n")
@@ -1585,20 +1843,33 @@ final class BatteryMonitor: ObservableObject {
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
         task.arguments = ["-e", script]
-        // Discard child stdout/stderr — we don't read them, and unread
-        // Pipes can block the child if its output ever fills the buffer.
-        // Also pin stdin to /dev/null so osascript (which doesn't read it
-        // for our -e usage) can't accidentally block waiting on inherited
-        // input from a TTY.
+        // Discard child stdout — we don't read it, and an unread Pipe can
+        // block the child if its output ever fills the buffer. Also pin
+        // stdin to /dev/null so osascript (which doesn't read it for our
+        // -e usage) can't accidentally block waiting on inherited input
+        // from a TTY. stderr is read, on another thread and to its end,
+        // so it cannot fill either: it is where osascript says whether
+        // the dialog was cancelled or the script failed.
+        let errors = Pipe()
         task.standardInput = FileHandle.nullDevice
         task.standardOutput = FileHandle.nullDevice
-        task.standardError = FileHandle.nullDevice
+        task.standardError = errors
         do {
             try task.run()
+            var errorData = Data()
+            let read = DispatchSemaphore(value: 0)
+            DispatchQueue.global(qos: .utility).async {
+                errorData = errors.fileHandleForReading.readDataToEndOfFile()
+                read.signal()
+            }
+            // On the main queue (launch, takeover) this keeps the run loop
+            // turning while the dialog is up.
             task.waitUntilExit()
-            return task.terminationStatus == 0
+            read.wait()
+            return adminPromptOutcome(status: task.terminationStatus,
+                                      errorOutput: String(decoding: errorData, as: UTF8.self))
         } catch {
-            return false
+            return .failed
         }
     }
 
@@ -1640,7 +1911,7 @@ final class BatteryMonitor: ObservableObject {
         let digest = SHA256.hash(data: helperData).map { String(format: "%02x", $0) }.joined()
         let script = HelperSetup.installScript(writer: smcWriterPath, digest: digest,
             username: NSUserName(), appPID: ProcessInfo.processInfo.processIdentifier)
-        return runAsAdmin(script) && checkHelperAuthorization()
+        return runAsAdmin(script) == .done && checkHelperAuthorization()
     }
 
     /// This account can run the helper: lift a declined-takeover hold and
@@ -1650,15 +1921,49 @@ final class BatteryMonitor: ObservableObject {
         if chargeControlHold == .accessDeclined { chargeControlHold = nil }
     }
 
-    /// Ensure sudo helper is installed (prompts for password on background queue).
-    /// Calls completion on the main queue with success/failure.
+    /// A helper install started from the panel has landed
+    /// (ensureSudoInstalled), and the prompt hold has ended with it. The
+    /// administrator prompt takes as long as the person takes, so this acts
+    /// on the state of now, not of the click. The grant is a fact either
+    /// way. What the session makes of it is not: the copy may have lost its
+    /// license while the prompt was up, and on that hold nothing of the
+    /// install's is applied. What its setup started is put back instead,
+    /// the way the hold puts everything back: the watchdog, and with it a
+    /// restore the hold tried before the grant existed and could not run
+    /// (releaseChargeControl queues one at a time, so a restore already on
+    /// its way is not doubled). Not once a license is registered again:
+    /// the takeover that waited for the prompt retires that watchdog with
+    /// its own cleanup.
+    private func finishHelperInstall() {
+        grantAccess()
+        if chargeControlHold == .unlicensed {
+            if !chargeControlLicensed, watchdogSpawned || chargeControlReleasePending { releaseChargeControl() }
+            return
+        }
+        // The install script's restore released any macOS charge limit of
+        // ours, or failed to (the script tolerates that): forget the
+        // target and treat what powerd holds as unconfirmed, so the next
+        // poll writes its own, a release included, instead of waiting for
+        // the health check to notice.
+        nativeLimitWritten = nil
+        nativeLimitIntent = nil
+        nativeLimitUnconfirmed = true
+    }
+
+    /// Ensure sudo helper is installed. The password prompt runs off the
+    /// main and the SMC queue, with charge control frozen for as long as it
+    /// is up (enterAdminPromptHold). Calls completion on the main queue
+    /// with success/failure, after the install has been acted on and
+    /// before charge control goes on: a caller that takes its intent back
+    /// on failure does so before the poll that follows.
     func ensureSudoInstalled(completion: @escaping (Bool) -> Void) {
         // Standing by: installing would run the migration's restore and
         // spawn a watchdog against the instance that holds charge control.
         // No mechanism: nothing a helper could do here would apply. No
         // license: charge control is on hold until one is registered. The
-        // status line already explains each.
-        if controlsUnavailable {
+        // status line already explains each. A prompt of ours already up:
+        // no second one opens behind it.
+        if controlsUnavailable || adminPromptUp {
             completion(false)
             return
         }
@@ -1667,32 +1972,59 @@ final class BatteryMonitor: ObservableObject {
             completion(true)
             return
         }
-        smcQueue.async { [weak self] in
-            let ok = self?.io.installHelper() ?? false
-            // The setup transaction already installed a fresh watchdog (a
-            // spawn failure fails the install).
-            if ok {
-                self?.watchdogSpawned = true
-                self?.watchdogSpawnFailed = false
-                self?.registerCleanupDaemonIfNeeded()
+        enterAdminPromptHold { [weak self] frozen in
+            guard let self else {
+                completion(false)
+                return
             }
-            DispatchQueue.main.async {
-                // Optional chaining: NSApp is nil under the test host.
-                NSApp?.activate(ignoringOtherApps: true)
+            self.adminQueue.async { [weak self] in
+                let ok = self?.io.installHelper() ?? false
+                // The setup transaction already installed a fresh watchdog
+                // (a spawn failure fails the install).
                 if ok {
-                    self?.grantAccess()
-                    // The install script's restore released any macOS
-                    // charge limit of ours, or failed to (the script
-                    // tolerates that): forget the target and treat what
-                    // powerd holds as unconfirmed, so the next poll writes
-                    // its own, a release included, instead of waiting for
-                    // the health check to notice.
-                    self?.nativeLimitWritten = nil
-                    self?.nativeLimitIntent = nil
-                    self?.nativeLimitUnconfirmed = true
-                    self?.recheckHealth()
+                    self?.watchdogSpawned = true
+                    self?.watchdogSpawnFailed = false
                 }
-                completion(ok)
+                DispatchQueue.main.async {
+                    // Optional chaining: NSApp is nil under the test host.
+                    NSApp?.activate(ignoringOtherApps: true)
+                    guard let self else {
+                        completion(ok)
+                        return
+                    }
+                    self.leaveAdminPromptHold()
+                    if ok {
+                        // A helper call like any other: through the SMC queue.
+                        self.smcQueue.async { [weak self] in self?.registerCleanupDaemonIfNeeded() }
+                        self.finishHelperInstall()
+                    }
+                    self.reassertAfterAdminPrompt(frozen: frozen)
+                    completion(ok)
+                    if !ok {
+                        // The caller has taken its intent back by now.
+                        // The poll also lets a takeover that waited for
+                        // this prompt go ahead.
+                        self.refresh()
+                    } else if self.preparingForSleep, self.chargeControlHold == nil {
+                        // The install landed on the way into sleep, after
+                        // the sleep handler had found charge control
+                        // frozen and left it alone: its setup has since
+                        // restored, so what a sleep needs is written now.
+                        self.writePreSleepState()
+                    } else if self.chargeControlResuming {
+                        // A takeover that waited for this prompt goes ahead.
+                        self.refresh()
+                    } else {
+                        // After the caller's poll, not before it: the
+                        // setup's restore left charging allowed, and a
+                        // check run first would take what the state
+                        // machine is about to write for a mismatch, repair
+                        // it itself, and leave the panel a poll behind.
+                        // With that write in flight the check stands back
+                        // and the poll that follows the write runs it.
+                        self.recheckHealth()
+                    }
+                }
             }
         }
     }
@@ -2761,6 +3093,14 @@ final class BatteryMonitor: ObservableObject {
     }
 
     func refresh() {
+        refresh(smcQueueDrained: false)
+    }
+
+    /// `smcQueueDrained` is true only for the poll that the SMC queue's own
+    /// marker sets off (resumeOnceSMCQueueDrains): everything queued before
+    /// the marker has landed, which is what a takeover after a license
+    /// hold has to know.
+    private func refresh(smcQueueDrained: Bool) {
         guard !preparingForSleep, !terminating else { return }
         refreshCount += 1
         var battery = self.io.battery()
@@ -2800,11 +3140,30 @@ final class BatteryMonitor: ObservableObject {
             }
             return
         }
-        if standingBy || chargeControlHold == .unlicensed {
-            let registered = chargeControlHold == .unlicensed
+        if chargeControlHold == .unlicensed {
+            // A license was registered. The takeover below writes from
+            // the main queue, so it follows whatever is still on the SMC
+            // queue: this poll goes ahead only when the queue's marker set
+            // it off, and no restore of the hold's was queued behind that
+            // marker since. Any other poll asks for the marker and leaves
+            // the hold standing. A prompt of ours that is still up comes
+            // first: the takeover would open a second one behind it, for
+            // the very grant the first is asking for. Its answer polls
+            // again (ensureSudoInstalled, removeSudoRule).
+            guard !adminPromptUp else { return }
+            guard smcQueueDrained, !chargeControlReleaseInFlight else {
+                resumeOnceSMCQueueDrains()
+                return
+            }
             chargeControlHold = nil
-            AmpereLog.app("Ampere: Taking over charge control%@", registered ? " (a license was registered)" : "")
-            if registered { resumeAfterHold() }
+            AmpereLog.app("Ampere: Taking over charge control (a license was registered)")
+            resumeAfterHold()
+            activateChargeControl(atLaunch: false)
+        } else if standingBy {
+            // Nothing of this instance's can be on the SMC queue: standing
+            // by dispatches nothing.
+            chargeControlHold = nil
+            AmpereLog.app("Ampere: Taking over charge control")
             activateChargeControl(atLaunch: false)
         } else if chargeControlHold == .mechanismUnknown || chargeControlHold == .noMechanism {
             // The SMC did not answer the CHTE probe last time, or nothing
@@ -3303,8 +3662,9 @@ final class BatteryMonitor: ObservableObject {
     /// write confirms a transition, so the state is applied directly and
     /// the one helper call per change carries the target. Sleep holds
     /// never arm: the firmware enforces the target through sleep.
-    /// `beforeSleep` runs the one helper call inline and skips the health
-    /// check: prepareForSleep needs the target settled before it returns.
+    /// `beforeSleep` runs the one helper call inline, whoever holds the
+    /// in-flight token, and skips the health check: prepareForSleep needs
+    /// the target settled before it returns.
     private func nativeRefresh(_ battery: BatteryState?, beforeSleep: Bool = false) {
         guard let b = battery else { return }
         updateChargeToFullOverride(b)
@@ -3373,28 +3733,38 @@ final class BatteryMonitor: ObservableObject {
             // follows the level up on AC and down off AC) rather than a
             // fresh one.
             nativeLimitIntent = intent
+        } else if beforeSleep {
+            // The caller drained the SMC queue, so no helper call is in
+            // flight. A token still set marks a completion queued on the
+            // main queue behind the caller (a cleanup retry's), which
+            // cannot run before the caller returns and carries nothing
+            // this target depends on; a target write's own completion,
+            // which does, was recorded by the caller. Waiting for the
+            // token would leave the stale target in force through sleep,
+            // so the write goes ahead without it, as the inhibit path's
+            // pre-sleep write does, and leaves the token to its owner.
+            let write = NativeLimitWrite(target: target, intent: intent,
+                                         revision: controlRevision, percentage: b.percentage)
+            smcQueue.sync {
+                retryFailedWatchdogSpawn()
+                write.succeeded = runSMCWriteViaSudo(write.command)
+            }
+            recordNativeLimitWrite(write)
+            return
         } else if !autoManageInFlight {
             autoManageInFlight = true
             let write = NativeLimitWrite(target: target, intent: intent,
                                          revision: controlRevision, percentage: b.percentage)
             nativeLimitInFlight = write
-            if beforeSleep {
-                smcQueue.sync {
-                    retryFailedWatchdogSpawn()
-                    write.succeeded = runSMCWriteViaSudo(write.command)
-                }
-                finishNativeLimitWrite(write)
-            } else {
-                smcQueue.async { [weak self] in
-                    guard let self else { return }
-                    self.retryFailedWatchdogSpawn()
-                    write.succeeded = self.runSMCWriteViaSudo(write.command)
-                    DispatchQueue.main.async {
-                        // Recorded by prepareForSleep already: nothing left
-                        // to store, and the target it settled must stand.
-                        guard self.nativeLimitInFlight === write else { return }
-                        self.finishNativeLimitWrite(write)
-                    }
+            smcQueue.async { [weak self] in
+                guard let self else { return }
+                self.retryFailedWatchdogSpawn()
+                write.succeeded = self.runSMCWriteViaSudo(write.command)
+                DispatchQueue.main.async {
+                    // Recorded by prepareForSleep already: nothing left
+                    // to store, and the target it settled must stand.
+                    guard self.nativeLimitInFlight === write else { return }
+                    self.finishNativeLimitWrite(write)
                 }
             }
             return
@@ -3406,14 +3776,23 @@ final class BatteryMonitor: ObservableObject {
         }
     }
 
-    /// Record the outcome of a native write once the helper has returned.
-    /// A request that arrived while the helper ran (a cancelled full charge,
-    /// a manual pause) is evaluated right away rather than at the next poll:
-    /// the write stored its own target, and the newer intent may need a
-    /// different one.
+    /// Complete a native write that was dispatched from a poll, once the
+    /// helper has returned: give the in-flight token back and record the
+    /// outcome. A request that arrived while the helper ran (a cancelled
+    /// full charge, a manual pause) is evaluated right away rather than at
+    /// the next poll: the write stored its own target, and the newer intent
+    /// may need a different one.
     private func finishNativeLimitWrite(_ write: NativeLimitWrite) {
         autoManageInFlight = false
         nativeLimitInFlight = nil
+        recordNativeLimitWrite(write)
+        if controlRevision != write.revision { refresh() }
+    }
+
+    /// What a native write that has returned from the helper leaves behind:
+    /// the target and intent now in force, or the error. The pre-sleep
+    /// write records through here directly: it never took the token.
+    private func recordNativeLimitWrite(_ write: NativeLimitWrite) {
         if write.succeeded {
             nativeLimitWritten = write.target
             nativeLimitIntent = write.intent
@@ -3430,7 +3809,6 @@ final class BatteryMonitor: ObservableObject {
             lastError = "Charge control failed — revoke and re-grant admin access"
             AmpereLog.app("Ampere: %@ failed at %d%%", write.command, write.percentage)
         }
-        if controlRevision != write.revision { refresh() }
     }
 
     /// Pre-sleep handling for native mode. The firmware keeps enforcing the
@@ -3440,6 +3818,13 @@ final class BatteryMonitor: ObservableObject {
     /// still in the helper is stored by that write's completion, which runs
     /// after wake, and refresh() is blocked until then. Wait for the helper,
     /// record the write here, and settle the target with one inline poll.
+    /// The call in flight may as well be a cleanup retry, during which the
+    /// poll that saw the cancel could write nothing. It leaves nothing to
+    /// record: the inline poll writes whatever its completion has yet to
+    /// do (nativeRefresh). The same settling freezes the target ahead of
+    /// an administrator prompt (enterAdminPromptHold), and follows a
+    /// helper install that lands on the way into sleep, whose setup
+    /// released the target (ensureSudoInstalled).
     private func settleNativeLimitBeforeSleep() {
         smcQueue.sync {}
         if let write = nativeLimitInFlight { finishNativeLimitWrite(write) }
@@ -3718,9 +4103,23 @@ final class BatteryMonitor: ObservableObject {
         healthWarning = newWarning
     }
 
-    /// Re-run the health check immediately (e.g. after revoke/re-grant admin).
+    /// Re-run the health check at once, after admin access was granted
+    /// again from the panel, so the warning clears (or appears) without
+    /// waiting for the next poll. A check can repair, which makes this a
+    /// write path, and it is entered from a completion that runs whenever
+    /// the administrator prompt was answered: it runs only where a poll
+    /// would run a check (refresh). That means this instance holds charge
+    /// control (a repair on a hold would be written after the hold's
+    /// restore, with nothing left to put it back at quit), the Mac is
+    /// neither going to sleep (a repair would undo the pre-sleep pause)
+    /// nor quitting, no helper call is in flight (the check would read a
+    /// state on its way to changing, and could only warn), and a power
+    /// adapter is connected (on battery there is no expected state). The
+    /// next poll's check stands in otherwise.
     private func recheckHealth() {
-        guard let battery = self.io.battery() else { return }
+        guard chargeControlHold == nil, !preparingForSleep, !terminating,
+              !autoManageInFlight, isSudoRuleInstalled,
+              let battery = io.battery(), battery.adapterConnected else { return }
         if nativeLimitMode {
             performNativeHealthCheck(battery: battery)
         } else {

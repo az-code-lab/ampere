@@ -236,14 +236,16 @@ final class RegistrationManager: ObservableObject {
     /// Delivered on the next turn of the main queue, never in the moment of
     /// the change. A published property emits before it changes, so a
     /// subscriber that runs there sees the registration's own properties
-    /// still in their old state; and the work the tier sets off (taking
-    /// charge control, or putting it back) waits on helper processes, which
-    /// spins the main run loop, and a SwiftUI view that renders in that
-    /// nested loop renders the old state and is not asked again. The
-    /// registration window showed the form after a key had registered, and
-    /// the registered state after Deregister, until the next click (the
-    /// owner, 2026-10-16). By the next turn the change is complete and the
-    /// window has drawn it.
+    /// still in their old state; and taking charge control, which the tier
+    /// sets off, waits on helper processes on the main queue, which spins
+    /// the main run loop, and a SwiftUI view that renders in that nested
+    /// loop renders the old state and is not asked again. (Putting charge
+    /// control back is only queued now, and a takeover after a license
+    /// hold follows the SMC queue a turn later still: BatteryMonitor.
+    /// refresh.) The registration window showed the form after a key had
+    /// registered, and the registered state after Deregister, until the
+    /// next click (the owner, 2026-10-16). By the next turn the change is
+    /// complete and the window has drawn it.
     var tierPublisher: AnyPublisher<LicenseTier, Never> {
         $isRegistered.combineLatest($isFree)
             .map { Self.tier(registered: $0, free: $1) }

@@ -205,7 +205,7 @@ final class VideoSnapshotTests: XCTestCase {
         io.installHelper = { XCTFail("helper install during snapshot"); return false }
         io.setupRefusal = { nil }
         io.competingInstance = { nil }
-        io.runAsAdmin = { _ in XCTFail("administrator command during snapshot"); return false }
+        io.runAsAdmin = { _ in XCTFail("administrator command during snapshot"); return .failed }
         io.cleanupDaemonBundlePath = { nil }
         io.cleanupDaemonRegistered = { _ in true }
         return BatteryMonitor(license: license, defaults: preferences,

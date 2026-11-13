@@ -122,6 +122,200 @@ final class ReleaseScriptTests: XCTestCase {
         XCTAssertTrue(forced.output.contains("guard passed"))
     }
 
+    // MARK: - A version origin already holds
+
+    /// The real preflight, everything above the certificate lookup, as a
+    /// script of its own: nothing is signed, built, tagged, or published.
+    private func preflight() throws -> String {
+        let text = try scriptText()
+        let boundary = try XCTUnwrap(text.range(of: "# Select the G2 release certificate"))
+        return String(text[..<boundary.lowerBound]) + "printf 'guard passed\\n'\n"
+    }
+
+    /// The script's own lines from the one that starts with `from` up to
+    /// the one that starts with `to`, lifted verbatim so a test can run
+    /// them against a fabricated repository.
+    private func section(from: String, to: String) throws -> String {
+        let text = try scriptText()
+        let start = try XCTUnwrap(text.range(of: "\n" + from), "release.sh has no line starting with \(from)")
+        let end = try XCTUnwrap(text.range(of: "\n" + to, range: start.upperBound..<text.endIndex),
+                                "release.sh has no line starting with \(to) after \(from)")
+        return String(text[start.lowerBound..<end.lowerBound])
+    }
+
+    /// Git without the developer's own configuration, so a signing setup,
+    /// a URL rewrite, or a hook on this Mac cannot change what the fixture
+    /// does.
+    private static let hermeticGit = """
+        export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+        export GIT_AUTHOR_NAME=Release GIT_AUTHOR_EMAIL=release@example.invalid
+        export GIT_COMMITTER_NAME=Release GIT_COMMITTER_EMAIL=release@example.invalid
+
+        """
+
+    /// A published version and a release Mac that never fetched its tag: a
+    /// bare `remote.git` holding v1.2.3, and `clone`, cloned from it
+    /// without tags, one commit ahead, with the preflight as its
+    /// release.sh and an empty .project.env. The directory is removed when
+    /// the test ends.
+    private func publishedVersionFixture() throws -> URL {
+        let fixture = FileManager.default.temporaryDirectory.appending(path: "ampere-release-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: fixture, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: fixture) }
+        let setup = bash(Self.hermeticGit + """
+            set -eu
+            git init -q --bare remote.git
+            git init -q source
+            git -C source commit -q --allow-empty -m published
+            git -C source tag v1.2.3
+            git -C source push -q ../remote.git HEAD:refs/heads/master refs/tags/v1.2.3
+            git clone -q --no-tags remote.git clone
+            git -C clone commit -q --allow-empty -m next
+            """, directory: fixture)
+        XCTAssertEqual(setup.status, 0, setup.output)
+        let clone = fixture.appending(path: "clone")
+        try preflight().write(to: clone.appending(path: "release.sh"), atomically: true, encoding: .utf8)
+        try Data().write(to: clone.appending(path: ".project.env"))
+        let local = bash(Self.hermeticGit + "git rev-parse -q --verify refs/tags/v1.2.3", directory: clone)
+        XCTAssertNotEqual(local.status, 0, "The fixture's premise: the clone has no local tag for the published version")
+        return fixture
+    }
+
+    func testAVersionPublishedOnOriginIsRefusedEvenWithoutALocalTag() throws {
+        // The local tag is only this Mac's memory of a release. A clone that
+        // never fetched it (git clone --no-tags, a second release Mac, a tag
+        // deleted here) has none, and a guard that looks only there waves
+        // the published version through to the steps that replace it.
+        let fixture = try publishedVersionFixture()
+        let clone = fixture.appending(path: "clone")
+        let run = { (arguments: [String]) in
+            self.bash(Self.hermeticGit + "exec /bin/bash release.sh \"$@\"", arguments: arguments, directory: clone)
+        }
+
+        let refused = run(["1.2.3"])
+        XCTAssertNotEqual(refused.status, 0, refused.output)
+        XCTAssertTrue(refused.output.contains("v1.2.3 is already published on origin"), refused.output)
+        XCTAssertFalse(refused.output.contains("guard passed"), refused.output)
+
+        let forced = run(["1.2.3", "--force"])
+        XCTAssertEqual(forced.status, 0, forced.output)
+        XCTAssertTrue(forced.output.contains("guard passed"), forced.output)
+
+        let unpublished = run(["1.2.4"])
+        XCTAssertEqual(unpublished.status, 0, unpublished.output)
+        XCTAssertTrue(unpublished.output.contains("guard passed"), unpublished.output)
+    }
+
+    func testAnOriginThatCannotBeAskedIsNotTakenForAnUnpublishedVersion() throws {
+        // No answer is not "no such tag": offline, or with origin gone, the
+        // version may well be published, so the preflight refuses rather
+        // than guess. --force is the explicit choice and asks nothing.
+        let fixture = try publishedVersionFixture()
+        let clone = fixture.appending(path: "clone")
+        let moved = bash("mv remote.git elsewhere.git", directory: fixture)
+        XCTAssertEqual(moved.status, 0, moved.output)
+        let run = { (arguments: [String]) in
+            self.bash(Self.hermeticGit + "exec /bin/bash release.sh \"$@\"", arguments: arguments, directory: clone)
+        }
+
+        let refused = run(["1.2.4"])
+        XCTAssertNotEqual(refused.status, 0, refused.output)
+        XCTAssertTrue(refused.output.contains("could not ask origin"), refused.output)
+        XCTAssertFalse(refused.output.contains("guard passed"), refused.output)
+
+        let forced = run(["1.2.4", "--force"])
+        XCTAssertEqual(forced.status, 0, forced.output)
+        XCTAssertTrue(forced.output.contains("guard passed"), forced.output)
+    }
+
+    /// Runs lifted lines of release.sh in the fixture's clone with the
+    /// variables the script would have set by then and a `gh` that only
+    /// records what it was asked. Returns the snippet's result and gh's log.
+    private func runLifted(_ lines: String, version: String, force: Bool,
+                           in fixture: URL) throws -> (output: String, status: Int32, gh: [String]) {
+        let bin = fixture.appending(path: "bin")
+        let log = fixture.appending(path: "gh-\(UUID().uuidString).log")
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        // One line per invocation: the release notes span several.
+        try "#!/bin/bash\nasked=\"$*\"\nprintf '%s\\n' \"${asked//$'\\n'/ }\" >> \"$GH_LOG\"\n"
+            .write(to: bin.appending(path: "gh"), atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: bin.appending(path: "gh").path)
+        let clone = fixture.appending(path: "clone")
+        let result = bash(Self.hermeticGit + """
+            set -euo pipefail
+            export PATH="$1:$PATH" GH_LOG="$2"
+            VERSION="$3"
+            FORCE="$4"
+            REPO_DIR="$PWD"
+            GITHUB_REPO=example/ampere
+            SCHEME=Ampere
+            DMG_PATH=/tmp/Ampere.dmg
+            SHA256=0000
+            \(lines)
+            """, arguments: [bin.path, log.path, version, force ? "--force" : ""], directory: clone)
+        let recorded = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
+        return (result.output, result.status, recorded.split(separator: "\n").map(String.init))
+    }
+
+    private func tagCommit(_ tag: String, in repository: URL) -> String {
+        bash(Self.hermeticGit + "git rev-parse -q --verify \"refs/tags/$1^{commit}\"", arguments: [tag],
+             directory: repository).output.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    func testOnlyForceReplacesATagOrAReleaseOriginAlreadyHolds() throws {
+        // The preflight is the early refusal; these are the steps that do
+        // the replacing, and a version can be published between the two (the
+        // build and three notarization rounds sit in the gap). Without
+        // --force they must be the plain commands, which origin and GitHub
+        // refuse for a version they already hold, not the forced ones.
+        let fixture = try publishedVersionFixture()
+        let clone = fixture.appending(path: "clone")
+        let remote = fixture.appending(path: "remote.git")
+        let tagging = try section(from: "echo \"==> Tagging v$VERSION...\"", to: "echo \"==> Building Release...\"")
+        let publishing = try section(from: "echo \"==> Pushing tag...\"", to: "echo \"==> Updating Homebrew cask...\"")
+        let published = tagCommit("v1.2.3", in: remote)
+        let head = bash(Self.hermeticGit + "git rev-parse HEAD", directory: clone).output
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        XCTAssertEqual(published.count, 40)
+        XCTAssertNotEqual(published, head)
+
+        // The clone has no local tag, so tagging succeeds and names HEAD.
+        let tagged = try runLifted(tagging, version: "1.2.3", force: false, in: fixture)
+        XCTAssertEqual(tagged.status, 0, tagged.output)
+        XCTAssertEqual(tagCommit("v1.2.3", in: clone), head)
+
+        let plain = try runLifted(publishing, version: "1.2.3", force: false, in: fixture)
+        XCTAssertNotEqual(plain.status, 0, "A plain push of a tag origin holds for another commit is rejected: \(plain.output)")
+        XCTAssertEqual(tagCommit("v1.2.3", in: remote), published, "The published tag must not move without --force")
+        XCTAssertEqual(plain.gh, [], "Nothing is deleted or created once the push is refused")
+
+        // A local tag that exists is not moved without --force either.
+        let fetched = bash(Self.hermeticGit + "git tag -f v1.2.3 \"$1\"", arguments: [published], directory: clone)
+        XCTAssertEqual(fetched.status, 0, fetched.output)
+        let retagged = try runLifted(tagging, version: "1.2.3", force: false, in: fixture)
+        XCTAssertNotEqual(retagged.status, 0, retagged.output)
+        XCTAssertEqual(tagCommit("v1.2.3", in: clone), published)
+
+        // --force is the deliberate re-release: the tag moves here and on
+        // origin, and the old GitHub release goes before the new one.
+        let forcedTag = try runLifted(tagging, version: "1.2.3", force: true, in: fixture)
+        XCTAssertEqual(forcedTag.status, 0, forcedTag.output)
+        XCTAssertEqual(tagCommit("v1.2.3", in: clone), head)
+        let forced = try runLifted(publishing, version: "1.2.3", force: true, in: fixture)
+        XCTAssertEqual(forced.status, 0, forced.output)
+        XCTAssertEqual(tagCommit("v1.2.3", in: remote), head)
+        XCTAssertEqual(forced.gh.count, 2, "\(forced.gh)")
+        XCTAssertTrue(forced.gh.first?.hasPrefix("release delete v1.2.3 ") == true, "\(forced.gh)")
+        XCTAssertTrue(forced.gh.last?.hasPrefix("release create v1.2.3 ") == true, "\(forced.gh)")
+
+        // A version origin has never seen needs no force and deletes nothing.
+        let fresh = try runLifted(tagging + "\n" + publishing, version: "1.2.4", force: false, in: fixture)
+        XCTAssertEqual(fresh.status, 0, fresh.output)
+        XCTAssertEqual(tagCommit("v1.2.4", in: remote), head)
+        XCTAssertEqual(fresh.gh.count, 1, "\(fresh.gh)")
+        XCTAssertTrue(fresh.gh.first?.hasPrefix("release create v1.2.4 ") == true, "\(fresh.gh)")
+    }
+
     func testTheDiskImageIsSignedNotarizedAndStapledItself() throws {
         // The app inside carries its own stapled ticket, and that is what
         // clears a first launch — so an unsigned image still installs, which

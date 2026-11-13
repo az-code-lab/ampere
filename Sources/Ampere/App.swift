@@ -1069,11 +1069,17 @@ struct ContentView: View {
             // registration window and shows this panel only while a sheet
             // keeps it from closing).
             if !monitor.controlsUnavailable {
+                // While a password prompt of Ampere's own is open the
+                // sections stay where they are but take no input
+                // (BatteryMonitor.adminPromptUp): the panel does not jump
+                // under the prompt, and no intent changes behind the
+                // frozen state.
                 if !monitor.autoManageEnabled && state.adapterConnected {
                     Divider().padding(.horizontal)
 
                     // Charge control: pause/discharge/resume
                     chargeControlSection()
+                        .disabled(monitor.adminPromptUp)
                 }
 
                 if monitor.autoManageEnabled {
@@ -1081,6 +1087,7 @@ struct ContentView: View {
 
                     // Auto charge content (slider + discharge toggle)
                     autoManageContent(state)
+                        .disabled(monitor.adminPromptUp)
                 }
             }
 
@@ -1297,7 +1304,16 @@ struct ContentView: View {
                             .font(.system(size: 12))
                             .foregroundColor(.secondary)
                     } else if monitor.chargeControlHold == .unlicensed {
-                        Text("Charge control: on hold until this copy is registered. A free license is enough; a paid license adds custom charge bounds and Keep Awake.")
+                        // Registered again, with the takeover waiting for
+                        // a password prompt of Ampere's own that is still
+                        // open (BatteryMonitor.chargeControlResuming).
+                        Text(monitor.chargeControlResuming
+                            ? "Charge control: the license is registered. Ampere takes charge control once the admin password prompt that is still open has been answered."
+                            : "Charge control: on hold until this copy is registered. A free license is enough; a paid license adds custom charge bounds and Keep Awake.")
+                            .font(.system(size: 12))
+                            .foregroundColor(.secondary)
+                    } else if monitor.chargeControlHold == .adminPrompt {
+                        Text("Charge control: frozen while an admin password prompt of Ampere's is open. An active discharge was stopped and a charge short of full paused first, as before a sleep; nothing is written until the prompt is answered, and charge control goes on from there.")
                             .font(.system(size: 12))
                             .foregroundColor(.secondary)
                     }
@@ -1318,7 +1334,7 @@ struct ContentView: View {
             if monitor.settingsExpanded {
                 Divider().padding(.horizontal)
                 autoManageToggle()
-                    .disabled(monitor.controlsUnavailable)
+                    .disabled(monitor.controlsUnavailable || monitor.adminPromptUp)
                 launchAtLoginRow()
                 menuBarPercentRow()
                 // A setting of Keep Awake's, so offered with it: a copy
@@ -1399,7 +1415,15 @@ struct ContentView: View {
         case .mechanismUnknown:
             return "Charge control on hold: the SMC did not answer. Ampere asks again at every poll."
         case .unlicensed:
-            return "Charge control needs a license: register one in the registration window, or quit"
+            // Registered again, with the takeover waiting for a password
+            // prompt of Ampere's own that is still open
+            // (BatteryMonitor.chargeControlResuming): asking for a license
+            // here would be asking for one it has.
+            return monitor.chargeControlResuming
+                ? "Charge control on hold: waiting for the admin prompt that is still open. Ampere takes charge control once it is answered."
+                : "Charge control needs a license: register one in the registration window, or quit"
+        case .adminPrompt:
+            return "Charge control is frozen while the admin password prompt is open. It goes on once the prompt is answered or cancelled."
         case nil:
             break
         }
@@ -2125,6 +2149,8 @@ struct ContentView: View {
                 monitor.removeSudoRule()
             }
             .buttonStyle(FooterButtonStyle())
+            // One password prompt at a time (BatteryMonitor.adminPromptUp).
+            .disabled(monitor.adminPromptUp)
             .help("Remove this account's passwordless sudo rule, and the helper binary once no other account uses it (prompts for your admin password). Charge control stops working until access is granted again.")
         }
         .padding(.horizontal, 16)
