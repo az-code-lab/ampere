@@ -23,4 +23,8 @@ done
 # version, verified with otool -l | grep -A4 LC_BUILD_VERSION.
 SDK_FLAGS=(-Xswiftc -Xclang-linker -Xswiftc -isysroot -Xswiftc -Xclang-linker -Xswiftc "$(xcrun --show-sdk-path)")
 
-swift build -c debug "${SDK_FLAGS[@]}" 2>&1 && .build/debug/Ampere
+# The build's progress lines are shown while it runs and cleared when it
+# ends (see build-progress.sh): the last one the engine prints is a
+# snapshot that can stop short of its own total ("[108 / 109]").
+source ./build-progress.sh
+swift build -c debug "${SDK_FLAGS[@]}" 2>&1 | build_progress && .build/debug/Ampere

@@ -95,7 +95,14 @@ if [ -n "$(git status --porcelain)" ]; then
 fi
 
 echo "==> Running tests..."
-swift test
+# Build output goes through build_progress (see build-progress.sh), which
+# leaves none of the engine's "[started / possible]" lines on screen: the
+# last one printed is a snapshot that can stop short of its own total.
+# Only the build is filtered, and the tests then run without building
+# again, because a line a test prints could look like a progress line.
+source "$REPO_DIR/build-progress.sh"
+swift build --build-tests 2>&1 | build_progress
+swift test --skip-build
 
 echo "==> Tagging v$VERSION..."
 # Only --force moves a tag that exists. The preflight found none, so a plain
@@ -121,7 +128,7 @@ cd "$REPO_DIR"
 # Settings" window at launch). Passing -isysroot restores the real SDK
 # version, verified with otool -l | grep -A4 LC_BUILD_VERSION.
 SDK_FLAGS=(-Xswiftc -Xclang-linker -Xswiftc -isysroot -Xswiftc -Xclang-linker -Xswiftc "$(xcrun --show-sdk-path)")
-swift build -c release "${SDK_FLAGS[@]}" 2>&1
+swift build -c release "${SDK_FLAGS[@]}" 2>&1 | build_progress
 
 echo "==> Creating app bundle..."
 rm -rf "$APP_DIR"

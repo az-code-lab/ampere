@@ -245,6 +245,8 @@ swift build -c debug
 
 `run.sh` and `release.sh` pass the linker the SDK explicitly (`SDK_FLAGS` in both scripts). Under Xcode 27's toolchain a bare `swift build` produces a binary stamped as built against the SDK of its deployment target: SwiftPM's Swift Build engine runs `swiftc` without `SDKROOT`, and `clang` then records the deployment target instead of the SDK version. AppKit and SwiftUI run such a binary in that older release's compatibility mode on every later macOS; with the macOS 14 target of the time, macOS 27 showed an empty "Ampere Settings" window at launch. Check a build with `otool -l .build/debug/Ampere | grep -A4 LC_BUILD_VERSION`; the `sdk` line must show the SDK you built with (27.0 under Xcode 27), not the deployment target's `15.0`.
 
+Both scripts also pass their build output through `build_progress` (`build-progress.sh`). The Swift Build engine's progress lines (`[108 / 109] Ampere-product`) are not done over total: they count the tasks started over the tasks that may still run, the engine sends at most one every 100 ms, and it never sends the final state again. A build whose last steps finish inside that window therefore ends on a count short of its own total, with `Build complete!` under it (ten identical rebuilds ended on `37 / 38` nine times and on `38 / 38` once). The filter draws the progress lines in place while the build runs and clears them when it ends, so what remains is SwiftPM's verdict and its diagnostics; where the output is not a terminal the progress lines are left out. `release.sh` builds the tests through it and then runs them with `swift test --skip-build`, so no test output passes through the filter.
+
 ## Uninstall
 
 Delete `Ampere.app` from Applications, or:
