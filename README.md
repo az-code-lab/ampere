@@ -8,7 +8,7 @@ A lightweight macOS menu bar app for monitoring battery status and controlling c
 
 ## Features
 
-- **Real-time battery stats** - percentage, cycle count, health, temperature, raw charge, and battery age, plus wattage (adapter / battery / system), voltage (adapter / battery), and current (adapter / battery)
+- **Real-time battery stats** - percentage, cycle count, health, temperature, raw charge, and battery age, plus wattage (adapter / battery / system), voltage (adapter / battery), and current (adapter / battery); clicking a card that has a second unit switches it, and the temperature starts in the unit macOS is set to (see Card Units)
 - **Charge control** - pause and resume charging via SMC
 - **Auto charge** - configurable upper/lower bounds to keep your battery in an optimal charge range; custom bounds are the paid feature, and a free license runs the default 40 to 60% range
 - **Micro-charge prevention** - inhibits charging between bounds after restart; only charges from below the lower bound or on explicit user request
@@ -166,6 +166,22 @@ A running session shows in the menu bar, to the left of the battery. The symbol 
 
 Unlike the charge sleep hold and the discharge override (which use the system-wide `pmset` override precisely because they must survive a lid close), Keep Awake never blocks lid-close sleep on an undocked Mac. In clamshell mode (external display + power) a closed lid does not sleep the Mac anyway.
 
+### Card Units
+
+Six of the twelve cards on the panel have a second unit, and clicking one switches it. Hovering such a card shows a swap glyph, and its tooltip says what a click switches to.
+
+| Card | Starts as | A click switches to |
+|---|---|---|
+| **Battery Served** | years and months ("1y 8m") | days ("608d") |
+| **Temperature** | the unit macOS is set to | the other of °C and °F |
+| **Health** | percent | full-charge over design capacity, in mAh |
+| **Raw Charge** | percent | current charge over full-charge capacity, in mAh |
+| **Adapter Current**, **Battery Current** | amps | milliamps (the two switch together) |
+
+Each choice is saved the moment the card is clicked and comes back after a restart, an update, or a crash. Temperature is the one card with no unit of its own to start in: until it is clicked it shows the unit set under System Settings > General > Language & Region > Temperature (the region's own unit where that was never changed), so a new install reads Celsius on a Mac set to Celsius. The first click stores the unit it switches to, and from then on the card keeps that choice whatever macOS is set to.
+
+The **Checked at** time of the last health check, in the About panel, is written the way the same settings say: the Mac's 12 or 24 hour clock, and its region's order of day and month.
+
 ### Behavior on Sleep/Wake and Quit/Restart
 
 | Scenario | Sleep → Wake | Quit → Restart |
@@ -178,7 +194,7 @@ On firmware without CHTE all three rows collapse into one behavior: the macOS ch
 
 ### Settings and Safety
 
-- **Settings persist across restarts** - auto charge, discharge toggle, charge bounds (a free license always relaunches with the default 40 to 60%), keep awake (including a mid-session deadline; not resumed by a copy that no longer holds a paid license), and the two menu bar switches (Percent in Menu Bar, Keep Awake Time in Menu Bar) are saved and restored when the app relaunches. The registration, free or paid, persists too; an unregistered copy relaunches at its registration window with its settings intact.
+- **Settings persist across restarts** - auto charge, discharge toggle, charge bounds (a free license always relaunches with the default 40 to 60%), keep awake (including a mid-session deadline; not resumed by a copy that no longer holds a paid license), the two menu bar switches (Percent in Menu Bar, Keep Awake Time in Menu Bar), and the unit each card was switched to (see Card Units) are saved and restored when the app relaunches. The registration, free or paid, persists too; an unregistered copy relaunches at its registration window with its settings intact.
 - **Quitting the app restores system defaults** - all SMC overrides (charging inhibit, discharge) and power management changes (sleep settings) are cleared when the app exits, and on firmware without CHTE the macOS charge limit is put back to whatever it was before. Your Mac returns to its normal charging and sleep behavior. If the app crashes or is force-killed, a watchdog daemon cleans up automatically within a few seconds. If the Mac was shut down mid-override instead, the next launch restores it; should that restore fail (pmset not answering right at login, say), the status line says so and the app retries every two minutes until it succeeds.
 
 ### Health Check

@@ -984,7 +984,10 @@ struct ContentView: View {
     // Display preferences persist across restarts per CLAUDE.md requirement 3.
     // showAbout / launchAtLogin remain @State: the former is sheet visibility,
     // the latter is derived from SMAppService and isn't a user preference.
-    @AppStorage("ui.useFahrenheit") private var useFahrenheit = true
+    // The temperature unit has no default of its own: nil until the card is
+    // first clicked, and the card shows macOS's unit until then
+    // (TemperatureDisplay).
+    @AppStorage("ui.useFahrenheit") private var temperatureChoice: Bool?
     @AppStorage("ui.healthShowPercent") private var healthShowPercent = true
     @AppStorage("ui.ageShowYears") private var ageShowYears = true
     @AppStorage("ui.amperageShowMA") private var amperageShowMA = false
@@ -1000,9 +1003,7 @@ struct ContentView: View {
 
     private var healthCheckTimeString: String {
         guard let time = monitor.lastHealthCheckTime else { return "n/a" }
-        let fmt = DateFormatter()
-        fmt.dateFormat = "h:mm:ss a M/d/yyyy"
-        return fmt.string(from: time)
+        return healthCheckTimeLabel(time)
     }
 
     var body: some View {
@@ -1530,13 +1531,10 @@ struct ContentView: View {
     }
 
     private func statusGrid(_ state: BatteryState) -> some View {
-        let tempValue: String
-        if useFahrenheit {
-            let f = state.temperature * 9.0 / 5.0 + 32.0
-            tempValue = String(format: "%.1f\u{00B0}F", f)
-        } else {
-            tempValue = String(format: "%.1f\u{00B0}C", state.temperature)
-        }
+        // Read at every render, so a card that was never clicked follows
+        // the unit macOS is set to.
+        let useFahrenheit = TemperatureDisplay.usesFahrenheit(stored: temperatureChoice)
+        let tempValue = TemperatureDisplay.label(celsius: state.temperature, fahrenheit: useFahrenheit)
 
         let healthValue = healthShowPercent ? state.health : "\(state.maxCapacity)/\(state.designCapacity) mAh"
 
@@ -1573,7 +1571,9 @@ struct ContentView: View {
                     ageShowYears.toggle()
                 }, help: "Battery age since manufacture — click to show in \(ageShowYears ? "days" : "years")")
             StatCard(title: "Temperature", value: tempValue, icon: "thermometer.medium", iconColor: tint, onTap: {
-                useFahrenheit.toggle()
+                // The click's choice is kept from here on, whichever unit
+                // macOS is set to.
+                temperatureChoice = !useFahrenheit
             }, help: "Battery temperature — click to show in °\(useFahrenheit ? "C" : "F")")
             StatCard(title: "Adapter Voltage", value: voltageValue(state.adapterVoltage), icon: "bolt.fill", iconColor: adapterTint,
                 help: "Voltage at the power adapter")
@@ -2287,6 +2287,49 @@ enum BatteryMode: Equatable {
 func formatWatts(_ watts: Double?) -> String {
     guard let watts else { return "—" }
     return String(format: "%.1f W", watts)
+}
+
+/// The About panel's "Checked at" text for the last health check: the time
+/// with seconds, then the date, each the way macOS is set to show them (12
+/// or 24 hour clock, the region's order of day and month, its calendar).
+/// A fixed month/day/year pattern stood here before, which a day-first
+/// region reads as another date (4 March as 3 April). On a Mac set to the
+/// United States the text reads as that pattern's did, with the narrow
+/// space macOS puts before AM and PM. Pure inputs, so the format is tested
+/// without touching this Mac's settings.
+func healthCheckTimeLabel(_ date: Date, locale: Locale = .autoupdatingCurrent,
+                          timeZone: TimeZone = .autoupdatingCurrent) -> String {
+    var calendar = locale.calendar
+    calendar.timeZone = timeZone
+    let time = Date.FormatStyle(date: .omitted, time: .standard, locale: locale,
+                                calendar: calendar, timeZone: timeZone)
+    let day = Date.FormatStyle(date: .numeric, time: .omitted, locale: locale,
+                               calendar: calendar, timeZone: timeZone)
+    return date.formatted(time) + " " + date.formatted(day)
+}
+
+/// The Temperature card's unit and text. The card has no unit of its own
+/// to start in: until it is clicked it shows the unit macOS is set to
+/// (System Settings > General > Language & Region > Temperature, or the
+/// region's own unit where that was never changed). A click stores the unit
+/// it switches to (`ui.useFahrenheit`), and from then on that choice is
+/// shown whatever macOS says. Before this rule a new install showed
+/// Fahrenheit on every Mac. Pure inputs, so the rule is tested without
+/// touching this Mac's settings.
+enum TemperatureDisplay {
+    /// `stored` is the choice a click saved, nil while the card was never
+    /// clicked. Anything macOS reports other than Fahrenheit reads as
+    /// Celsius, the unit the sensor reports in.
+    static func usesFahrenheit(stored: Bool?, locale: Locale = .autoupdatingCurrent) -> Bool {
+        stored ?? (UnitTemperature(forLocale: locale) == .fahrenheit)
+    }
+
+    /// The card's text for a reading in degrees Celsius.
+    static func label(celsius: Double, fahrenheit: Bool) -> String {
+        fahrenheit
+            ? String(format: "%.1f\u{00B0}F", celsius * 9.0 / 5.0 + 32.0)
+            : String(format: "%.1f\u{00B0}C", celsius)
+    }
 }
 
 /// Decides which target the ETA label should aim at, then delegates the
