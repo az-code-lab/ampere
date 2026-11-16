@@ -21,7 +21,14 @@ enum AppVersion {
         task.standardError = FileHandle.nullDevice
         do {
             try task.run()
-            task.waitUntilExit()
+            // git's answer is read to its end, which is when git is done.
+            // Not waitUntilExit(): that runs the main run loop while it
+            // waits, and the first use of this value is usually a view's
+            // body (the panel's title). SwiftUI, run from that loop,
+            // evaluated the body again, which came back here and waited for
+            // this same initializer to finish, for good: a dev build could
+            // hang as its panel first opened (caught under test, 2026-11-15).
+            // Release builds never get here; they read version.txt above.
             if let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
                 .trimmingCharacters(in: .whitespacesAndNewlines), !output.isEmpty {
                 // return "0.0.1" // test upgrade

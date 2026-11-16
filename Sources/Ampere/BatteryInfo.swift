@@ -439,18 +439,20 @@ final class BatteryMonitor: ObservableObject {
     /// Invalidates the delayed reset of an outcome when a newer manual
     /// check starts before the previous outcome's text has cleared.
     private var manualCheckGeneration = 0
-    @Published var isPopoverVisible: Bool = false
-    /// True while a sheet (About) is presented over the panel.
-    /// Pure UI state like `isPopoverVisible` — not persisted. While true the
-    /// popover must not close: tearing down an NSPopover underneath an
-    /// attached SwiftUI sheet strands the sheet's presentation state, and
-    /// the reopened panel sits behind an invisible modal, dead to clicks.
+    /// True while the panel can be seen: hanging from the menu bar item, or
+    /// as a window with any part of it showing (AppDelegate.panelIsOnScreen).
+    /// Pure UI state, not persisted, set through setFastPolling: polling is
+    /// fast while it holds, and readings that changed nothing the menu bar
+    /// shows are published only then.
+    @Published var isPanelVisible: Bool = false
+    /// True while a sheet (About, the Keep Display On warning) is presented
+    /// over the attached panel. Pure UI state like `isPanelVisible`, not
+    /// persisted. While true the popover must not close: tearing down an
+    /// NSPopover underneath an attached SwiftUI sheet strands the sheet's
+    /// presentation state, and the reopened panel sits behind an invisible
+    /// modal, dead to clicks. The panel's own window carries its sheets
+    /// itself and leaves this alone.
     @Published var sheetVisible: Bool = false
-    /// True while the panel is a free-floating window, torn off the menu
-    /// bar item. Pure UI state like `isPopoverVisible`, set and cleared by
-    /// AppDelegate: the panel's window-drag gesture is live only in this
-    /// state (see DetachedPanelDrag).
-    @Published var panelDetached: Bool = false
 
     @Published var autoManageEnabled: Bool {
         didSet {
@@ -1551,9 +1553,10 @@ final class BatteryMonitor: ObservableObject {
         }
     }
 
-    /// Switch to fast (10s) or slow (60s) polling based on popover visibility.
+    /// Switch to fast (10s) or slow (60s) polling with whether the panel can
+    /// be seen, attached or as a window (AppDelegate.setPanelOnScreen).
     func setFastPolling(_ fast: Bool) {
-        isPopoverVisible = fast
+        isPanelVisible = fast
         timer?.invalidate()
         let interval: TimeInterval = fast ? 10.0 : 60.0
         if fast { refresh() }
@@ -3053,7 +3056,7 @@ final class BatteryMonitor: ObservableObject {
     // MARK: - Refresh
 
     /// Publish the latest battery reading, gated to avoid noisy SwiftUI
-    /// layout passes when the popover is hidden and only menu-bar-relevant
+    /// layout passes when the panel is out of view and only menu-bar-relevant
     /// fields haven't changed.
     private func publishStateIfNeeded(_ battery: BatteryState?) {
         if state != battery {
@@ -3067,7 +3070,7 @@ final class BatteryMonitor: ObservableObject {
                 // current direction.
                 || Self.amperageDirection(state?.amperage)
                     != Self.amperageDirection(battery?.amperage)
-            if isPopoverVisible || menuBarChanged {
+            if isPanelVisible || menuBarChanged {
                 state = battery
             }
         }
@@ -3099,7 +3102,7 @@ final class BatteryMonitor: ObservableObject {
         // Publish unconditionally on every refresh — early returns below
         // dispatch SMC actions and exit, and on failure the dispatch's
         // callback intentionally does NOT recurse into refresh(). Without
-        // this defer, the menu bar would be stuck at "0%" and the popover
+        // this defer, the menu bar would be stuck at "0%" and the panel
         // at "no battery" whenever the first refresh trips an early return.
         defer { publishStateIfNeeded(battery) }
 
@@ -3911,7 +3914,7 @@ final class BatteryMonitor: ObservableObject {
             || lastHealthCheckCHTEMatch != limitMatch
             || lastHealthCheckCHIEMatch != chieMatch
             || healthWarning != newWarning
-        guard isPopoverVisible || changed else { return }
+        guard isPanelVisible || changed else { return }
         lastHealthCheckTime = Date()
         lastHealthCheckSMC = newSMC
         lastHealthCheckStatus = newStatus
@@ -4041,7 +4044,7 @@ final class BatteryMonitor: ObservableObject {
             // Takes the same in-flight token as every other SMC dispatch
             // site. No refresh() from the completion — if firmware reverts
             // the write instantly, an immediate re-check would tight-loop;
-            // the next tick (60s slow / 10s popover) re-verifies at a sane
+            // the next tick (60s slow / 10s panel in view) re-verifies at a sane
             // cadence and clears the FAIL status once the repair sticks.
             if let op = Self.chteRepairOp(
                    chteMatch: newCHTEMatch, chieMatch: newCHIEMatch, chie: chie,
@@ -4072,19 +4075,19 @@ final class BatteryMonitor: ObservableObject {
 
         // Publishing any of these fires objectWillChange, which redraws the
         // menu bar and re-renders the (possibly hidden) SwiftUI tree — the
-        // very churn publishStateIfNeeded exists to avoid. When the popover
-        // is hidden and the result is identical to the last check, skip the
-        // publish entirely; only the timestamp would move, and the About
-        // sheet that displays it can't be visible. Opening the popover
-        // triggers an immediate refresh, so the timestamp is fresh by the
-        // time it can be seen.
+        // very churn publishStateIfNeeded exists to avoid. When the panel is
+        // out of view and the result is identical to the last check, skip
+        // the publish entirely; only the timestamp would move, and the
+        // About sheet that displays it can't be visible. The panel coming
+        // into view triggers an immediate refresh, so the timestamp is
+        // fresh by the time it can be seen.
         let changed = lastHealthCheckStatus != newStatus
             || lastHealthCheckSMC != newSMC
             || lastHealthCheckExpected != newExpected
             || lastHealthCheckCHTEMatch != newCHTEMatch
             || lastHealthCheckCHIEMatch != newCHIEMatch
             || healthWarning != newWarning
-        guard isPopoverVisible || changed else { return }
+        guard isPanelVisible || changed else { return }
 
         lastHealthCheckTime = Date()
         lastHealthCheckSMC = newSMC

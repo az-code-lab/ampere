@@ -1,4 +1,5 @@
 import XCTest
+import SwiftUI
 @testable import Ampere
 import Shared
 
@@ -2970,5 +2971,31 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         XCTAssertEqual(declined.chargeControlNotice,
                        .init(text: "Admin access required for charge control. Pause charging or re-enable Auto Charge to grant it.",
                              kind: .hold))
+    }
+
+    // MARK: - The panel's two forms
+
+    /// Attached to the menu bar item, the panel leads with a row of its
+    /// own: the app's name and the pin. Torn off it is a window, whose
+    /// title bar says the name and which has nothing to pin: the same
+    /// panel without that row (a line of text, pulled 8 points up, and the
+    /// gap under it).
+    func testThePanelsWindowFormIsTheAttachedOneWithoutItsHeaderRow() throws {
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ampere-panel-forms-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: folder.appendingPathComponent("registration").path))
+        let registration = RegistrationManager(defaults: defaults, deviceSerial: "TESTSERIAL")
+        let hw = Hardware()
+        let monitor = hw.monitor(license: .paid)
+        monitor.state = hw.reading()
+
+        let attached = NSHostingView(rootView: ContentView(monitor: monitor, registration: registration)).fittingSize
+        let window = NSHostingView(rootView: ContentView(monitor: monitor, registration: registration,
+                                                         presentation: .window)).fittingSize
+        XCTAssertEqual(attached.width, 580)
+        XCTAssertEqual(window.width, 580)
+        XCTAssertEqual(attached.height - window.height, 24, accuracy: 4)
     }
 }

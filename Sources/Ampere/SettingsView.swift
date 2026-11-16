@@ -6,8 +6,9 @@ import ServiceManagement
 // MARK: - Settings Window
 
 extension Notification.Name {
-    /// Posted by the panel's Settings… link and by the Settings… menu
-    /// command (Cmd+,); AppDelegate owns the window (showSettingsWindow).
+    /// Posted by the panel's Settings… link; AppDelegate owns the window
+    /// (showSettingsWindow), and the Settings… menu command (Cmd+,) calls
+    /// it directly.
     static let ampereShowSettingsWindow = Notification.Name("ampere.showSettingsWindow")
 }
 
