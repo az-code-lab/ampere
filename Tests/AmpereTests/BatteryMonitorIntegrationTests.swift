@@ -2997,5 +2997,23 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         XCTAssertEqual(attached.width, 580)
         XCTAssertEqual(window.width, 580)
         XCTAssertEqual(attached.height - window.height, 24, accuracy: 4)
+
+        // In its window the view is told how tall it may be on the screen
+        // it is on: as tall as its rows while they fit, that tall and
+        // scrolling when they do not, and its own height again when the
+        // window moves to a screen with room for them.
+        let layout = PanelWindowLayout()
+        let host = NSHostingView(rootView: ContentView(monitor: monitor, registration: registration,
+                                                       presentation: .window, windowLayout: layout))
+        host.sizingOptions = [.minSize, .intrinsicContentSize, .maxSize]
+        XCTAssertEqual(host.fittingSize.height, window.height, accuracy: 1)
+        XCTAssertEqual(host.fittingSize.width, 580)
+        layout.maxHeight = 500
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.1))
+        XCTAssertEqual(host.fittingSize.height, 500, accuracy: 1)
+        XCTAssertEqual(host.fittingSize.width, 580)
+        layout.maxHeight = window.height + 300
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.1))
+        XCTAssertEqual(host.fittingSize.height, window.height, accuracy: 1)
     }
 }

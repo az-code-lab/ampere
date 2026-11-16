@@ -90,7 +90,14 @@ final class PanelWindowTests: XCTestCase {
     /// of this app, or not.
     func testAClickOnOneOfTheAppsOwnWindowsIsNotAClickOutsideTheApp() throws {
         _ = NSApplication.shared
-        let screen = try XCTUnwrap(NSScreen.main ?? NSScreen.screens.first)
+        // Nowhere near a screen there is no window to land on, this app's
+        // or anyone's: a click outside the app. (Not asked of a spot on
+        // screen: whatever shows there is the Mac's, not the test's.)
+        XCTAssertFalse(AppDelegate.clickLandsOnOwnWindow(at: NSPoint(x: -100_000, y: -100_000)))
+
+        guard let screen = NSScreen.main ?? NSScreen.screens.first else {
+            throw XCTSkip("No display to put a window on")
+        }
         // A small opaque window in front of everything, for a moment.
         let frame = NSRect(x: screen.visibleFrame.minX + 40, y: screen.visibleFrame.minY + 40, width: 8, height: 8)
         let window = NSWindow(contentRect: frame, styleMask: [.borderless], backing: .buffered, defer: false)
@@ -100,15 +107,65 @@ final class PanelWindowTests: XCTestCase {
         window.orderFrontRegardless()
         defer { window.orderOut(nil) }
         // Drawn and known to the window server before it is asked: a
-        // window that has not shown anything yet takes no mouse-down.
+        // window that has not shown anything yet takes no mouse-down. Asked
+        // again for up to two seconds, since nothing says when that is.
         window.display()
-        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.2))
         let point = NSPoint(x: frame.midX, y: frame.midY)
-        XCTAssertTrue(AppDelegate.clickLandsOnOwnWindow(at: point))
-        // Gone, the same spot is the desktop's or another app's.
-        window.orderOut(nil)
-        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.1))
-        XCTAssertFalse(AppDelegate.clickLandsOnOwnWindow(at: point))
+        let deadline = Date(timeIntervalSinceNow: 2)
+        var landed = false
+        while !landed, Date() < deadline {
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.05))
+            landed = AppDelegate.clickLandsOnOwnWindow(at: point)
+        }
+        XCTAssertTrue(landed)
+    }
+
+    // MARK: - A window no taller than its screen
+
+    /// With every row showing, the panel and its title bar are taller than
+    /// a 13 inch MacBook's screen has between its menu bar and its Dock, and
+    /// an ordinary window is not drawn over the Dock as the attached panel
+    /// is: the last row ended up under it. The window's view is told how
+    /// much room the screen has, and scrolls past that.
+    func testThePanelsViewGetsWhatTheTitleBarLeavesOfTheScreen() {
+        XCTAssertEqual(AppDelegate.panelWindowRoom(visibleHeight: 960, titleBarHeight: 32), 928)
+        // A 13 inch MacBook Air with a Dock: about 849 points to show in.
+        XCTAssertEqual(AppDelegate.panelWindowRoom(visibleHeight: 849, titleBarHeight: 32), 817)
+        // A sliver of a screen still leaves something to scroll in.
+        XCTAssertEqual(AppDelegate.panelWindowRoom(visibleHeight: 180, titleBarHeight: 32),
+                       AppDelegate.panelWindowLeastRoom)
+        XCTAssertEqual(AppDelegate.panelWindowRoom(visibleHeight: 0, titleBarHeight: 32),
+                       AppDelegate.panelWindowLeastRoom)
+    }
+
+    // MARK: - Whether the window was in the Dock
+
+    func testWhetherTheWindowWasMinimizedHasAKeyOfItsOwn() {
+        let keys = [AppDelegate.panelWindowOpenKey, AppDelegate.panelWindowTopLeftKey,
+                    AppDelegate.panelWindowMinimizedKey, AppDelegate.settingsWindowTopLeftKey]
+        XCTAssertEqual(Set(keys).count, keys.count)
+    }
+
+    // MARK: - Who has the keyboard when the app comes back
+
+    /// The registration window, and a sheet over the panel, take the
+    /// keyboard back when the app becomes active again, which an accessory
+    /// app's windows do not always get by themselves. Not from another
+    /// window of the app, though: with the panel kept open beside the
+    /// registration window (Manage… no longer closes it), a click on the
+    /// panel that brought the app back lost the keyboard 50 ms later.
+    func testAWindowTakesTheKeyboardBackOnlyWhenNoOtherWindowOfTheAppHasIt() {
+        func window() -> NSWindow {
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 100, height: 100), styleMask: [.titled],
+                                  backing: .buffered, defer: true)
+            window.isReleasedWhenClosed = false
+            return window
+        }
+        let registration = window(), panel = window()
+        XCTAssertTrue(SheetKeyActivator.takesKeyboardBack(for: registration, from: nil), "Nobody has it")
+        XCTAssertTrue(SheetKeyActivator.takesKeyboardBack(for: registration, from: registration), "It has it already")
+        XCTAssertFalse(SheetKeyActivator.takesKeyboardBack(for: registration, from: panel),
+                       "The panel was clicked to bring the app back")
     }
 
     /// The monitor's events have no window and carry the place on screen;

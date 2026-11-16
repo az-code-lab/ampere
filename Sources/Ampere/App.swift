@@ -42,13 +42,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSMenuIte
     /// visible, and both are still open.
     private var panelWindowOpen = false
     private var panelWindowObservers: [NSObjectProtocol] = []
-    /// Whether the panel can be seen right now, attached or as a window:
-    /// what the monitor's fast polling follows (refreshPanelOnScreen).
-    private var panelOnScreen = false
+    /// How tall the panel's view may be in its window on the screen that
+    /// window is on; past that the view scrolls (fitPanelWindow).
+    private let panelWindowLayout = PanelWindowLayout()
     /// Waits for the Dock to take the keyboard, on the way to showing the
     /// app's menu bar (takeMenuBar), and how many times that was begun.
     private var menuBarHandover: NSObjectProtocol?
     private var menuBarHandovers = 0
+    /// True from a launch that reopened the panel's window without taking
+    /// the keyboard until the app is first made active: the menu bar is
+    /// looked at once then (applicationDidBecomeActive).
+    private var menuBarUnchecked = false
     /// True once the app is on its way out (applicationWillTerminate).
     private var terminating = false
     private var pinnedObserver: AnyCancellable?
@@ -63,8 +67,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSMenuIte
     private var appearanceObservation: NSKeyValueObservation?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Activation policy is set in main.swift before SwiftUI launches,
-        // so we don't need to change it here (avoids external monitor blackout).
+        // The app is a menu bar app already: main.swift sets the accessory
+        // policy before anything else runs. It turns regular only for the
+        // panel's own window (setRegularApp), which the last step here
+        // reopens when the previous run ended with it open.
 
         // 1. Status bar item first, with a placeholder icon and no click
         // handler. The OS draws the menu bar slot before the heavy
@@ -793,11 +799,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSMenuIte
     /// in screen coordinates, as NSStringFromPoint writes it.
     static let settingsWindowTopLeftKey = "ui.settingsWindowTopLeft"
 
-    /// The same for the panel's own window, and whether that window was
-    /// open: the panel torn off is a window the next launch opens again
-    /// (restorePanelWindow).
+    /// The same for the panel's own window, whether that window was open,
+    /// and whether it was in the Dock: the panel torn off is a window the
+    /// next launch opens again as it was left (restorePanelWindow).
     static let panelWindowTopLeftKey = "ui.panelWindowTopLeft"
     static let panelWindowOpenKey = "ui.panelWindowOpen"
+    static let panelWindowMinimizedKey = "ui.panelWindowMinimized"
+
+    /// How wide the panel is, attached or as a window.
+    static let panelWidth: CGFloat = 580
 
     /// How much of a window's title bar a display has to show for the
     /// window to count as still on it: enough to drag it by.
@@ -897,13 +907,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSMenuIte
     /// What the menu bar offers right now. Close Window needs a window
     /// that has the keyboard. About Ampere needs the panel's window, with
     /// no sheet over it already (a second sheet would only wait behind the
-    /// first).
+    /// first), and showing a battery: the sheet hangs from the battery
+    /// view's footer, and with no reading there is no such view to open it
+    /// on (ContentView).
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         switch menuItem.action {
         case #selector(closeKeyWindow(_:)):
             return NSApp.keyWindow != nil
         case #selector(showAbout(_:)):
-            return panelWindowOpen && panelWindow?.attachedSheet == nil
+            return panelWindowOpen && panelWindow?.attachedSheet == nil && monitor?.state != nil
         default:
             return true
         }
@@ -1085,69 +1097,135 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSMenuIte
     /// yet on screen. The view is the panel's own in its window form (no
     /// header row: the title bar says what that row said, and a window is
     /// not pinned). A view of its own and not the popover's: AppKit shows
-    /// the two side by side while it turns one into the other.
-    private func preparedPanelWindow() -> NSWindow {
-        let window = panelWindow ?? {
-            let window = NSWindow(contentRect: .zero, styleMask: [.titled, .closable, .miniaturizable],
-                                  backing: .buffered, defer: false)
-            window.title = "Ampere \(AppVersion.current)"
-            // Reused across opens; a fresh view is installed each time.
-            window.isReleasedWhenClosed = false
-            // The app says itself whether this window reopens at launch,
-            // and where (restorePanelWindow).
-            window.isRestorable = false
-            // Asked for from another Space (the menu bar item, the Dock
-            // icon), it comes to that Space, as the settings window does.
-            window.collectionBehavior = .moveToActiveSpace
-            let center = NotificationCenter.default
-            panelWindowObservers = [
-                // Where it is dragged is where the next launch opens it.
-                // Only once it is the panel: AppKit moves it about on its
-                // way in.
-                center.addObserver(forName: NSWindow.didMoveNotification, object: window, queue: .main) { [weak self] _ in
-                    guard let self, self.panelWindowOpen else { return }
-                    self.savePanelWindowPlace()
-                },
-                center.addObserver(forName: NSWindow.willCloseNotification, object: window, queue: .main) { [weak self] _ in
-                    self?.panelWindowWillClose()
-                },
-                // Covered, minimized, on another Space, hidden with the
-                // app: nobody is looking, and the polling slows down.
-                center.addObserver(forName: NSWindow.didChangeOcclusionStateNotification, object: window,
-                                   queue: .main) { [weak self] _ in
-                    self?.refreshPanelOnScreen()
-                },
-            ]
-            panelWindow = window
-            return window
-        }()
+    /// the two side by side while it turns one into the other. `visible`:
+    /// the visible frame of the screen the window is about to open on,
+    /// where the caller knows it (fitPanelWindow).
+    private func preparedPanelWindow(on visible: NSRect? = nil) -> NSWindow {
+        let window = panelWindowShell()
+        fitPanelWindow(to: visible)
         // A hosting view that takes the first click and sizes the window
         // to the panel, as the other windows' do: the panel's rows come
         // and go with the power adapter, the mode and the license.
         let content = FirstMouseHostingView(rootView: ContentView(monitor: monitor, registration: registration,
-                                                                  presentation: .window))
+                                                                  presentation: .window,
+                                                                  windowLayout: panelWindowLayout))
         content.sizingOptions = [.minSize, .intrinsicContentSize, .maxSize]
         window.contentView = content
         window.setContentSize(content.fittingSize)
         return window
     }
 
+    /// The panel's window itself, made on first use and kept.
+    private func panelWindowShell() -> NSWindow {
+        if let panelWindow { return panelWindow }
+        let window = NSWindow(contentRect: .zero, styleMask: [.titled, .closable, .miniaturizable],
+                              backing: .buffered, defer: false)
+        window.title = "Ampere \(AppVersion.current)"
+        // Reused across opens; a fresh view is installed each time.
+        window.isReleasedWhenClosed = false
+        // The app says itself whether this window reopens at launch, and
+        // where (restorePanelWindow).
+        window.isRestorable = false
+        // Asked for from another Space (the menu bar item, the Dock icon),
+        // it comes to that Space, as the settings window does.
+        window.collectionBehavior = .moveToActiveSpace
+        let center = NotificationCenter.default
+        func observe(_ name: Notification.Name, _ object: Any?, _ handler: @escaping (AppDelegate) -> Void) {
+            panelWindowObservers.append(center.addObserver(forName: name, object: object, queue: .main) { [weak self] _ in
+                guard let self else { return }
+                handler(self)
+            })
+        }
+        // Where it is dragged is where the next launch opens it. Only once
+        // it is the panel: AppKit moves it about on its way in.
+        observe(NSWindow.didMoveNotification, window) { delegate in
+            guard delegate.panelWindowOpen else { return }
+            delegate.savePanelWindowPlace()
+        }
+        observe(NSWindow.willCloseNotification, window) { $0.panelWindowWillClose() }
+        // Covered, minimized, on another Space, hidden with the app:
+        // nobody is looking, and the polling slows down.
+        observe(NSWindow.didChangeOcclusionStateNotification, window) { $0.refreshPanelOnScreen() }
+        // In the Dock or out of it: the next launch leaves it where it was.
+        observe(NSWindow.didMiniaturizeNotification, window) { $0.savePanelWindowMinimized(true) }
+        observe(NSWindow.didDeminiaturizeNotification, window) { $0.savePanelWindowMinimized(false) }
+        // Another screen, or the same one with another Dock or menu bar:
+        // another height to fit.
+        observe(NSWindow.didChangeScreenNotification, window) { $0.fitPanelWindow(to: nil) }
+        observe(NSApplication.didChangeScreenParametersNotification, nil) { $0.fitPanelWindow(to: nil) }
+        panelWindow = window
+        return window
+    }
+
+    /// The least a screen leaves the panel's view to show itself in: under
+    /// this the window keeps this height whatever the screen.
+    static let panelWindowLeastRoom: CGFloat = 240
+
+    /// How tall the panel's view may be in its window on a screen whose
+    /// visible frame (under the menu bar, clear of the Dock) is
+    /// `visibleHeight` tall: what the title bar leaves of it.
+    static func panelWindowRoom(visibleHeight: CGFloat, titleBarHeight: CGFloat) -> CGFloat {
+        max(visibleHeight - titleBarHeight, panelWindowLeastRoom)
+    }
+
+    /// Tell the panel's view how tall it may be on the screen its window is
+    /// on (`visible`: that screen's visible frame, where the window is not
+    /// on it yet). With every row showing the panel is 842 points tall, and
+    /// 874 with its title bar: more than a 13 inch MacBook's screen has
+    /// between its menu bar and a Dock at the bottom (956 points in all at
+    /// its default scaling). Attached, the panel is drawn over the Dock, on
+    /// the menu bar's layer; an ordinary window is not, so its last row
+    /// (Settings…, About, Quit) would sit under the Dock there, with the
+    /// title bar already against the menu bar and nowhere to move the
+    /// window to. So the view is as tall as its rows up to the room there
+    /// is, and scrolls past that (PanelWindowScroll),
+    /// which is what the settings window does on a small screen.
+    private func fitPanelWindow(to visible: NSRect?) {
+        guard let window = panelWindow,
+              let visible = visible ?? window.screen?.visibleFrame
+                ?? statusItem.button?.window?.screen?.visibleFrame ?? NSScreen.main?.visibleFrame
+        else { return }
+        let titleBar = window.frame.height - window.contentRect(forFrameRect: window.frame).height
+        let room = Self.panelWindowRoom(visibleHeight: visible.height, titleBarHeight: titleBar)
+        // Only a change: every assignment lays the view out again.
+        if panelWindowLayout.maxHeight != room { panelWindowLayout.maxHeight = room }
+    }
+
     /// The window is the panel from here on: open as far as the next
-    /// launch is concerned, the app a regular one, and the window in front
-    /// with the keyboard. A copy with no license has no panel (a license
-    /// that lapsed in the middle of the drag): its window closes again.
-    private func panelWindowDidOpen() {
+    /// launch is concerned, and the app a regular one. Torn off just now,
+    /// it is in front with the keyboard. A copy with no license has no
+    /// panel (a license that lapsed in the middle of the drag): its window
+    /// closes again.
+    ///
+    /// `restoring`: a launch reopening the window the last run left open.
+    /// It comes back as it was left, in the Dock if it was minimized, and
+    /// does not take the keyboard: a launch at login, or the relaunch after
+    /// an update, comes while the user is doing something else. Shown that
+    /// way it is in view, in front, and the app is not active (measured);
+    /// the first click on it makes it so.
+    private func panelWindowDidOpen(restoring: Bool = false) {
         guard let window = panelWindow, !panelWindowOpen else { return }
         guard !licenseGated else {
             window.close()
             window.contentView = NSView()
             return
         }
+        let defaults = UserDefaults.standard
+        let minimized = restoring && defaults.bool(forKey: Self.panelWindowMinimizedKey)
         panelWindowOpen = true
-        UserDefaults.standard.set(true, forKey: Self.panelWindowOpenKey)
+        defaults.set(true, forKey: Self.panelWindowOpenKey)
+        defaults.set(minimized, forKey: Self.panelWindowMinimizedKey)
+        // On its screen now, which a tear-off could only guess at.
+        if !restoring { fitPanelWindow(to: nil) }
         savePanelWindowPlace()
-        setRegularApp(true)
-        window.makeKeyAndOrderFront(nil)
+        setRegularApp(true, takingKeyboard: !restoring)
+        if minimized {
+            window.miniaturize(nil)
+        } else if !restoring || NSApp.isActive {
+            window.makeKeyAndOrderFront(nil)
+        } else {
+            window.orderFrontRegardless()
+        }
         refreshPanelOnScreen()
     }
 
@@ -1161,6 +1239,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSMenuIte
         guard panelWindowOpen, !terminating else { return }
         panelWindowOpen = false
         UserDefaults.standard.set(false, forKey: Self.panelWindowOpenKey)
+        UserDefaults.standard.set(false, forKey: Self.panelWindowMinimizedKey)
         refreshPanelOnScreen()
         // A turn later, so nothing is torn down inside the close itself; a
         // window reopened by then keeps its view and the app its Dock icon.
@@ -1193,6 +1272,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSMenuIte
         Self.saveWindowTopLeft(of: window, as: Self.panelWindowTopLeftKey, in: .standard)
     }
 
+    /// Keep whether the panel's window is in the Dock. Only while it is
+    /// the panel, and not on the way out: quitting does not take a window
+    /// out of the Dock, and whatever it does to one is not the user's doing.
+    private func savePanelWindowMinimized(_ minimized: Bool) {
+        guard panelWindowOpen, !terminating else { return }
+        UserDefaults.standard.set(minimized, forKey: Self.panelWindowMinimizedKey)
+    }
+
     /// Whether a launch reopens the panel's window: it was open when the
     /// last run ended, and this copy has a license to show a panel with.
     static func reopensPanelWindow(wasOpen: Bool, tier: LicenseTier) -> Bool {
@@ -1200,32 +1287,41 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSMenuIte
     }
 
     /// The panel was a window when the last run ended, by a quit, an
-    /// update's relaunch or a crash: it is a window again, where it was
-    /// left (CLAUDE.md requirement 3). By its top-left corner, since its
-    /// height follows its rows; moved up if it would now run off the bottom
-    /// of its screen, and centered if the display it was left on is gone,
-    /// the rules the settings window is placed by. A copy with no license
-    /// has no panel, and its next launch does not bring one back either.
+    /// update's relaunch or a crash: it is a window again, as it was left
+    /// (CLAUDE.md requirement 3). Where it was, by its top-left corner,
+    /// since its height follows its rows; moved up if it would now run off
+    /// the bottom of its screen, and centered if the display it was left on
+    /// is gone, the rules the settings window is placed by. In the Dock if
+    /// that is where it was, and without taking the keyboard
+    /// (panelWindowDidOpen). A copy with no license has no panel, and its
+    /// next launch does not bring one back either.
     private func restorePanelWindow() {
         let defaults = UserDefaults.standard
         let wasOpen = defaults.bool(forKey: Self.panelWindowOpenKey)
         guard Self.reopensPanelWindow(wasOpen: wasOpen, tier: registration.tier) else {
-            if wasOpen { defaults.set(false, forKey: Self.panelWindowOpenKey) }
+            if wasOpen {
+                defaults.set(false, forKey: Self.panelWindowOpenKey)
+                defaults.set(false, forKey: Self.panelWindowMinimizedKey)
+            }
             return
         }
-        let window = preparedPanelWindow()
-        let titleBar = window.frame.height - window.contentRect(forFrameRect: window.frame).height
+        // The screen it was left on decides how tall it may be, so the
+        // screen comes first: the window's width and title bar are the
+        // same whatever is in it.
+        let shell = panelWindowShell()
+        let titleBar = shell.frame.height - shell.contentRect(forFrameRect: shell.frame).height
         let topLeft = Self.savedWindowTopLeft(Self.panelWindowTopLeftKey, in: defaults)
         let home = topLeft.flatMap {
-            Self.windowScreen(topLeft: $0, width: window.frame.width, titleBarHeight: titleBar,
+            Self.windowScreen(topLeft: $0, width: Self.panelWidth, titleBarHeight: titleBar,
                               screens: NSScreen.screens.map(\.visibleFrame))
         }
+        let window = preparedPanelWindow(on: home ?? NSScreen.main?.visibleFrame)
         if let topLeft, let home {
             window.setFrameOrigin(Self.windowOrigin(topLeft: topLeft, size: window.frame.size, on: home))
         } else {
             window.center()
         }
-        panelWindowDidOpen()
+        panelWindowDidOpen(restoring: true)
     }
 
     /// Whether the panel can be seen: attached to the menu bar item, or a
@@ -1243,11 +1339,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSMenuIte
                                               windowSeen: seen))
     }
 
-    /// Tell the monitor when the answer changes; it refreshes at once when
-    /// the panel comes into view.
+    /// Tell the monitor when the answer changes (it keeps the answer:
+    /// isPanelVisible); it refreshes at once when the panel comes into view.
     private func setPanelOnScreen(_ onScreen: Bool) {
-        guard onScreen != panelOnScreen else { return }
-        panelOnScreen = onScreen
+        guard onScreen != monitor.isPanelVisible else { return }
         monitor.setFastPolling(onScreen)
     }
 
@@ -1270,12 +1365,23 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSMenuIte
     /// displays and no built-in one (CGDisplayRegisterReconfigurationCallback
     /// stayed silent over a dozen runs, 2026-11-15); the note in main.swift
     /// is about the launch of an earlier build.
-    private func setRegularApp(_ regular: Bool) {
+    ///
+    /// `takingKeyboard` false: a launch reopening the window, which leaves
+    /// the keyboard where it is (panelWindowDidOpen). An app that is not
+    /// active needs no menu bar; the first time it is made active the
+    /// menus are looked at once (applicationDidBecomeActive). One that the
+    /// system has already made active gets them as after a tear-off.
+    private func setRegularApp(_ regular: Bool, takingKeyboard: Bool = true) {
         guard (NSApp.activationPolicy() == .regular) != regular else { return }
         if regular {
             NSApp.setActivationPolicy(.regular)
-            takeMenuBar()
+            if takingKeyboard || NSApp.isActive {
+                takeMenuBar()
+            } else {
+                menuBarUnchecked = true
+            }
         } else {
+            menuBarUnchecked = false
             endMenuBarHandover()
             let wasActive = NSApp.isActive
             NSApp.setActivationPolicy(.accessory)
@@ -1308,15 +1414,35 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSMenuIte
     private func takeMenuBar() {
         guard NSApp.isActive else {
             NSApp.activate(ignoringOtherApps: true)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-                guard let self, self.panelWindowOpen, NSApp.isActive,
-                      !Self.ownsMenuBar(NSWorkspace.shared.menuBarOwningApplication) else { return }
-                self.takeMenuBarThroughDock()
-            }
+            takeMenuBarIfStillAnothers()
             return
         }
         takeMenuBarThroughDock()
     }
+
+    /// Half a second after the app was made active from not being so: the
+    /// menus should be its own by now, and the Dock is asked where they are
+    /// not. Once per activation it is called for, never from the handover
+    /// itself, so a Mac on which the handover does not work is asked once
+    /// and left alone.
+    private func takeMenuBarIfStillAnothers() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self, self.panelWindowOpen, NSApp.isActive, NSApp.activationPolicy() == .regular,
+                  !Self.ownsMenuBar(NSWorkspace.shared.menuBarOwningApplication) else { return }
+            self.takeMenuBarThroughDock()
+        }
+    }
+
+    /// The app was made active. After a launch that reopened the panel's
+    /// window without taking the keyboard this is the first time, and the
+    /// moment its menus are due (setRegularApp).
+    func applicationDidBecomeActive(_ notification: Notification) {
+        guard menuBarUnchecked else { return }
+        menuBarUnchecked = false
+        takeMenuBarIfStillAnothers()
+    }
+
+    static let dockBundleIdentifier = "com.apple.dock"
 
     /// Whether the menu bar on screen is this app's.
     static func ownsMenuBar(_ owner: NSRunningApplication?) -> Bool {
@@ -1332,10 +1458,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSMenuIte
         ) { [weak self] _ in
             guard let self else { return }
             self.endMenuBarHandover()
+            // Only from the Dock, which is in front at this moment when the
+            // handover is what took the keyboard away (measured). Anything
+            // else in front is where the user has just gone, and stays.
+            guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == Self.dockBundleIdentifier else { return }
             NSApp.activate(ignoringOtherApps: true)
             if self.panelWindowOpen { self.panelWindow?.makeKeyAndOrderFront(nil) }
         }
-        let dock = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").first
+        let dock = NSRunningApplication.runningApplications(withBundleIdentifier: Self.dockBundleIdentifier).first
         guard dock?.activate(options: []) == true else {
             // No Dock to hand to: the menus follow at the next activation.
             endMenuBarHandover()
@@ -1707,6 +1837,10 @@ struct ContentView: View {
     @ObservedObject var monitor: BatteryMonitor
     @ObservedObject var registration: RegistrationManager
     var presentation: Presentation = .attached
+    /// The window's word on how tall the view may be on its screen
+    /// (PanelWindowScroll). Nil attached, where the panel is as tall as its
+    /// rows.
+    var windowLayout: PanelWindowLayout? = nil
     // Display preferences persist across restarts per CLAUDE.md requirement 3.
     // showAbout remains @State: it is sheet visibility, not a preference.
     // The temperature unit has no default of its own: nil until the card is
@@ -1731,15 +1865,16 @@ struct ContentView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            if let state = monitor.state {
-                batteryView(state)
+        Group {
+            // In its window the panel is never taller than the screen has
+            // room for (PanelWindowScroll). Which of the two this view is
+            // never changes while it lives, so nothing is rebuilt here.
+            if let windowLayout {
+                PanelWindowScroll(layout: windowLayout) { panel }
             } else {
-                noBatteryView
+                panel
             }
         }
-        .frame(width: 580)
-        .background(Color(.windowBackgroundColor))
         .onChange(of: showAbout) { mirrorSheetVisibility() }
         .onChange(of: confirmKeepAwakeDisplay) { mirrorSheetVisibility() }
         .onReceive(NotificationCenter.default.publisher(for: .ampereShowAbout)) { _ in
@@ -1749,6 +1884,18 @@ struct ContentView: View {
             // to show there is nothing to open it on.
             if presentation == .window, monitor.state != nil { showAbout = true }
         }
+    }
+
+    private var panel: some View {
+        VStack(spacing: 0) {
+            if let state = monitor.state {
+                batteryView(state)
+            } else {
+                noBatteryView
+            }
+        }
+        .frame(width: AppDelegate.panelWidth)
+        .background(Color(.windowBackgroundColor))
     }
 
     /// Mirror sheet visibility into the monitor so AppDelegate keeps the
@@ -2716,6 +2863,35 @@ struct ContentView: View {
         return .secondary
     }
 
+}
+
+// MARK: - Panel Window Layout
+
+/// What the panel's window tells its view about the screen it is on: how
+/// tall the view may be there (AppDelegate.fitPanelWindow). No limit until
+/// the window has said.
+final class PanelWindowLayout: ObservableObject {
+    @Published var maxHeight: CGFloat = .infinity
+}
+
+/// The panel in its window: as tall as its rows, up to the height its
+/// screen has room for, and scrolling past that. A scroll view at all
+/// times, so the panel is not rebuilt (and a sheet over it not dropped)
+/// when the limit starts or stops to bind; while everything fits it has
+/// nothing to scroll and no rubber band. Its width and height are fixed
+/// both ways, which is what makes the hosting view size the window to it
+/// and follow it as the rows come and go.
+struct PanelWindowScroll<Content: View>: View {
+    @ObservedObject var layout: PanelWindowLayout
+    @ViewBuilder var content: () -> Content
+
+    var body: some View {
+        ScrollView(.vertical) { content() }
+            .scrollBounceBehavior(.basedOnSize)
+            .frame(width: AppDelegate.panelWidth)
+            .frame(maxHeight: layout.maxHeight)
+            .fixedSize(horizontal: false, vertical: true)
+    }
 }
 
 // MARK: - Status line (panel header + menu bar tooltip)
@@ -3825,6 +4001,21 @@ struct SheetKeyActivator: NSViewRepresentable {
     /// the insertion point back).
     var onReactivate: (() -> Void)? = nil
 
+    /// Whether `window` takes the keyboard back when the app becomes
+    /// active again, given the window AppKit has left it with (`key`). It
+    /// does when no window has it, when it has it already (its field's
+    /// focus still wants restoring), and when the window it is a sheet over
+    /// has it, which is the case this exists for: AppKit hands the keyboard
+    /// to the panel under a sheet. It does not when another window of the
+    /// app has it. That window was clicked to bring the app back, or was
+    /// the one in use before: with the panel kept open beside the
+    /// registration window, the registration window took the keyboard from
+    /// the panel 50 ms after every click that brought the app back, in the
+    /// middle of a dragger's drag if that was the click.
+    static func takesKeyboardBack(for window: NSWindow, from key: NSWindow?) -> Bool {
+        key == nil || key === window || key === window.sheetParent
+    }
+
     func makeNSView(context: Context) -> NSView {
         let view = KeyGrabView()
         view.onReactivate = onReactivate
@@ -3855,7 +4046,8 @@ struct SheetKeyActivator: NSViewRepresentable {
                 // juggling first — it hands key back to the popover's
                 // panel, and an immediate makeKey here would lose the race.
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                    guard let self, let window = self.window else { return }
+                    guard let self, let window = self.window,
+                          SheetKeyActivator.takesKeyboardBack(for: window, from: NSApp.keyWindow) else { return }
                     window.makeKey()
                     self.onReactivate?()
                 }
