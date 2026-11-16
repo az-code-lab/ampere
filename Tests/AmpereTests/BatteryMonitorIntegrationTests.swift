@@ -458,15 +458,12 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         }
     }
 
-    /// What the Auto Charge switch does when it is turned on: the intent
-    /// first, then the grant, then a poll (ContentView.autoManageToggle).
+    /// The Auto Charge switch turned on (the settings window's, through
+    /// BatteryMonitor.setAutoManage): the intent first, then the grant,
+    /// then a poll.
     private func turnAutoChargeOn(_ monitor: BatteryMonitor) -> XCTestExpectation {
         let answered = expectation(description: "the administrator prompt was answered")
-        monitor.autoManageEnabled = true
-        monitor.ensureSudoInstalled { ok in
-            if ok { monitor.refresh() } else { monitor.autoManageEnabled = false }
-            answered.fulfill()
-        }
+        monitor.setAutoManage(true) { answered.fulfill() }
         return answered
     }
 
@@ -2846,5 +2843,132 @@ final class BatteryMonitorIntegrationTests: XCTestCase {
         XCTAssertEqual(hw.preferences.values["showMenuBarKeepAwakeTime"] as? Bool, false)
         XCTAssertFalse(hw.monitor(license: .paid).showMenuBarKeepAwakeTime, "A restart keeps the choice")
         XCTAssertFalse(hw.monitor(license: .free).showMenuBarKeepAwakeTime, "And a lapsed license does not reset it")
+    }
+
+    // MARK: - The settings window
+
+    /// Auto Charge is switched from the settings window, where the panel's
+    /// status line is not in view. Turning it on takes the mode at once
+    /// and asks for the helper where the account has to grant it again;
+    /// while that prompt is up the window's notice says charge control is
+    /// frozen, and a declined prompt takes the mode back and leaves the
+    /// reason as the notice.
+    func testAutoChargeSwitch_ADeclinedPromptTakesTheModeBackAndSaysWhy() {
+        let hw = Hardware()
+        let (monitor, afterRevoke) = revokedMonitor(hw, .lastAccount)
+        XCTAssertNil(monitor.chargeControlNotice, "Nothing to say after a Revoke that went through")
+        hw.installSucceeds = false
+        let prompt = hw.blockInstall()
+        let answered = turnAutoChargeOn(monitor)
+        awaitEntered(prompt)
+        XCTAssertTrue(monitor.autoManageEnabled, "The switch shows on while the prompt is up")
+        XCTAssertTrue(monitor.adminPromptUp, "and takes no input meanwhile")
+        XCTAssertEqual(monitor.chargeControlNotice?.kind, .hold)
+        XCTAssertEqual(monitor.chargeControlNotice?.text,
+                       "Charge control is frozen while the admin password prompt is open. It goes on once the prompt is answered or cancelled.")
+        prompt.release.signal()
+        wait(for: [answered], timeout: 3)
+        drainCallbacks()
+        XCTAssertFalse(monitor.autoManageEnabled)
+        XCTAssertFalse(monitor.adminPromptUp)
+        XCTAssertEqual(monitor.chargeControlNotice,
+                       .init(text: "Admin access required for auto charge", kind: .error))
+        XCTAssertEqual(hw.preferences.values["autoManageEnabled"] as? Bool, false, "A restart finds the mode off")
+        XCTAssertEqual(hw.writes.count, afterRevoke, "Nothing was written for it")
+    }
+
+    /// The same switch with the prompt answered: the mode stays, the grant
+    /// is acted on at once, and the window has nothing to report.
+    func testAutoChargeSwitch_AGrantKeepsTheModeAndActsOnItAtOnce() {
+        let hw = Hardware()
+        let (monitor, afterRevoke) = revokedMonitor(hw, .lastAccount)
+        let answered = turnAutoChargeOn(monitor)
+        wait(for: [answered], timeout: 3)
+        awaitCondition { monitor.chargingPaused }
+        drainCallbacks()
+        XCTAssertTrue(monitor.autoManageEnabled)
+        XCTAssertTrue(monitor.accountAuthorized)
+        XCTAssertEqual(hw.preferences.values["autoManageEnabled"] as? Bool, true)
+        XCTAssertEqual(Array(hw.writes.dropFirst(afterRevoke)), ["inhibit"],
+                       "Between the bounds the state machine holds, without waiting for a poll")
+        XCTAssertNil(monitor.chargeControlNotice)
+    }
+
+    /// Turned off, the switch ends what auto mode had running (a charge to
+    /// the upper bound resumes as plain charging) and clears an error that
+    /// belonged to it.
+    func testAutoChargeSwitch_OffEndsAutoModeAndClearsItsError() {
+        let hw = Hardware()
+        let monitor = chargingMonitor(hw)
+        monitor.lastError = "Admin access required for auto charge"
+        var settled = false
+        monitor.setAutoManage(false) { settled = true }
+        XCTAssertTrue(settled, "Nothing to wait for on the way off")
+        XCTAssertFalse(monitor.autoManageEnabled)
+        XCTAssertFalse(monitor.chargeToUpperBound)
+        XCTAssertFalse(monitor.chargeToFull)
+        XCTAssertNil(monitor.lastError)
+        drainCallbacks()
+        XCTAssertEqual(hw.preferences.values["autoManageEnabled"] as? Bool, false)
+        XCTAssertFalse(hw.chargingInhibited, "Manual mode charges as macOS does")
+        XCTAssertNil(monitor.chargeControlNotice)
+    }
+
+    /// The notice the settings window leads with, and the panel's status
+    /// message too: each hold in its own words, a copy that stands by in
+    /// grey, a hold in orange, and with no hold the last error in red.
+    func testChargeControlNotice_NamesTheHoldOrTheLastError() {
+        let managing = Hardware().monitor(startMonitoring: true)
+        drainCallbacks()
+        XCTAssertNil(managing.chargeControlNotice)
+        managing.lastError = "Charge control failed — revoke and re-grant admin access"
+        XCTAssertEqual(managing.chargeControlNotice,
+                       .init(text: "Charge control failed — revoke and re-grant admin access", kind: .error))
+
+        let standby = Hardware()
+        standby.competing = "Ampere running as alice"
+        let standingBy = standby.monitor(startMonitoring: true)
+        XCTAssertEqual(standingBy.chargeControlNotice,
+                       .init(text: "Charge control is in use by Ampere running as alice", kind: .standby))
+        // The hold outranks an error: it is why nothing can be done.
+        standingBy.removeSudoRule()
+        XCTAssertNotNil(standingBy.lastError)
+        XCTAssertEqual(standingBy.chargeControlNotice?.kind, .standby)
+
+        let none = Hardware()
+        none.chteMissing = true
+        none.nativeClientMissing = true
+        let noMechanism = none.monitor(startMonitoring: true)
+        XCTAssertEqual(noMechanism.chargeControlHold, .noMechanism)
+        XCTAssertEqual(noMechanism.chargeControlNotice?.kind, .hold)
+        XCTAssertEqual(noMechanism.chargeControlNotice?.text.hasPrefix("Charge control unavailable:"), true)
+
+        // Three probes per activation: the launch's, then the first poll's.
+        let silent = Hardware()
+        silent.chteUnansweredProbes = 6
+        let unknown = silent.monitor(startMonitoring: true)
+        drainCallbacks()
+        XCTAssertEqual(unknown.chargeControlHold, .mechanismUnknown)
+        XCTAssertEqual(unknown.chargeControlNotice,
+                       .init(text: "Charge control on hold: the SMC did not answer. Ampere asks again at every poll.",
+                             kind: .hold))
+
+        let unlicensed = Hardware().monitor(startMonitoring: true, license: .unlicensed)
+        XCTAssertEqual(unlicensed.chargeControlNotice,
+                       .init(text: "Charge control needs a license: register one in the registration window, or quit",
+                             kind: .hold))
+
+        let declinedHardware = Hardware()
+        declinedHardware.competing = "Ampere running as alice"
+        declinedHardware.authorized = false
+        declinedHardware.installSucceeds = false
+        let declined = declinedHardware.monitor(startMonitoring: true)
+        declinedHardware.competing = nil
+        declined.refresh()
+        drainCallbacks()
+        XCTAssertEqual(declined.chargeControlHold, .accessDeclined)
+        XCTAssertEqual(declined.chargeControlNotice,
+                       .init(text: "Admin access required for charge control. Pause charging or re-enable Auto Charge to grant it.",
+                             kind: .hold))
     }
 }

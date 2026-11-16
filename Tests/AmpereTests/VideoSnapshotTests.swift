@@ -99,12 +99,6 @@ final class VideoSnapshotTests: XCTestCase {
         awakeMonitor.chargingPaused = true
         panels.append(("keepawake", awakeMonitor, registered))
 
-        let settingsMonitor = Self.monitor()
-        settingsMonitor.state = holding
-        settingsMonitor.chargingPaused = true
-        settingsMonitor.settingsExpanded = true
-        panels.append(("settings", settingsMonitor, registered))
-
         let manualMonitor = Self.monitor(prefs: ["autoManageEnabled": false])
         manualMonitor.state = charging
         panels.append(("manual", manualMonitor, registered))

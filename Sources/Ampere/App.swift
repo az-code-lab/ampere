@@ -2,7 +2,6 @@ import SwiftUI
 import Shared
 import AppKit
 import Combine
-import ServiceManagement
 
 // MARK: - Menu Bar App
 
@@ -10,7 +9,28 @@ struct AmpereApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
     var body: some Scene {
+        // An App needs a scene, and this one is never shown: every window
+        // is AppKit's, owned by AppDelegate (the panel, the registration
+        // window, the settings window). What the scene does bring is the
+        // main menu, unseen in an accessory app but live for its key
+        // equivalents. Its Settings… item opened the scene's own window on
+        // Cmd+, from any window of the app: empty, and titled "Ampere
+        // Settings". The item is replaced with one that opens the real
+        // settings window. A Close item is added as well: an App with no
+        // window scene gets none, so Cmd+W closed nothing.
         Settings { EmptyView() }
+            .commands {
+                CommandGroup(replacing: .appSettings) {
+                    Button("Settings…") {
+                        NotificationCenter.default.post(name: .ampereShowSettingsWindow, object: nil)
+                    }
+                    .keyboardShortcut(",", modifiers: .command)
+                }
+                CommandGroup(before: .windowSize) {
+                    Button("Close") { appDelegate.closeKeyWindow() }
+                        .keyboardShortcut("w", modifiers: .command)
+                }
+            }
     }
 }
 
@@ -30,6 +50,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     // click-to-activate/key behavior.
     private var registrationWindow: NSWindow?
     private var registrationShowObserver: NSObjectProtocol?
+    /// The settings live in a window of their own (showSettingsWindow).
+    private var settingsWindow: NSWindow?
+    private var settingsShowObserver: NSObjectProtocol?
+    private var settingsCloseObserver: NSObjectProtocol?
+    private var settingsMoveObserver: NSObjectProtocol?
     private var pinnedObserver: AnyCancellable?
     private var stateObserver: AnyCancellable?
     private var registrationObserver: AnyCancellable?
@@ -116,11 +141,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 self.applyLicenseGate(tier: tier)
             }
 
-        // The panel's Registration row posts this; the window is owned here.
+        // The settings window's License row and the panel's Unlock… buttons
+        // post this; the window is owned here.
         registrationShowObserver = NotificationCenter.default.addObserver(
             forName: .ampereShowRegistrationWindow, object: nil, queue: .main
         ) { [weak self] _ in
             self?.showRegistrationWindow()
+        }
+
+        // The panel's Settings… link and the Settings… menu command
+        // (Cmd+,) post this one.
+        settingsShowObserver = NotificationCenter.default.addObserver(
+            forName: .ampereShowSettingsWindow, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.showSettingsWindow()
         }
 
         // Update menu bar icon whenever monitor state changes
@@ -455,10 +489,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func applyLicenseGate(tier: LicenseTier) {
         licenseGated = tier == .unlicensed
         if licenseGated {
-            // The panel, attached or torn off, goes; the window takes its
-            // place. (A sheet keeps the popover open until it is dismissed,
-            // see popoverShouldClose; the window still comes up in front.)
+            // The panel, attached or torn off, goes, and the settings
+            // window with it; the registration window takes their place.
+            // (A sheet keeps the popover open until it is dismissed, see
+            // popoverShouldClose; the window still comes up in front.)
             if popover.isShown { popover.performClose(nil) }
+            settingsWindow?.close()
             showRegistrationWindow()
         }
         // Not closable while gated: the way out is a key, or Quit.
@@ -498,6 +534,185 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         window.center()
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
+    }
+
+    /// The settings window: what the panel's Settings… link and Cmd+, open.
+    /// The settings used to unfold under the panel's footer, where every
+    /// new row made the panel taller; a window has room for them and for a
+    /// line on what each one does (SettingsView).
+    ///
+    /// The panel goes on by its own rule. One that would close at the next
+    /// click outside it (not pinned, no sheet up) closes now, since that
+    /// click is about to land in this window. A pinned or torn-off panel
+    /// stays, and shows what a switch here changes as it changes. A copy
+    /// with no license has no settings: it is held at the registration
+    /// window (licenseGated), which comes forward instead.
+    private func showSettingsWindow() {
+        if licenseGated {
+            showRegistrationWindow()
+            return
+        }
+        let firstOpen = settingsWindow == nil
+        let window = settingsWindow ?? {
+            let window = NSWindow(contentRect: .zero, styleMask: [.titled, .closable],
+                                  backing: .buffered, defer: false)
+            window.title = "Ampere Settings"
+            // Reused across opens; a fresh SettingsView is installed each
+            // time below.
+            window.isReleasedWhenClosed = false
+            // Where the user drags it is where it comes back, in this run
+            // and the next (saveSettingsWindowPlace). Only while it shows:
+            // the moves that size and place it before it opens are saved
+            // once, when they are done.
+            settingsMoveObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.didMoveNotification, object: window, queue: .main
+            ) { [weak self, weak window] _ in
+                guard let self, let window, window.isVisible else { return }
+                self.saveSettingsWindowPlace()
+            }
+            // Asked for from another Space while it is open, it comes to
+            // that Space; the default takes the user to the Space it was
+            // left on, or shows nothing where macOS is set not to switch.
+            window.collectionBehavior = .moveToActiveSpace
+            // The view goes when the window closes. Left installed in a
+            // closed window it would go on following the monitor unseen,
+            // and looking for the helper's files at every poll. A turn
+            // later, so it is not torn down inside the close itself; a
+            // window reopened by then keeps the view it was just given.
+            settingsCloseObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.willCloseNotification, object: window, queue: .main
+            ) { [weak window] _ in
+                DispatchQueue.main.async {
+                    guard let window, !window.isVisible else { return }
+                    window.contentView = NSView()
+                }
+            }
+            settingsWindow = window
+            return window
+        }()
+        // Already open: it comes forward as it is. Otherwise it is filled
+        // and placed first, while the panel still has the keyboard (see
+        // the centering below).
+        if !window.isVisible {
+            // A fresh view on every open: it reads the login item, which is
+            // macOS's to keep and may have changed while the window was
+            // closed. The hosting view takes the first click and sizes the
+            // window to its rows, as the registration window's does: rows
+            // come and go with the license and with admin access.
+            let content = FirstMouseHostingView(rootView: SettingsView(monitor: monitor, registration: registration))
+            content.sizingOptions = [.minSize, .intrinsicContentSize, .maxSize]
+            window.contentView = content
+            // Where it was last left: in this run, or in an earlier one
+            // (the preferences keep it). It goes back there while a display
+            // still shows enough of its title bar to move it by.
+            let titleBar = window.frame.height - window.contentRect(forFrameRect: window.frame).height
+            let lastTopLeft = firstOpen
+                ? Self.savedSettingsWindowTopLeft(in: .standard)
+                : NSPoint(x: window.frame.minX, y: window.frame.maxY)
+            let home = lastTopLeft.flatMap {
+                Self.settingsWindowScreen(topLeft: $0, width: SettingsView.width, titleBarHeight: titleBar,
+                                          screens: NSScreen.screens.map(\.visibleFrame))
+            }
+            // Never taller than its screen has room for (the visible
+            // height less the title bar): on a small display, or with more
+            // rows than there are today, the form keeps the height there
+            // is and scrolls.
+            if let visible = home ?? NSScreen.main?.visibleFrame {
+                let room = max(visible.height - titleBar, 0)
+                if content.fittingSize.height > room {
+                    content.rootView = SettingsView(monitor: monitor, registration: registration,
+                                                    scrollHeight: room)
+                }
+            }
+            window.setContentSize(content.fittingSize)
+            if let lastTopLeft, let home {
+                // By its top-left corner, since its height follows its
+                // rows, and moved up where it would now run off the bottom.
+                window.setFrameOrigin(Self.settingsWindowOrigin(topLeft: lastTopLeft, size: window.frame.size,
+                                                                on: home))
+            } else {
+                // Never placed, or the display it was left on is gone:
+                // centered on the screen of the key window, which is the
+                // display the panel was opened on.
+                window.center()
+            }
+            saveSettingsWindowPlace()
+        }
+        if popover.isShown, popover.behavior == .transient {
+            popover.performClose(nil)
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+    }
+
+    /// Where the settings window is kept between runs: its top-left corner
+    /// in screen coordinates, as NSStringFromPoint writes it.
+    static let settingsWindowTopLeftKey = "ui.settingsWindowTopLeft"
+
+    /// How much of the settings window's title bar a display has to show
+    /// for the window to count as still on it: enough to drag it by.
+    static let settingsWindowGrabWidth: CGFloat = 60
+
+    /// Keep where the settings window is, so it comes back there after a
+    /// relaunch or a crash, as the settings in it do (CLAUDE.md requirement
+    /// 3). The top-left corner and not the frame: the height follows the
+    /// rows, which differ from one open to the next.
+    private func saveSettingsWindowPlace() {
+        guard let window = settingsWindow else { return }
+        let topLeft = NSPoint(x: window.frame.minX, y: window.frame.maxY)
+        UserDefaults.standard.set(NSStringFromPoint(topLeft), forKey: Self.settingsWindowTopLeftKey)
+    }
+
+    /// The settings window's top-left corner as an earlier run left it, or
+    /// nil when none ever saved one.
+    static func savedSettingsWindowTopLeft(in defaults: UserDefaults) -> NSPoint? {
+        defaults.string(forKey: settingsWindowTopLeftKey).map(NSPointFromString)
+    }
+
+    /// The display a settings window left at `topLeft` is still on: the
+    /// one that shows the most of its title bar, as long as that is enough
+    /// to drag the window by (settingsWindowGrabWidth, and half the bar's
+    /// height). Nil when no display shows that much, which is a window left
+    /// on a display that has since been disconnected or rearranged: it is
+    /// centered then, not put back out of reach. `screens`: the visible
+    /// frames of the connected displays (under the menu bar, clear of the
+    /// Dock).
+    static func settingsWindowScreen(topLeft: NSPoint, width: CGFloat, titleBarHeight: CGFloat,
+                                     screens: [NSRect]) -> NSRect? {
+        let bar = NSRect(x: topLeft.x, y: topLeft.y - titleBarHeight, width: width, height: titleBarHeight)
+        func shown(_ screen: NSRect) -> NSRect {
+            let part = bar.intersection(screen)
+            return part.isNull ? .zero : part
+        }
+        guard let screen = screens.max(by: { shown($0).width * shown($0).height < shown($1).width * shown($1).height })
+        else { return nil }
+        let part = shown(screen)
+        return part.width >= settingsWindowGrabWidth && part.height >= titleBarHeight / 2 ? screen : nil
+    }
+
+    /// The frame origin (bottom-left) of a settings window of `size` whose
+    /// top-left corner was left at `topLeft`, on the display with the
+    /// visible frame `visible`. The corner is kept, except that a window
+    /// that would run off the bottom is moved up to show whole (it has more
+    /// rows than when it was left), and one whose top is above the visible
+    /// frame is moved down under it. The top wins where both cannot hold.
+    static func settingsWindowOrigin(topLeft: NSPoint, size: NSSize, on visible: NSRect) -> NSPoint {
+        let y = min(max(topLeft.y - size.height, visible.minY), visible.maxY - size.height)
+        return NSPoint(x: topLeft.x, y: y)
+    }
+
+    /// Cmd+W, from the Close command AmpereApp adds. The panel closes the
+    /// way a click on the menu bar item closes it (a sheet over it still
+    /// refuses, see popoverShouldClose); any other window closes as its
+    /// close button would, and one without a close button (the registration
+    /// window while it is the only way on) answers with the system's beep.
+    func closeKeyWindow() {
+        guard let window = NSApp.keyWindow else { return }
+        if popover.isShown, window === popover.contentViewController?.view.window {
+            popover.performClose(nil)
+        } else {
+            window.performClose(nil)
+        }
     }
 
     @objc private func togglePopover() {
@@ -574,16 +789,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// its rect on the first step only, where the old rect still names the
     /// right spot, and ignores the move, after which the old rect names a
     /// spot further left: the next thing that makes the popover lay itself
-    /// out again (the Settings section opening) would carry the panel
-    /// there. So the rect is set again, as the same right-hand part of the
-    /// button, on the move: the panel does not move at all when the item
-    /// widens, and follows the icon when the whole item is pushed along by
-    /// a neighbor. Setting it on the first step instead makes the panel
-    /// jump sideways and back. Narrowing is the case this cannot keep
-    /// still (the popover clips the rect to the narrower button on the
-    /// first step), which is why the item never narrows while the panel is
-    /// attached: see anchoredIconWidth and the title logic in
-    /// updateMenuBarIcon.
+    /// out again (a row coming or going, which changes the panel's height)
+    /// would carry the panel there. So the rect is set again, as the same
+    /// right-hand part of the button, on the move: the panel does not move
+    /// at all when the item widens, and follows the icon when the whole
+    /// item is pushed along by a neighbor. Setting it on the first step
+    /// instead makes the panel jump sideways and back. Narrowing is the
+    /// case this cannot keep still (the popover clips the rect to the
+    /// narrower button on the first step), which is why the item never
+    /// narrows while the panel is attached: see anchoredIconWidth and the
+    /// title logic in updateMenuBarIcon.
     private func repinPanelAnchor() {
         guard panelAnchored, popover.isShown, !popover.isDetached, let button = statusItem.button else { return }
         popover.positioningRect = Self.panelAnchorRect(buttonBounds: button.bounds, anchorWidth: panelAnchorWidth)
@@ -628,13 +843,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     /// Shared teardown for both panel close paths (attached popover closing,
     /// detached window closing): unpin, mark the panel attached again (the
-    /// next open is a popover), drop back to slow polling, and fold the
-    /// settings section so the next open starts collapsed.
+    /// next open is a popover), and drop back to slow polling.
     private func panelDidClose() {
         monitor.pinned = false
         monitor.panelDetached = false
         monitor.setFastPolling(false)
-        monitor.settingsExpanded = false
     }
 
     @objc private func detachedWindowDidClose(_ notification: Notification) {
@@ -667,6 +880,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         keepAwakeTickTimer?.invalidate()
         if let registrationShowObserver {
             NotificationCenter.default.removeObserver(registrationShowObserver)
+        }
+        if let settingsShowObserver {
+            NotificationCenter.default.removeObserver(settingsShowObserver)
+        }
+        if let settingsCloseObserver {
+            NotificationCenter.default.removeObserver(settingsCloseObserver)
+        }
+        if let settingsMoveObserver {
+            NotificationCenter.default.removeObserver(settingsMoveObserver)
         }
         if let systemColorsObserver {
             NotificationCenter.default.removeObserver(systemColorsObserver)
@@ -982,8 +1204,7 @@ struct ContentView: View {
     @ObservedObject var monitor: BatteryMonitor
     @ObservedObject var registration: RegistrationManager
     // Display preferences persist across restarts per CLAUDE.md requirement 3.
-    // showAbout / launchAtLogin remain @State: the former is sheet visibility,
-    // the latter is derived from SMAppService and isn't a user preference.
+    // showAbout remains @State: it is sheet visibility, not a preference.
     // The temperature unit has no default of its own: nil until the card is
     // first clicked, and the card shows macOS's unit until then
     // (TemperatureDisplay).
@@ -998,7 +1219,6 @@ struct ContentView: View {
     /// Why the authentication behind that sheet could not confirm the
     /// owner, shown in the sheet; nil until a prompt fails.
     @State private var keepAwakeDisplayFailure: String?
-    @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
     @State private var pinHovering = false
 
     private var healthCheckTimeString: String {
@@ -1105,34 +1325,31 @@ struct ContentView: View {
 
             // Footer actions
             HStack(spacing: 12) {
+                // The settings are a window of their own, which AppDelegate
+                // owns (showSettingsWindow).
                 Button {
-                    monitor.settingsExpanded.toggle()
+                    NotificationCenter.default.post(name: .ampereShowSettingsWindow, object: nil)
                 } label: {
                     HStack(spacing: 6) {
-                        Text("Settings")
+                        Text("Settings…")
                         // Unregistered is the one settings state worth
-                        // surfacing while the section is folded — the
-                        // Registration row inside is the only entry point
-                        // to the registration window. Wording and orange
-                        // match that row; the explicit color keeps the
-                        // button style's tint from recoloring it. Gone
-                        // entirely once registered.
+                        // surfacing on the link. A copy with no license is
+                        // held at the registration window and shows this
+                        // panel only while a sheet keeps it from closing;
+                        // the link then opens that window, not the
+                        // settings. The explicit color keeps the button
+                        // style's tint from recoloring it. Gone entirely
+                        // once registered.
                         if !registration.isRegistered {
                             Text("Unregistered")
                                 .foregroundColor(.orange)
                         }
                     }
                 }
-                // Accent while expanded marks the link as the active toggle
-                // for the rows below it.
-                .buttonStyle(FooterButtonStyle(
-                    tint: monitor.settingsExpanded ? .accentColor : .secondary,
-                    hoverTint: monitor.settingsExpanded ? .accentColor : .primary))
-                .help(monitor.settingsExpanded
-                    ? "Hide settings"
-                    : registration.isRegistered
-                        ? "Show settings"
-                        : "Show settings — unregistered, register from the Registration row")
+                .buttonStyle(FooterButtonStyle())
+                .help(registration.isRegistered
+                    ? "Open the settings window: auto charge, launch at login, the menu bar item, the license, and admin access"
+                    : "Unregistered: opens the registration window, where you can get a free license or enter the key from your purchase email")
                 Spacer()
                 if let update = monitor.updateAvailable {
                     updateControl(update)
@@ -1329,28 +1546,6 @@ struct ContentView: View {
                 .frame(width: 300)
             }
 
-            // Settings rows: toggled by the footer link above, so they
-            // expand below it and the panel grows downward. AppDelegate
-            // collapses the section whenever the panel closes.
-            if monitor.settingsExpanded {
-                Divider().padding(.horizontal)
-                autoManageToggle()
-                    .disabled(monitor.controlsUnavailable || monitor.adminPromptUp)
-                launchAtLoginRow()
-                menuBarPercentRow()
-                // A setting of Keep Awake's, so offered with it: a copy
-                // without the paid license has no session to show.
-                if !monitor.keepAwakeLocked {
-                    menuBarKeepAwakeTimeRow()
-                }
-                registrationRow()
-                // Only while this account holds passwordless access and this
-                // instance manages charge control: another account's rule is
-                // not ours to revoke, and neither is its running session.
-                if monitor.isSudoRuleInstalled && monitor.accountAuthorized && !monitor.standingBy {
-                    revokeAdminRow()
-                }
-            }
         }
         .padding(.vertical, 20)
     }
@@ -1406,29 +1601,10 @@ struct ContentView: View {
     }
 
     private func statusMessage(_ state: BatteryState) -> String {
-        switch monitor.chargeControlHold {
-        case .otherInstance(let other):
-            return "Charge control is in use by \(other)"
-        case .accessDeclined:
-            return "Admin access required for charge control. Pause charging or re-enable Auto Charge to grant it."
-        case .noMechanism:
-            return "Charge control unavailable: this firmware has no CHTE key and this macOS has no charge limit. Monitoring only; Ampere checks again at every poll."
-        case .mechanismUnknown:
-            return "Charge control on hold: the SMC did not answer. Ampere asks again at every poll."
-        case .unlicensed:
-            // Registered again, with the takeover waiting for a password
-            // prompt of Ampere's own that is still open
-            // (BatteryMonitor.chargeControlResuming): asking for a license
-            // here would be asking for one it has.
-            return monitor.chargeControlResuming
-                ? "Charge control on hold: waiting for the admin prompt that is still open. Ampere takes charge control once it is answered."
-                : "Charge control needs a license: register one in the registration window, or quit"
-        case .adminPrompt:
-            return "Charge control is frozen while the admin password prompt is open. It goes on once the prompt is answered or cancelled."
-        case nil:
-            break
-        }
-        if let error = monitor.lastError { return error }
+        // A hold, or the last error, ahead of everything about the battery
+        // (BatteryMonitor.chargeControlNotice; the settings window shows
+        // the same notice).
+        if let notice = monitor.chargeControlNotice { return notice.text }
         if let warning = monitor.healthWarning { return warning }
         if let warning = monitor.recoveryWarning { return warning }
         // macOS's own calibration charge (BatteryMonitor.
@@ -1509,9 +1685,8 @@ struct ContentView: View {
     }
 
     private func statusMessageColor(_ state: BatteryState) -> Color {
-        if monitor.standingBy { return .secondary }
-        if monitor.chargeControlHold != nil { return .orange }
-        if monitor.lastError != nil { return .red }
+        // Mirrors statusMessage's first branch.
+        if let notice = monitor.chargeControlNotice { return notice.kind.color }
         if monitor.healthWarning != nil { return .red }
         if monitor.recoveryWarning != nil { return .red }
         // Mirrors statusMessage's override branch: orange, like the other
@@ -1616,76 +1791,12 @@ struct ContentView: View {
         return String(format: "%.2f V", volts)
     }
 
-    private func launchAtLoginRow() -> some View {
-        HStack {
-            Image(systemName: "arrow.right.circle.fill")
-                .font(.system(size: 14))
-                .foregroundColor(launchAtLogin ? .accentColor : .secondary)
-            Text("Launch at Login")
-                .font(.system(size: 13, weight: .semibold))
-            Spacer()
-            Toggle("", isOn: $launchAtLogin)
-                .toggleStyle(.switch)
-                .controlSize(.small)
-                .onChange(of: launchAtLogin) {
-                    setLaunchAtLogin(launchAtLogin)
-                }
-        }
-        .padding(.horizontal, 16)
-        .help("Start Ampere automatically when you log in")
-    }
-
-    private func menuBarPercentRow() -> some View {
-        HStack {
-            // number.circle.fill, not `percent`: SF Symbols has no filled-
-            // circle percent glyph, and the settings rows keep to one
-            // *.circle.fill family so the icons match in size and weight
-            // (bare glyphs read smaller at the same point size).
-            Image(systemName: "number.circle.fill")
-                .font(.system(size: 14))
-                .foregroundColor(monitor.showMenuBarPercent ? .accentColor : .secondary)
-            Text("Percent in Menu Bar")
-                .font(.system(size: 13, weight: .semibold))
-            Spacer()
-            Toggle("", isOn: Binding(
-                get: { monitor.showMenuBarPercent },
-                set: { monitor.showMenuBarPercent = $0 }
-            ))
-            .toggleStyle(.switch)
-            .controlSize(.small)
-        }
-        .padding(.horizontal, 16)
-        .help("Show the charge percentage next to the battery icon in the menu bar; off shows the icon only (the freed space is reclaimed when this panel closes)")
-    }
-
-    private func menuBarKeepAwakeTimeRow() -> some View {
-        HStack {
-            // The settings rows' *.circle.fill family (see menuBarPercentRow).
-            Image(systemName: "timer.circle.fill")
-                .font(.system(size: 14))
-                .foregroundColor(monitor.showMenuBarKeepAwakeTime ? .accentColor : .secondary)
-            Text("Keep Awake Time in Menu Bar")
-                .font(.system(size: 13, weight: .semibold))
-            Spacer()
-            Toggle("", isOn: Binding(
-                get: { monitor.showMenuBarKeepAwakeTime },
-                set: { monitor.showMenuBarKeepAwakeTime = $0 }
-            ))
-            .toggleStyle(.switch)
-            .controlSize(.small)
-        }
-        .padding(.horizontal, 16)
-        .help(monitor.showMenuBarKeepAwakeTime
-            ? "On: a timed Keep Awake session shows its remaining time beside its symbol in the menu bar. Turn off to show the symbol alone and keep the menu bar item narrow (the freed space is reclaimed when this panel closes)."
-            : "Off: a Keep Awake session shows only its symbol in the menu bar, a cup, or a display on the accent color while the display is kept on. Turn on to show a timed session's remaining time beside it.")
-    }
-
     private func keepAwakeRow() -> some View {
         let onPower = monitor.state?.adapterConnected ?? false
         let locked = monitor.keepAwakeLocked
         return HStack {
             // Bare glyph in the shared 26 pt frame like the other main-panel
-            // rows (the *.circle.fill family is the settings section's).
+            // rows (the *.circle.fill family is the settings window's).
             // Coffee cup: the universal keep-awake metaphor (caffeinate). A
             // lock while the feature is withheld, like the bounds row's.
             Image(systemName: locked ? "lock.fill" : "cup.and.saucer.fill")
@@ -1833,69 +1944,6 @@ struct ContentView: View {
         .background(SheetKeyActivator())
     }
 
-    private func autoManageToggle() -> some View {
-        HStack {
-            Image(systemName: "arrow.up.arrow.down.circle.fill")
-                .font(.system(size: 14))
-                .foregroundColor(monitor.autoManageEnabled ? .accentColor : .secondary)
-            Text("Auto Charge")
-                .font(.system(size: 13, weight: .semibold))
-            Spacer()
-            Toggle("", isOn: Binding(
-                get: { monitor.autoManageEnabled },
-                set: { newValue in
-                    if newValue {
-                        // Set immediately so the toggle doesn't flicker.
-                        // No rule-1 arming here: the state machine arms
-                        // chargeToUpperBound itself when it sees below-lower
-                        // on AC (any entry path), so the refresh below
-                        // handles a fresh enable in that condition too.
-                        monitor.autoManageEnabled = true
-                        monitor.ensureSudoInstalled { ok in
-                            if ok {
-                                // Act on the new mode now (inhibit/allow per
-                                // the state machine) instead of waiting up to
-                                // a poll cycle.
-                                monitor.refresh()
-                            } else {
-                                monitor.autoManageEnabled = false
-                                // The status line already explains a hold.
-                                if monitor.chargeControlHold == nil {
-                                    monitor.lastError = "Admin access required for auto charge"
-                                }
-                            }
-                        }
-                    } else {
-                        monitor.autoManageEnabled = false
-                        monitor.chargeToUpperBound = false
-                        monitor.chargeToFull = false
-                        // Any pending error in auto-manage mode (most commonly
-                        // "Admin access required for auto charge"
-                        // from a failed prior enable) is no longer relevant
-                        // once the user has disabled auto-manage.
-                        monitor.lastError = nil
-                        // If a discharge is active, refresh()'s
-                        // "!autoManageEnabled" branch stops it (CHIE + sleep
-                        // restore) immediately rather than on the next tick —
-                        // without this, the UI shows manual mode while the
-                        // SMC is still actively discharging.
-                        monitor.refresh()
-                    }
-                }
-            ))
-            .toggleStyle(.switch)
-            .controlSize(.small)
-        }
-        .padding(.horizontal, 16)
-        // State-dependent like the pin/settings tooltips: each side says what
-        // is active now and what flipping the toggle switches to.
-        .help(monitor.autoManageEnabled
-            ? (monitor.nativeLimitMode
-                ? "On: Ampere keeps the battery between the bounds through the macOS charge limit; charging starts below the lower bound and stops at the upper bound, awake or asleep. Turn off for standard macOS charging with manual Pause/Resume."
-                : "On: Ampere keeps the battery between the bounds; charging starts below the lower bound and stops at the upper bound. A below-lower charge keeps the Mac awake until it finishes; other charges pause during sleep and resume on wake. Turn off for standard macOS charging with manual Pause/Resume.")
-            : "Off: standard macOS charging to full, with manual Pause/Resume while on AC. Turn on to keep the battery between the lower and upper bounds automatically. Requires admin access.")
-    }
-
     private func autoManageContent(_ state: BatteryState) -> some View {
         VStack(spacing: 10) {
             BatteryRangeSlider(
@@ -2039,7 +2087,7 @@ struct ContentView: View {
         .padding(.horizontal, 16)
     }
 
-    // MARK: - Registration
+    // MARK: - Footer (update control, About sheet)
 
     /// Footer control for a pending update. Idle/failed → a clickable
     /// "Update to X" button (failed adds a warning icon whose tooltip carries
@@ -2096,67 +2144,6 @@ struct ContentView: View {
         }
     }
 
-    private func registrationRow() -> some View {
-        let tier = registration.tier
-        return HStack {
-            // Circle variants (not the seals): seals render 18x18 where the
-            // sibling circles are 16x16, visibly oversizing this row's icon
-            // and indenting its label.
-            Image(systemName: tier == .unlicensed ? "xmark.circle.fill" : "checkmark.circle.fill")
-                .font(.system(size: 14))
-                .foregroundColor(tier == .unlicensed ? .orange : .accentColor)
-            // "Registered to <name>" once registered, "Free license" for a
-            // free one; the unregistered row keeps the neutral label —
-            // "Registered to … Unregistered" would contradict itself.
-            Text(tier == .paid ? "Registered to" : tier == .free ? "Free license" : "Registration")
-                .font(.system(size: 13, weight: .semibold))
-            Spacer()
-            Button(action: {
-                NotificationCenter.default.post(name: .ampereShowRegistrationWindow, object: nil)
-            }) {
-                // Licensee name when known; the registration window this
-                // opens shows the email, so the row doesn't need to.
-                Text(tier == .unlicensed
-                    ? "Unregistered"
-                    : (registration.name.isEmpty ? registration.email : registration.name))
-                    .font(.system(size: 12))
-                    .foregroundColor(tier == .unlicensed ? .orange : .secondary)
-            }
-            .buttonStyle(.plain)
-        }
-        .padding(.horizontal, 16)
-        .help(tier == .paid
-            ? "Registered to \(registration.email); click the name to manage or deregister"
-            : tier == .free
-            ? "Free license, registered to \(registration.email); click the name to manage it, or to move to a paid license for custom charge bounds and Keep Awake"
-            : "Unregistered; click to get a free license, or to enter the key from your purchase email")
-    }
-
-
-    /// Settings-row home of the old footer "Revoke Admin Access" button.
-    /// Visible only while the sudoers rule is installed, same as the button
-    /// was: revocation publishes state changes when it completes, so the
-    /// row disappears on success and stays if cancelled.
-    private func revokeAdminRow() -> some View {
-        HStack {
-            Image(systemName: "lock.circle.fill")
-                .font(.system(size: 14))
-                .foregroundColor(.accentColor)
-            Text("Admin Access")
-                .font(.system(size: 13, weight: .semibold))
-            Spacer()
-            Button("Revoke") {
-                monitor.removeSudoRule()
-            }
-            .buttonStyle(FooterButtonStyle())
-            // One password prompt at a time (BatteryMonitor.adminPromptUp).
-            .disabled(monitor.adminPromptUp)
-            .help("Remove this account's passwordless sudo rule, and the helper binary once no other account uses it (prompts for your admin password). Charge control stops working until access is granted again.")
-        }
-        .padding(.horizontal, 16)
-        .help("Ampere has passwordless admin access for charge control; Revoke removes it")
-    }
-
     /// Shows expected (green) vs actual (red) for a mismatched SMC key,
     /// with the key= prefix aligned using monospaced font throughout.
     private func healthCheckMismatch(expectedValue: String, actualValue: String) -> some View {
@@ -2195,20 +2182,6 @@ struct ContentView: View {
     }
 
     // MARK: - Helpers
-
-    private func setLaunchAtLogin(_ enabled: Bool) {
-        do {
-            if enabled {
-                try SMAppService.mainApp.register()
-            } else {
-                try SMAppService.mainApp.unregister()
-            }
-        } catch {
-            AmpereLog.app("Ampere: Failed to \(enabled ? "enable" : "disable") launch at login: %@", error.localizedDescription)
-            // Revert toggle on failure
-            launchAtLogin = SMAppService.mainApp.status == .enabled
-        }
-    }
 
     private func statusColor(_ state: BatteryState) -> Color {
         // Match the diagram/cards by deferring to the live current direction
@@ -2267,6 +2240,76 @@ extension BatteryMonitor {
             upperBound: chargingTarget
         )
         return eta.isEmpty ? state.timeRemaining : eta
+    }
+}
+
+// MARK: - Charge control notice (panel status message + settings window)
+
+extension BatteryMonitor {
+    /// What charge control has to say ahead of anything about the battery:
+    /// why this instance is not managing it, or the last thing that went
+    /// wrong. The panel's status message leads with it. The settings
+    /// window, which has no status line, shows it above its rows: its Auto
+    /// Charge switch and Revoke are what a hold disables and what raise
+    /// most of the errors, and the panel is usually closed while it is
+    /// open. One source, so the two can never disagree.
+    struct ChargeControlNotice: Equatable {
+        enum Kind: Equatable {
+            /// Another instance holds charge control; nothing is wrong here.
+            case standby
+            /// Charge control is on hold, for the reason the text gives.
+            case hold
+            /// The last charge-control action failed.
+            case error
+        }
+        let text: String
+        let kind: Kind
+    }
+
+    var chargeControlNotice: ChargeControlNotice? {
+        switch chargeControlHold {
+        case .otherInstance(let other):
+            return ChargeControlNotice(text: "Charge control is in use by \(other)", kind: .standby)
+        case .accessDeclined:
+            return ChargeControlNotice(
+                text: "Admin access required for charge control. Pause charging or re-enable Auto Charge to grant it.",
+                kind: .hold)
+        case .noMechanism:
+            return ChargeControlNotice(
+                text: "Charge control unavailable: this firmware has no CHTE key and this macOS has no charge limit. Monitoring only; Ampere checks again at every poll.",
+                kind: .hold)
+        case .mechanismUnknown:
+            return ChargeControlNotice(
+                text: "Charge control on hold: the SMC did not answer. Ampere asks again at every poll.",
+                kind: .hold)
+        case .unlicensed:
+            // Registered again, with the takeover waiting for a password
+            // prompt of Ampere's own that is still open
+            // (chargeControlResuming): asking for a license here would be
+            // asking for one it has.
+            return ChargeControlNotice(
+                text: chargeControlResuming
+                    ? "Charge control on hold: waiting for the admin prompt that is still open. Ampere takes charge control once it is answered."
+                    : "Charge control needs a license: register one in the registration window, or quit",
+                kind: .hold)
+        case .adminPrompt:
+            return ChargeControlNotice(
+                text: "Charge control is frozen while the admin password prompt is open. It goes on once the prompt is answered or cancelled.",
+                kind: .hold)
+        case nil:
+            return lastError.map { ChargeControlNotice(text: $0, kind: .error) }
+        }
+    }
+}
+
+extension BatteryMonitor.ChargeControlNotice.Kind {
+    /// Grey for a copy standing by, orange for a hold, red for an error.
+    var color: Color {
+        switch self {
+        case .standby: return .secondary
+        case .hold: return .orange
+        case .error: return .red
+        }
     }
 }
 
@@ -3018,7 +3061,7 @@ struct ChargeBoundsLockRow: View {
 
 /// The trailing control of a row whose feature a free license withholds
 /// (ChargeBoundsLockRow, the Keep Awake row): "Unlock…", in the panel's
-/// quiet text-button style (FooterButtonStyle, as the settings' Revoke),
+/// quiet text-button style (FooterButtonStyle, as the footer's links),
 /// opening the registration window, where a paid license is explained and
 /// bought. One word rather than a "Buy a license to…" line (the owner's
 /// call, 2026-10-16): the lock in the row's icon column says what is
@@ -3037,7 +3080,8 @@ struct UnlockButton: View {
 // MARK: - Registration Window
 
 extension Notification.Name {
-    /// Posted by the panel's Registration row; AppDelegate owns the window.
+    /// Posted by the settings window's License row and by the panel's
+    /// Unlock… buttons; AppDelegate owns the window.
     static let ampereShowRegistrationWindow = Notification.Name("ampere.showRegistrationWindow")
 }
 

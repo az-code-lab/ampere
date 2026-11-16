@@ -446,13 +446,6 @@ final class BatteryMonitor: ObservableObject {
     /// attached SwiftUI sheet strands the sheet's presentation state, and
     /// the reopened panel sits behind an invisible modal, dead to clicks.
     @Published var sheetVisible: Bool = false
-    /// True while the settings rows are shown below the panel footer.
-    /// Pure UI state like `isPopoverVisible` — not persisted, and lives here
-    /// rather than as ContentView @State because AppDelegate must fold the
-    /// section whenever the panel closes (popover or detached window): the
-    /// hidden view isn't recreated on reopen, and offscreen SwiftUI onChange
-    /// delivery is not guaranteed.
-    @Published var settingsExpanded: Bool = false
     /// True while the panel is a free-floating window, torn off the menu
     /// bar item. Pure UI state like `isPopoverVisible`, set and cleared by
     /// AppDelegate: the panel's window-drag gesture is live only in this
@@ -4475,6 +4468,49 @@ final class BatteryMonitor: ObservableObject {
             }
             self.requestedChargingPaused = shouldPause
             self.refresh()
+        }
+    }
+
+    /// The Auto Charge switch (the settings window's). On: the mode is
+    /// taken at once, so the switch does not flicker, and the helper is
+    /// asked for where this account cannot run it yet; a declined prompt
+    /// takes the mode back. No rule-1 arming here: the state machine arms
+    /// chargeToUpperBound itself when it sees below-lower on AC (any entry
+    /// path), so the refresh handles a fresh enable in that condition too.
+    /// `settled` runs on the main queue once the switch has been acted on:
+    /// at once, or after the administrator prompt it had to ask.
+    func setAutoManage(_ on: Bool, settled: (() -> Void)? = nil) {
+        if on {
+            autoManageEnabled = true
+            ensureSudoInstalled { [weak self] ok in
+                defer { settled?() }
+                guard let self else { return }
+                if ok {
+                    // Act on the new mode now (inhibit/allow per the state
+                    // machine) instead of waiting up to a poll cycle.
+                    self.refresh()
+                } else {
+                    self.autoManageEnabled = false
+                    // The status line already explains a hold.
+                    if self.chargeControlHold == nil {
+                        self.lastError = "Admin access required for auto charge"
+                    }
+                }
+            }
+        } else {
+            defer { settled?() }
+            autoManageEnabled = false
+            chargeToUpperBound = false
+            chargeToFull = false
+            // Any pending error in auto-manage mode (most commonly "Admin
+            // access required for auto charge" from a failed prior enable)
+            // is no longer relevant once the user has disabled auto-manage.
+            lastError = nil
+            // If a discharge is active, refresh()'s "!autoManageEnabled"
+            // branch stops it (CHIE + sleep restore) immediately rather
+            // than on the next tick: without this, the panel shows manual
+            // mode while the SMC is still actively discharging.
+            refresh()
         }
     }
 }
